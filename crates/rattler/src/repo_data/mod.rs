@@ -1,13 +1,18 @@
+mod fetch;
+
 use crate::{ChannelConfig, MatchSpec, Version};
 use fxhash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Deserializer};
 use serde_with::{serde_as, DeserializeAs};
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Copy, Clone)]
 pub enum NoArchType {
-    Generic,
+    // TODO: What does this mean?
+    GenericV1,
+    // TODO: What does this mean?
+    GenericV2,
+    // TODO: What does this mean?
     Python,
 }
 
@@ -61,8 +66,8 @@ pub struct PackageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<String>,
 
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // pub noarch: Option<NoArchType>,
+    #[serde(deserialize_with = "deserialize_no_arch", default)]
+    pub noarch: Option<NoArchType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_env: Option<String>,
 
@@ -122,4 +127,25 @@ impl<'de> DeserializeAs<'de, MatchSpec> for MatchSpecStr {
         )
         .map_err(serde::de::Error::custom)
     }
+}
+
+/// Deserializer the parse the `noarch` field in conda package data.
+fn deserialize_no_arch<'de, D>(deserializer: D) -> Result<Option<NoArchType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(untagged)]
+    enum NoArchSerde {
+        OldFormat(bool),
+        NewFormat(NoArchTypeSerde),
+    }
+
+    let value = Option::<NoArchSerde>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match value {
+        NoArchSerde::OldFormat(true) => Some(NoArchType::GenericV1),
+        NoArchSerde::OldFormat(false) => None,
+        NoArchSerde::NewFormat(NoArchTypeSerde::Python) => Some(NoArchType::Python),
+        NoArchSerde::NewFormat(NoArchTypeSerde::Generic) => Some(NoArchType::GenericV2),
+    }))
 }
