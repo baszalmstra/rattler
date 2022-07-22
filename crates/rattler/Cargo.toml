@@ -9,7 +9,7 @@ edition = "2021"
 anyhow = "1.0.44"
 structopt = "0.3.25"
 tokio = { version = "1.12.0", features = ["full", "io-util"] }
-tokio-util = { version = "0.6.9", features = ["codec"] }
+tokio-util = { version = "0.6.9", features = ["codec", "io"] }
 futures = "0.3.17"
 serde = { version = "1.0.130", features = ["derive"] }
 serde_json = { version="1.0.68", features=["raw_value"] }
@@ -34,9 +34,10 @@ derive_more = "0.99.16"
 void = "1.0.2"
 nom = "7.1.0"
 dirs = "4.0.0"
-async-compression = {version="0.3.12", features=["gzip", "futures-bufread"] }
+async-compression = {version="0.3.12", features=["gzip", "futures-bufread", "tokio"] }
 log = "0.4.14"
 pretty_env_logger = "0.4.0"
+tempfile = "3.3.0"
 
 [dev-dependencies]
 rand = "0.8.4"

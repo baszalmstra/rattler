@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer};
 use serde_with::{serde_as, DeserializeAs};
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum NoArchType {
     // TODO: What does this mean?
     GenericV1,
@@ -139,6 +139,13 @@ where
     enum NoArchSerde {
         OldFormat(bool),
         NewFormat(NoArchTypeSerde),
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum NoArchTypeSerde {
+        Python,
+        Generic,
     }
 
     let value = Option::<NoArchSerde>::deserialize(deserializer)?;
