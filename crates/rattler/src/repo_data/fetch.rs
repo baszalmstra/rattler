@@ -1,15 +1,17 @@
+use std::any::Any;
+use std::fs::OpenOptions;
 use std::io;
-use std::io::{ErrorKind, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{BufReader, ErrorKind, Read};
+use std::path::{Path, PathBuf};
 
-use async_compression::tokio::bufread::GzipDecoder;
-use futures::{AsyncReadExt, TryFutureExt, TryStreamExt};
-use serde_json::Value;
-use tempfile::NamedTempFile;
+use futures::TryStreamExt;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::io::StreamReader;
 use url::Url;
 
+use crate::utils::{AsyncEncoding, Encoding};
 use crate::{Channel, Platform, RepoData};
 
 const REPODATA_CHANNEL_PATH: &str = "repodata.json";
@@ -23,11 +25,26 @@ pub enum RequestRepoDataError {
     #[error("error downloading data: {0}")]
     TransportError(#[from] reqwest::Error),
 
-    #[error("unable to create temporary file: {0}")]
-    CreateTemporaryFileError(io::Error),
-
     #[error("{0}")]
     IoError(#[from] io::Error),
+
+    #[error("unsupported scheme'")]
+    UnsupportedScheme,
+
+    #[error("invalid path")]
+    InvalidPath,
+
+    #[error("the operation was cancelled")]
+    Cancelled,
+}
+
+impl From<JoinError> for RequestRepoDataError {
+    fn from(err: JoinError) -> Self {
+        match err.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(_) => RequestRepoDataError::Cancelled,
+        }
+    }
 }
 
 /// A struct to construct and perform a request to fetch repodata from a certain channel
@@ -83,21 +100,31 @@ impl RequestRepoDataBuilder {
             .join(REPODATA_CHANNEL_PATH)
             .expect("repodata.json is a valid json path");
 
-        // Download the repodata from the subdirectory url
-        let http_client = self.http_client.unwrap_or_else(reqwest::Client::new);
-        Ok(request_repodata_from_url(platform_url, http_client)
-            .await?
-            .0)
+        // Check the scheme of the url
+        match platform_url.scheme() {
+            "https" | "http" => {
+                // Download the repodata from the subdirectory url
+                let http_client = self.http_client.unwrap_or_else(reqwest::Client::new);
+                fetch_repodata_from_url(platform_url, http_client).await
+            }
+            "file" => {
+                let path = platform_url
+                    .to_file_path()
+                    .map_err(|_| RequestRepoDataError::InvalidPath)?;
+                fetch_repodata_from_path(&path).await
+            }
+            _ => Err(RequestRepoDataError::UnsupportedScheme),
+        }
     }
 }
 
 /// Downloads the repodata from the specified Url. The Url must point to a "repodata.json" file.
 /// This function returns both the parsed repodata as well as a file that contains the original
 /// repodata.
-async fn request_repodata_from_url(
+async fn fetch_repodata_from_url(
     url: Url,
     client: reqwest::Client,
-) -> Result<(RepoData, NamedTempFile), RequestRepoDataError> {
+) -> Result<RepoData, RequestRepoDataError> {
     let response = client
         .get(url)
         // We can handle g-zip encoding which is often used. We could also set this option on the
@@ -110,67 +137,64 @@ async fn request_repodata_from_url(
     // Determine the length of the response in bytes
     let content_size = response.content_length();
 
-    // Determine if the contents is gzip encoded or not
-    let is_gzip_encoded = is_response_encoded_with(&response, "gzip");
-
     // Get the request as a stream of bytes.
-    let byte_stream = response
-        .bytes_stream()
-        .map_err(|e| std::io::Error::new(ErrorKind::Other, e));
-    let mut byte_stream_reader = StreamReader::new(byte_stream);
+    let encoding = Encoding::from(&response);
+    let bytes_stream = response.bytes_stream();
+    let mut decoded_byte_stream =
+        StreamReader::new(bytes_stream.map_err(|e| io::Error::new(ErrorKind::Other, e)))
+            .decode(encoding);
 
-    // Construct a file to store the data to.
-    let temp_file = NamedTempFile::new().map_err(RequestRepoDataError::CreateTemporaryFileError)?;
+    // Read the bytes to memory
+    let mut data = Vec::with_capacity(content_size.unwrap_or(1_073_741_824) as usize);
+    decoded_byte_stream.read_to_end(&mut data).await?;
 
-    // Decode the stream if the stream is compressed and write the result to the file
-    {
-        let mut async_file = tokio::fs::File::from_std(temp_file.as_file().try_clone()?);
-        if is_gzip_encoded {
-            let mut decoder = GzipDecoder::new(byte_stream_reader);
-            tokio::io::copy(&mut decoder, &mut async_file).await?;
-        } else {
-            tokio::io::copy(&mut byte_stream_reader, &mut async_file).await?;
-        }
-    }
-
-    // Re-use the same file handle to read the data as json
-    let mut file = temp_file.as_file();
-    file.seek(SeekFrom::Start(0))?;
-
-    // Finally read the data to json
-    let repo_data: Value = serde_json::from_reader(std::io::BufReader::new(file))?;
-
-    Ok((serde_json::value::from_value(repo_data)?, temp_file))
+    // Deserialize
+    Ok(tokio::task::spawn_blocking(move || serde_json::from_slice(&data)).await??)
 }
 
-/// Returns true if the response is encoded as the specified encoding.
-fn is_response_encoded_with(response: &reqwest::Response, encoding_str: &str) -> bool {
-    let headers = response.headers();
-    headers
-        .get_all(reqwest::header::CONTENT_ENCODING)
-        .iter()
-        .any(|enc| enc == encoding_str)
-        || headers
-            .get_all(reqwest::header::TRANSFER_ENCODING)
-            .iter()
-            .any(|enc| enc == encoding_str)
+/// Read the [`RepoData`] from disk.
+async fn fetch_repodata_from_path(path: &Path) -> Result<RepoData, RequestRepoDataError> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut bytes = Vec::new();
+    BufReader::new(file).read_to_end(&mut bytes)?;
+    Ok(tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes)).await??)
 }
 
 #[cfg(test)]
 mod test {
     use crate::repo_data::fetch::RequestRepoDataBuilder;
+    use crate::utils::simple_channel_server::SimpleChannelServer;
     use crate::{Channel, ChannelConfig, Platform};
+    use std::path::PathBuf;
 
     #[tokio::test]
-    async fn test_fetch() {
-        let channel = Channel::from_str("conda-forge", &ChannelConfig::default())
-            .expect("should be possible");
+    async fn test_fetch_http() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let channel_path = manifest_dir.join("resources/channels/conda-forge");
 
-        let result = RequestRepoDataBuilder::new(channel, Platform::Linux64)
+        let server = SimpleChannelServer::new(channel_path);
+        let url = server.url().to_string();
+        let channel = Channel::from_str(url, &ChannelConfig::default()).unwrap();
+
+        let result = RequestRepoDataBuilder::new(channel, Platform::NoArch)
             .request()
             .await
             .unwrap();
+    }
 
-        dbg!(result);
+    #[tokio::test]
+    async fn test_fetch_file() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let channel_path = manifest_dir.join("resources/channels/conda-forge");
+        let channel = Channel::from_str(
+            &format!("file://{}", channel_path.display()),
+            &ChannelConfig::default(),
+        )
+        .unwrap();
+
+        let result = RequestRepoDataBuilder::new(channel, Platform::NoArch)
+            .request()
+            .await
+            .unwrap();
     }
 }

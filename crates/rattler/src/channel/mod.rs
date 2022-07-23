@@ -91,14 +91,6 @@ impl Channel {
         let path = url.path().trim_end_matches('/');
 
         // Case 1: No path give, channel name is ""
-        if path.is_empty() {
-            return Self {
-                platforms: platforms.map(Into::into),
-                scheme: url.scheme().to_owned(),
-                location: url.host_str().unwrap_or("").to_owned(),
-                name: String::from(""),
-            };
-        }
 
         // Case 2: migrated_custom_channels
         // Case 3: migrated_channel_aliases
@@ -298,6 +290,17 @@ mod tests {
         assert_eq!(channel.scheme, "https");
         assert_eq!(channel.location, "conda.anaconda.org");
         assert_eq!(channel.name, "conda-forge");
+        assert_eq!(channel.platforms, None);
+    }
+
+    #[test]
+    fn parse_url_only() {
+        let config = ChannelConfig::default();
+
+        let channel = Channel::from_str("http://localhost:1234", &config).unwrap();
+        assert_eq!(channel.scheme, "http");
+        assert_eq!(channel.location, "localhost:1234");
+        assert_eq!(channel.name, "");
         assert_eq!(channel.platforms, None);
     }
 
