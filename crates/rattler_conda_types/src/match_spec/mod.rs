@@ -404,4 +404,9 @@ mod tests {
         let spec = MatchSpec::from_str("mamba[version==1.0, md5=dede6252c964db3f3e41c7d30d07f6bf, sha256=aaac4bc9c6916ecc0e33137431645b029ade22190c7144eead61446dcbcc6f97]").unwrap();
         assert!(!spec.matches(&record));
     }
+
+    #[test]
+    fn size_of_match_spec() {
+        assert_eq!(std::mem::size_of::<MatchSpec>(), 368);
+    }
 }
