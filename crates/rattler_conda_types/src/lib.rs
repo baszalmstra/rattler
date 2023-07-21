@@ -11,10 +11,10 @@ mod platform;
 mod repo_data;
 mod repo_data_record;
 mod run_export;
+pub mod sparse_index;
 mod utils;
 mod version;
 pub mod version_spec;
-pub mod sparse_index;
 
 pub mod conda_lock;
 mod generic_virtual_package;
