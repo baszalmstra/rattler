@@ -7,6 +7,7 @@ mod topological_sort;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::path::Path;
+use std::sync::Arc;
 
 use fxhash::{FxHashMap, FxHashSet};
 
@@ -164,7 +165,7 @@ impl RepoData {
     /// data.
     pub fn into_repo_data_records(self, channel: &Channel) -> Vec<RepoDataRecord> {
         let mut records = Vec::with_capacity(self.packages.len() + self.conda_packages.len());
-        let channel_name = channel.canonical_name();
+        let channel_name = Arc::<str>::from(channel.canonical_name());
         for (filename, package_record) in self.packages.into_iter().chain(self.conda_packages) {
             records.push(RepoDataRecord {
                 url: channel

@@ -14,6 +14,7 @@ use rattler_digest::{serde::SerializableHash, Md5Hash, Sha256Hash};
 use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, skip_serializing_none, DisplayFromStr};
 use std::{fs::File, io::Read, path::Path, str::FromStr};
+use std::sync::Arc;
 use url::Url;
 
 pub mod builder;
@@ -362,9 +363,11 @@ impl TryFrom<LockedDependency> for RepoDataRecord {
             Md5Sha256(_, sha256) => Some(sha256),
             _ => None,
         };
-        let channel = channel_from_url(&value.url)
-            .ok_or_else(|| ConversionError::Missing("channel in url".to_string()))?
-            .to_string();
+        let channel = Arc::<str>::from(
+            channel_from_url(&value.url)
+                .ok_or_else(|| ConversionError::Missing("channel in url".to_string()))?
+                .to_string(),
+        );
         let file_name = file_name_from_url(&value.url)
             .ok_or_else(|| ConversionError::Missing("filename in url".to_string()))?
             .to_owned();

@@ -11,12 +11,12 @@ use thiserror::Error;
 #[derive(Debug, Serialize, Deserialize)]
 /// Record in a sparse index
 /// contains the package record and a filename
-struct SparseIndexRecord {
+pub struct SparseIndexRecord {
     #[serde(flatten)]
     /// Actual data regarding the package
-    package_record: PackageRecord,
+    pub package_record: PackageRecord,
     /// Filename to address the package with
-    filename: String,
+    pub filename: String,
 }
 
 impl SparseIndexRecord {

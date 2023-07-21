@@ -84,7 +84,7 @@ impl Channel {
     /// Constructs a new [`Channel`] from a `Url` and associated platforms.
     pub fn from_url(
         url: Url,
-        platforms: Option<impl Into<SmallVec<[Platform; 2]>>>,
+        platforms: Option<SmallVec<[Platform; 2]>>,
         _config: &ChannelConfig,
     ) -> Self {
         // Get the path part of the URL but trim the directory suffix

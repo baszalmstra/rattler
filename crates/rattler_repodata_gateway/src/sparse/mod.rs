@@ -9,6 +9,7 @@ use serde::{
     Deserialize, Deserializer,
 };
 use serde_json::value::RawValue;
+use std::sync::Arc;
 use std::{
     collections::{HashSet, VecDeque},
     fmt, io,
@@ -200,7 +201,7 @@ fn parse_records<'i>(
     subdir: &str,
     patch_function: Option<fn(&mut PackageRecord)>,
 ) -> io::Result<Vec<RepoDataRecord>> {
-    let channel_name = channel.canonical_name();
+    let channel_name = Arc::<str>::from(channel.canonical_name());
 
     let package_indices = packages.equal_range_by(|(package, _)| package.package.cmp(package_name));
     let mut result = Vec::with_capacity(package_indices.len());

@@ -1,5 +1,6 @@
 //! Defines the `[RepoDataRecord]` struct.
 
+use std::sync::Arc;
 use crate::PackageRecord;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -22,7 +23,7 @@ pub struct RepoDataRecord {
     /// String representation of the channel where the package comes from. This could be a URL but
     /// it could also be a channel name. Personally I would always add the complete URL here to be
     /// explicit about where the package came from.
-    pub channel: String,
+    pub channel: Arc<str>,
 }
 
 impl AsRef<PackageRecord> for RepoDataRecord {
