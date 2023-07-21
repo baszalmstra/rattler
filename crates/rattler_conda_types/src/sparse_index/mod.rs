@@ -1,9 +1,9 @@
 //! Contains code regarding the Sparse Index, which is a different way of handling the retrieval
 //! of records from the index.
 use crate::{PackageRecord, RepoData};
+use fxhash::FxHashMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -12,11 +12,12 @@ use thiserror::Error;
 /// Record in a sparse index
 /// contains the package record and a filename
 pub struct SparseIndexRecord {
-    #[serde(flatten)]
-    /// Actual data regarding the package
-    pub package_record: PackageRecord,
     /// Filename to address the package with
-    pub filename: String,
+    pub file_name: String,
+
+    /// Actual data regarding the package
+    #[serde(flatten)]
+    pub package_record: PackageRecord,
 }
 
 impl SparseIndexRecord {
@@ -24,34 +25,32 @@ impl SparseIndexRecord {
     pub fn from_record(package_record: PackageRecord, filename: String) -> SparseIndexRecord {
         SparseIndexRecord {
             package_record,
-            filename,
+            file_name: filename,
         }
     }
 }
 
 #[derive(Debug)]
 /// A single package in the sparse index
-struct SparseIndexPackage {
+pub struct SparseIndexPackage {
     /// Sparse index records
-    records: Vec<SparseIndexRecord>,
+    pub records: Vec<SparseIndexRecord>,
 }
 
 impl SparseIndexPackage {
-
     /// Write a sparse index package to a file
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), WriteSparseIndexError> {
-        let mut writer = std::io::LineWriter::new(writer);
         for record in self.records.iter() {
-            writer.write_all(serde_json::to_string(record)?.as_bytes())?
+            writeln!(writer, "{}", serde_json::to_string(record)?)?;
         }
         Ok(())
     }
 }
 
 /// The entire sparse index
-struct SparseIndex {
+pub struct SparseIndex {
     /// Package name to sparse index package
-    pub packages: HashMap<String, SparseIndexPackage>,
+    pub packages: FxHashMap<String, SparseIndexPackage>,
 }
 
 #[allow(missing_docs)]
@@ -112,7 +111,7 @@ pub fn sparse_index_filename(filename: &Path) -> Result<PathBuf, SparseIndexFile
         }
     }
 
-    Ok(new_path)
+    Ok(new_path.with_extension("json"))
 }
 
 #[allow(missing_docs)]
@@ -133,8 +132,8 @@ impl SparseIndex {
     pub fn write_index_to(&self, path: &Path) -> Result<(), WriteSparseIndexError> {
         for (package, sparse_index_package) in self.packages.iter() {
             // Create the directory for the package
-            let package_path = sparse_index_filename(Path::new(package))?;
-            std::fs::create_dir_all(&package_path)?;
+            let package_path = path.join(sparse_index_filename(Path::new(package))?);
+            std::fs::create_dir_all(&package_path.parent().unwrap())?;
 
             // Write the file
             let file = std::fs::File::create(package_path)?;
@@ -148,22 +147,19 @@ impl SparseIndex {
 
 impl From<RepoData> for SparseIndex {
     fn from(value: RepoData) -> Self {
-        let mut packages = HashMap::new();
-        for (package_name, record) in value.packages.into_iter() {
-            let sparse_index_record = SparseIndexRecord::from_record(record, package_name.clone());
-            packages
-                .entry(package_name)
-                .or_insert_with(|| SparseIndexPackage { records: vec![] })
-                .records
-                .push(sparse_index_record);
-        }
+        let packages = value
+            .packages
+            .into_iter()
+            .chain(value.conda_packages.into_iter())
+            .map(|(filename, record)| SparseIndexRecord::from_record(record, filename))
+            .into_group_map_by(|record| record.package_record.name.clone())
+            .into_iter()
+            .map(|(name, records)| (name.clone(), SparseIndexPackage { records }))
+            .collect();
 
-        SparseIndex {
-            packages,
-        }
+        SparseIndex { packages }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -4,9 +4,10 @@ use futures::{StreamExt, TryStreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use itertools::Itertools;
 use parking_lot::Mutex;
-use rattler_conda_types::sparse_index::SparseIndexRecord;
+use rattler_conda_types::sparse_index::{sparse_index_filename, SparseIndexRecord};
 use rattler_conda_types::{Channel, Platform, RepoDataRecord};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Weak};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -160,6 +161,9 @@ impl Gateway {
             rx
         };
 
+        // Drop the in-flight lock or we will dead-lock while waiting for it to finish.
+        drop(in_flight);
+
         Ok(receiver
             .recv()
             .await
@@ -182,9 +186,11 @@ async fn fetch_from_channel(
     platform: Platform,
     package: String,
 ) -> Result<Vec<RepoDataRecord>, GatewayError> {
+    let package_path = sparse_index_filename(Path::new(&package)).unwrap();
+
     let index_url = channel
         .platform_url(platform)
-        .join(&format!("{}.json", &package))
+        .join(&format!("{}", package_path.display()))
         .unwrap();
 
     let channel_name: Arc<str> = channel.canonical_name().into();
@@ -209,9 +215,9 @@ async fn fetch_from_channel(
                         .map(|record| RepoDataRecord {
                             package_record: record.package_record,
                             url: platform_url
-                                .join(&record.filename)
+                                .join(&record.file_name)
                                 .expect("must be able to append a filename"),
-                            file_name: record.filename,
+                            file_name: record.file_name,
                             channel: channel_name.clone(),
                         })
                         .map_err(|_| GatewayError::EncodingError)
@@ -221,5 +227,74 @@ async fn fetch_from_channel(
             .await
     } else {
         unreachable!("only local disk is supported")
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::sparse_index::Gateway;
+    use itertools::Itertools;
+    use rattler_conda_types::sparse_index::SparseIndex;
+    use rattler_conda_types::{Channel, ChannelConfig, Platform, RepoData};
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+    use url::Url;
+
+    fn conda_json_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/channels/conda-forge/linux-64/repodata.json")
+    }
+
+    fn conda_json_path_noarch() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/channels/conda-forge/noarch/repodata.json")
+    }
+
+    #[tokio::test]
+    async fn test_gateway() {
+        let sparse_index = tempfile::TempDir::new().unwrap();
+
+        // Create sparse index from repodata
+        let linux_64 = SparseIndex::from(RepoData::from_path(conda_json_path()).unwrap());
+        let noarch = SparseIndex::from(RepoData::from_path(conda_json_path_noarch()).unwrap());
+
+        // Write to disk
+        linux_64
+            .write_index_to(&sparse_index.path().join("linux-64"))
+            .unwrap();
+        noarch
+            .write_index_to(&sparse_index.path().join("noarch"))
+            .unwrap();
+
+        println!("Sparse index written to: {}", sparse_index.path().display());
+
+        let before_parse = Instant::now();
+
+        // Create a gateway from the sparse index
+        let channel = Channel::from_url(
+            Url::from_directory_path(sparse_index.path()).unwrap(),
+            None,
+            &ChannelConfig::default(),
+        );
+
+        let gateway = Gateway::from_channels([channel]);
+        let records = gateway
+            .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python"])
+            .await
+            .unwrap();
+
+        let after_parse = Instant::now();
+
+        println!(
+            "Parsing records took {}",
+            human_duration::human_duration(&(after_parse - before_parse))
+        );
+
+        insta::assert_yaml_snapshot!(records
+            .into_values()
+            .flat_map(|record| record.into_iter())
+            .map(|record| format!("{}/{}", &record.package_record.subdir, &record.file_name))
+            .sorted()
+            .collect::<Vec<_>>());
     }
 }
