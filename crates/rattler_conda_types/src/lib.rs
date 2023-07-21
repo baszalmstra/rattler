@@ -14,6 +14,7 @@ mod run_export;
 mod utils;
 mod version;
 pub mod version_spec;
+pub mod sparse_index;
 
 pub mod conda_lock;
 mod generic_virtual_package;
