@@ -36,10 +36,22 @@ struct SparseIndexPackage {
     records: Vec<SparseIndexRecord>,
 }
 
+impl SparseIndexPackage {
+
+    /// Write a sparse index package to a file
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), WriteSparseIndexError> {
+        let mut writer = std::io::LineWriter::new(writer);
+        for record in self.records.iter() {
+            writer.write_all(serde_json::to_string(record)?.as_bytes())?
+        }
+        Ok(())
+    }
+}
+
 /// The entire sparse index
 struct SparseIndex {
     /// Package name to sparse index package
-    packages: HashMap<String, SparseIndexPackage>,
+    pub packages: HashMap<String, SparseIndexPackage>,
 }
 
 #[allow(missing_docs)]
@@ -116,24 +128,24 @@ pub enum WriteSparseIndexError {
 }
 
 impl SparseIndex {
+    /// Write entire index to local path on filesystem
+    /// directories are created if they do not exist yet
     pub fn write_index_to(&self, path: &Path) -> Result<(), WriteSparseIndexError> {
-        for (package, sparse_index_record) in self.packages.iter() {
+        for (package, sparse_index_package) in self.packages.iter() {
             // Create the directory for the package
             let package_path = sparse_index_filename(Path::new(package))?;
             std::fs::create_dir_all(&package_path)?;
 
             // Write the file
             let file = std::fs::File::create(package_path)?;
-            let writer = std::io::BufWriter::new(file);
-            let mut writer = std::io::LineWriter::new(writer);
-            for record in sparse_index_record.records.iter() {
-                writer.write_all(serde_json::to_string(record)?.as_bytes())?
-            }
+            let mut writer = std::io::BufWriter::new(file);
+            sparse_index_package.write(&mut writer)?;
         }
 
         Ok(())
     }
 }
+
 
 #[cfg(test)]
 mod tests {
