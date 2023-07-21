@@ -4,6 +4,7 @@ use crate::PackageRecord;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -28,7 +29,7 @@ impl SparseIndexRecord {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 /// A single package in the sparse index
 struct SparseIndexPackage {
     /// Sparse index records
@@ -102,8 +103,34 @@ pub fn sparse_index_filename(filename: &Path) -> Result<PathBuf, SparseIndexFile
     Ok(new_path)
 }
 
+#[allow(missing_docs)]
+/// Error when trying to write a sparse index
+#[derive(Error, Debug)]
+pub enum WriteSparseIndexError {
+    #[error(transparent)]
+    FileNameError(#[from] SparseIndexFilenameError),
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    SerdeError(#[from] serde_json::Error),
+}
+
 impl SparseIndex {
-    pub fn write_index(path: &Path) -> Result<(), ()> {
+    pub fn write_index_to(&self, path: &Path) -> Result<(), WriteSparseIndexError> {
+        for (package, sparse_index_record) in self.packages.iter() {
+            // Create the directory for the package
+            let package_path = sparse_index_filename(Path::new(package))?;
+            std::fs::create_dir_all(&package_path)?;
+
+            // Write the file
+            let file = std::fs::File::create(package_path)?;
+            let writer = std::io::BufWriter::new(file);
+            let mut writer = std::io::LineWriter::new(writer);
+            for record in sparse_index_record.records.iter() {
+                writer.write_all(serde_json::to_string(record)?.as_bytes())?
+            }
+        }
+
         Ok(())
     }
 }
