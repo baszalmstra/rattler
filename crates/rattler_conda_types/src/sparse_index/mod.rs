@@ -1,6 +1,6 @@
 //! Contains code regarding the Sparse Index, which is a different way of handling the retrieval
 //! of records from the index.
-use crate::PackageRecord;
+use crate::{PackageRecord, RepoData};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -143,6 +143,24 @@ impl SparseIndex {
         }
 
         Ok(())
+    }
+}
+
+impl From<RepoData> for SparseIndex {
+    fn from(value: RepoData) -> Self {
+        let mut packages = HashMap::new();
+        for (package_name, record) in value.packages.into_iter() {
+            let sparse_index_record = SparseIndexRecord::from_record(record, package_name.clone());
+            packages
+                .entry(package_name)
+                .or_insert_with(|| SparseIndexPackage { records: vec![] })
+                .records
+                .push(sparse_index_record);
+        }
+
+        SparseIndex {
+            packages,
+        }
     }
 }
 
