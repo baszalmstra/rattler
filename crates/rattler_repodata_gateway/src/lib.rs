@@ -63,3 +63,4 @@ pub mod fetch;
 pub mod sparse;
 
 mod utils;
+mod sparse_index;
