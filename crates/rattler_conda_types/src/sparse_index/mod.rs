@@ -28,6 +28,11 @@ impl SparseIndexRecord {
             file_name: filename,
         }
     }
+
+    /// Converts to json
+    pub fn json(&self) -> serde_json::Result<String> {
+        serde_json::to_string(&self)
+    }
 }
 
 #[derive(Debug)]
