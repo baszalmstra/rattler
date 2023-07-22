@@ -161,6 +161,24 @@ impl From<RepoData> for SparseIndex {
     }
 }
 
+impl From<&RepoData> for SparseIndex {
+    fn from(value: &RepoData) -> Self {
+        let packages = value
+            .packages
+            .iter()
+            .chain(value.conda_packages.iter())
+            .map(|(filename, record)| {
+                SparseIndexRecord::from_record(record.clone(), filename.clone())
+            })
+            .into_group_map_by(|record| record.package_record.name.clone())
+            .into_iter()
+            .map(|(name, records)| (name.clone(), SparseIndexPackage { records }))
+            .collect();
+
+        SparseIndex { packages }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sparse_index_filename;
