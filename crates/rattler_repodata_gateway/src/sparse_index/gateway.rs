@@ -7,7 +7,6 @@ use parking_lot::Mutex;
 use rattler_conda_types::sparse_index::{sparse_index_filename, SparseIndexRecord};
 use rattler_conda_types::{Channel, Platform, RepoDataRecord};
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::{Arc, Weak};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -206,7 +205,7 @@ async fn fetch_from_channel(
     platform: Platform,
     package: String,
 ) -> Result<Vec<RepoDataRecord>, GatewayError> {
-    let package_path = sparse_index_filename(Path::new(&package)).unwrap();
+    let package_path = sparse_index_filename(&package).unwrap();
 
     let index_url = channel
         .platform_url(platform)

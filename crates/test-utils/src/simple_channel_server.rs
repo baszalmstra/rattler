@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 use tower_http::services::ServeDir;
 use url::Url;
 
+/// A stupid simple channel server.
 pub struct SimpleChannelServer {
     local_addr: SocketAddr,
     shutdown_sender: Option<oneshot::Sender<()>>,
@@ -45,7 +46,7 @@ impl SimpleChannelServer {
 
         // Spawn the server. Let go of the JoinHandle, we can use the graceful shutdown trigger to
         // stop the server.
-        let _ = tokio::spawn(server);
+        let _handle = tokio::spawn(server);
 
         Self {
             local_addr: addr,

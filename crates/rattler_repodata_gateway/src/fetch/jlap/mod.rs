@@ -591,7 +591,7 @@ mod test {
     use std::path::PathBuf;
 
     use crate::fetch::cache::RepoDataState;
-    use crate::utils::simple_channel_server::SimpleChannelServer;
+    use test_utils::SimpleChannelServer;
 
     use rattler_digest::{parse_digest_from_hex, Blake2b256};
     use rattler_networking::AuthenticatedClient;

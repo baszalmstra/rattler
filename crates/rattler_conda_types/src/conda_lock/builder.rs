@@ -433,7 +433,7 @@ mod tests {
 
         assert_eq!(record.package_record.name, locked_dep.name);
         assert_eq!(
-            record.channel,
+            record.channel.as_ref(),
             "https://conda.anaconda.org/conda-forge".to_string()
         );
         assert_eq!(

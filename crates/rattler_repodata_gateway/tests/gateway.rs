@@ -77,3 +77,38 @@ async fn test_gateway() {
         .sorted()
         .collect::<Vec<_>>());
 }
+
+#[tokio::test]
+async fn test_remote_gateway() {
+    let sparse_index = sparse_index_path();
+
+    let before_parse = Instant::now();
+
+    let repodata_server =
+        test_utils::SimpleChannelServer::new(
+            sparse_index,
+        );
+
+    // Create a gateway from the sparse index
+    let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+
+    let gateway = Gateway::from_channels([channel]);
+    let records = gateway
+        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python"])
+        .await
+        .unwrap();
+
+    let after_parse = Instant::now();
+
+    println!(
+        "Parsing records took {}",
+        human_duration::human_duration(&(after_parse - before_parse))
+    );
+
+    insta::assert_yaml_snapshot!(records
+        .into_values()
+        .flat_map(|record| record.into_iter())
+        .map(|record| format!("{}/{}", &record.package_record.subdir, &record.file_name))
+        .sorted()
+        .collect::<Vec<_>>());
+}

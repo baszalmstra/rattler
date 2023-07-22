@@ -999,7 +999,6 @@ mod test {
         fetch_repo_data, CacheResult, CachedRepoData, DownloadProgress, FetchRepoDataOptions,
     };
     use crate::fetch::{FetchRepoDataError, RepoDataNotFoundError};
-    use crate::utils::simple_channel_server::SimpleChannelServer;
     use crate::utils::Encoding;
     use assert_matches::assert_matches;
     use hex_literal::hex;
@@ -1009,6 +1008,7 @@ mod test {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+    use test_utils::SimpleChannelServer;
     use tokio::io::AsyncWriteExt;
     use url::Url;
 

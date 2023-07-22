@@ -1,12 +1,12 @@
-pub use encoding::{AsyncEncoding, Encoding};
-pub use flock::LockedFile;
+//! Utility functions.
+
+pub(crate) use encoding::{AsyncEncoding, Encoding};
+pub(crate) use flock::LockedFile;
 use std::fmt::Write;
 use url::Url;
 
 mod encoding;
 
-#[cfg(test)]
-pub(crate) mod simple_channel_server;
 
 mod flock;
 
