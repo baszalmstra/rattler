@@ -1,8 +1,8 @@
 //! Defines the `[RepoDataRecord]` struct.
 
-use std::sync::Arc;
 use crate::PackageRecord;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use url::Url;
 
 /// Information about a package from repodata. It includes a [`crate::PackageRecord`] but it also stores

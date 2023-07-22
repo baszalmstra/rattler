@@ -13,8 +13,8 @@ use fxhash::FxHashMap;
 use rattler_digest::{serde::SerializableHash, Md5Hash, Sha256Hash};
 use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, skip_serializing_none, DisplayFromStr};
-use std::{fs::File, io::Read, path::Path, str::FromStr};
 use std::sync::Arc;
+use std::{fs::File, io::Read, path::Path, str::FromStr};
 use url::Url;
 
 pub mod builder;

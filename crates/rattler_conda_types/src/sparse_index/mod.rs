@@ -76,10 +76,10 @@ pub fn sparse_index_filename(filename: &Path) -> Result<PathBuf, SparseIndexFile
     let mut new_path = PathBuf::new();
     let filename = filename
         .file_name()
-        .ok_or_else(|| SparseIndexFilenameError::NoFileNameComponent)?;
+        .ok_or(SparseIndexFilenameError::NoFileNameComponent)?;
     let filename = filename
         .to_str()
-        .ok_or_else(|| SparseIndexFilenameError::Utf8Error)?;
+        .ok_or(SparseIndexFilenameError::Utf8Error)?;
 
     // Create path according to rules in docs
     match filename.len() {
@@ -133,7 +133,7 @@ impl SparseIndex {
         for (package, sparse_index_package) in self.packages.iter() {
             // Create the directory for the package
             let package_path = path.join(sparse_index_filename(Path::new(package))?);
-            std::fs::create_dir_all(&package_path.parent().unwrap())?;
+            std::fs::create_dir_all(package_path.parent().unwrap())?;
 
             // Write the file
             let file = std::fs::File::create(package_path)?;
@@ -154,7 +154,7 @@ impl From<RepoData> for SparseIndex {
             .map(|(filename, record)| SparseIndexRecord::from_record(record, filename))
             .into_group_map_by(|record| record.package_record.name.clone())
             .into_iter()
-            .map(|(name, records)| (name.clone(), SparseIndexPackage { records }))
+            .map(|(name, records)| (name, SparseIndexPackage { records }))
             .collect();
 
         SparseIndex { packages }

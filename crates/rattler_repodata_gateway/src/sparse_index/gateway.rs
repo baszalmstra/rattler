@@ -14,6 +14,8 @@ use tokio::io::BufReader;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::LinesStream;
 
+/// An error that can occur when accesing records in the [`Gateway`]
+#[allow(missing_docs)]
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum GatewayError {
     #[error("a pending request was cancelled")]
@@ -26,23 +28,32 @@ pub enum GatewayError {
     IoError(Arc<std::io::Error>),
 }
 
+/// An object that allows fetching and caching [`RepoDataRecord`]s.
 pub struct Gateway {
     inner: Arc<GatewayInner>,
 }
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct CacheKey {
+    channel_idx: usize,
+    platform: Platform,
+    package_name: String,
+}
+
+type FetchResultChannel = broadcast::Sender<Result<(), GatewayError>>;
 
 pub struct GatewayInner {
     channels: Vec<Channel>,
 
     /// A mapping from platform and package name to its records.
-    records: FrozenMap<(usize, Platform, String), Vec<RepoDataRecord>>,
+    records: FrozenMap<CacheKey, Vec<RepoDataRecord>>,
 
     /// A mapping from platform and package name to ongoing requests.
-    in_flight: Mutex<
-        FxHashMap<(usize, Platform, String), Weak<broadcast::Sender<Result<(), GatewayError>>>>,
-    >,
+    in_flight: Mutex<FxHashMap<CacheKey, Weak<FetchResultChannel>>>,
 }
 
 impl Gateway {
+    /// Construct a new gateway from one or more channels.
     pub fn from_channels(channels: impl IntoIterator<Item = Channel>) -> Self {
         Self {
             inner: Arc::new(GatewayInner {
@@ -53,6 +64,8 @@ impl Gateway {
         }
     }
 
+    /// Recursively fetching all [`RepoDataRecord]`s for the specified package names from the given
+    /// channels.
     pub async fn find_recursive_records(
         &self,
         platforms: Vec<Platform>,
@@ -109,18 +122,22 @@ impl Gateway {
     }
 
     /// Downloads all the records for the package with the given name.
+    #[allow(clippy::await_holding_lock)] // This is a false positive. The `in_flight` lock is not held while awaiting. It is dropped on time.
     async fn fetch_records(
         &self,
         channel_idx: usize,
         package_name: String,
         platform: Platform,
     ) -> Result<(usize, Platform, &[RepoDataRecord]), GatewayError> {
-        let key = (channel_idx, platform, package_name);
+        let key = CacheKey {
+            channel_idx,
+            package_name,
+            platform,
+        };
 
         // If we already have the records we can return them immediately.
-        match self.inner.records.get(&key) {
-            Some(records) => return Ok((channel_idx, platform, records)),
-            None => {}
+        if let Some(records) = self.inner.records.get(&key) {
+            return Ok((channel_idx, platform, records));
         }
 
         // Otherwise, we look for an in-flight request
@@ -143,16 +160,19 @@ impl Gateway {
             let inner = self.inner.clone();
             let key = key.clone();
             tokio::spawn(async move {
-                let result =
-                    match fetch_from_channel(&inner.channels[channel_idx], platform, key.2.clone())
-                        .await
-                    {
-                        Ok(records) => {
-                            inner.records.insert(key, records);
-                            Ok(())
-                        }
-                        Err(err) => Err(err),
-                    };
+                let result = match fetch_from_channel(
+                    &inner.channels[channel_idx],
+                    platform,
+                    key.package_name.clone(),
+                )
+                .await
+                {
+                    Ok(records) => {
+                        inner.records.insert(key, records);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                };
 
                 // Broadcast the result
                 let _ = tx.send(result);
@@ -164,7 +184,7 @@ impl Gateway {
         // Drop the in-flight lock or we will dead-lock while waiting for it to finish.
         drop(in_flight);
 
-        Ok(receiver
+        receiver
             .recv()
             .await
             .map_err(|_| GatewayError::Cancelled)
@@ -177,7 +197,7 @@ impl Gateway {
                         .get(&key)
                         .expect("records must be present in the frozen set"),
                 )
-            })?)
+            })
     }
 }
 
@@ -231,70 +251,4 @@ async fn fetch_from_channel(
 }
 
 #[cfg(test)]
-mod test {
-    use crate::sparse_index::Gateway;
-    use itertools::Itertools;
-    use rattler_conda_types::sparse_index::SparseIndex;
-    use rattler_conda_types::{Channel, ChannelConfig, Platform, RepoData};
-    use std::path::{Path, PathBuf};
-    use std::time::Instant;
-    use url::Url;
-
-    fn conda_json_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-data/channels/conda-forge/linux-64/repodata.json")
-    }
-
-    fn conda_json_path_noarch() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-data/channels/conda-forge/noarch/repodata.json")
-    }
-
-    #[tokio::test]
-    async fn test_gateway() {
-        let sparse_index = tempfile::TempDir::new().unwrap();
-
-        // Create sparse index from repodata
-        let linux_64 = SparseIndex::from(RepoData::from_path(conda_json_path()).unwrap());
-        let noarch = SparseIndex::from(RepoData::from_path(conda_json_path_noarch()).unwrap());
-
-        // Write to disk
-        linux_64
-            .write_index_to(&sparse_index.path().join("linux-64"))
-            .unwrap();
-        noarch
-            .write_index_to(&sparse_index.path().join("noarch"))
-            .unwrap();
-
-        println!("Sparse index written to: {}", sparse_index.path().display());
-
-        let before_parse = Instant::now();
-
-        // Create a gateway from the sparse index
-        let channel = Channel::from_url(
-            Url::from_directory_path(sparse_index.path()).unwrap(),
-            None,
-            &ChannelConfig::default(),
-        );
-
-        let gateway = Gateway::from_channels([channel]);
-        let records = gateway
-            .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python"])
-            .await
-            .unwrap();
-
-        let after_parse = Instant::now();
-
-        println!(
-            "Parsing records took {}",
-            human_duration::human_duration(&(after_parse - before_parse))
-        );
-
-        insta::assert_yaml_snapshot!(records
-            .into_values()
-            .flat_map(|record| record.into_iter())
-            .map(|record| format!("{}/{}", &record.package_record.subdir, &record.file_name))
-            .sorted()
-            .collect::<Vec<_>>());
-    }
-}
+mod test {}

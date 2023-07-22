@@ -62,5 +62,5 @@ pub mod fetch;
 #[cfg(feature = "sparse")]
 pub mod sparse;
 
-mod sparse_index;
+pub mod sparse_index;
 mod utils;
