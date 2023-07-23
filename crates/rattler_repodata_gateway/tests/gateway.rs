@@ -99,7 +99,7 @@ async fn test_remote_gateway() {
 
     let gateway = Gateway::from_channels(AuthenticatedClient::default(), &cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python", "pytorch", "rubin-env"])
+        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["jupyterlab", "pytorch", "rubin-env"])
         .await
         .unwrap();
 
