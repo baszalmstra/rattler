@@ -1,17 +1,29 @@
+use bytes::Bytes;
 use elsa::sync::FrozenMap;
 use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use fxhash::{FxHashMap, FxHashSet};
+use http_cache_semantics::CachePolicy;
 use itertools::Itertools;
 use parking_lot::Mutex;
-use rattler_conda_types::sparse_index::{sparse_index_filename, SparseIndexRecord};
+use rattler_conda_types::sparse_index::{
+    sparse_index_filename, SparseIndexRecord,
+};
 use rattler_conda_types::{Channel, Platform, RepoDataRecord};
+use rattler_networking::AuthenticatedClient;
+use reqwest::{Error, StatusCode};
 use std::collections::VecDeque;
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::LinesStream;
+use tokio::try_join;
+use tokio_stream::wrappers::{BroadcastStream, LinesStream};
+use tokio_stream::Stream;
+use tokio_util::io::StreamReader;
+use url::Url;
 
 /// An error that can occur when accesing records in the [`Gateway`]
 #[allow(missing_docs)]
@@ -24,7 +36,31 @@ pub enum GatewayError {
     EncodingError,
 
     #[error(transparent)]
-    IoError(Arc<std::io::Error>),
+    IoError(#[from] Arc<std::io::Error>),
+
+    #[error(transparent)]
+    HttpError(#[from] Arc<reqwest::Error>),
+
+    #[error(transparent)]
+    CacheError(#[from] Arc<cacache::Error>),
+}
+
+impl From<reqwest::Error> for GatewayError {
+    fn from(value: Error) -> Self {
+        GatewayError::HttpError(Arc::new(value))
+    }
+}
+
+impl From<io::Error> for GatewayError {
+    fn from(value: io::Error) -> Self {
+        GatewayError::IoError(Arc::new(value))
+    }
+}
+
+impl From<cacache::Error> for GatewayError {
+    fn from(value: cacache::Error) -> Self {
+        GatewayError::CacheError(Arc::new(value))
+    }
 }
 
 /// An object that allows fetching and caching [`RepoDataRecord`]s.
@@ -42,6 +78,8 @@ struct CacheKey {
 type FetchResultChannel = broadcast::Sender<Result<(), GatewayError>>;
 
 pub struct GatewayInner {
+    client: AuthenticatedClient,
+    cache_dir: PathBuf,
     channels: Vec<Channel>,
 
     /// A mapping from platform and package name to its records.
@@ -53,9 +91,15 @@ pub struct GatewayInner {
 
 impl Gateway {
     /// Construct a new gateway from one or more channels.
-    pub fn from_channels(channels: impl IntoIterator<Item = Channel>) -> Self {
+    pub fn from_channels(
+        client: AuthenticatedClient,
+        cache_dir: impl Into<PathBuf>,
+        channels: impl IntoIterator<Item = Channel>,
+    ) -> Self {
         Self {
             inner: Arc::new(GatewayInner {
+                client,
+                cache_dir: cache_dir.into(),
                 channels: channels.into_iter().collect(),
                 records: FrozenMap::default(),
                 in_flight: Mutex::new(FxHashMap::default()),
@@ -158,8 +202,12 @@ impl Gateway {
 
             let inner = self.inner.clone();
             let key = key.clone();
+            let client = self.inner.client.clone();
+            let cache_dir = self.inner.cache_dir.clone();
             tokio::spawn(async move {
                 let result = match fetch_from_channel(
+                    client,
+                    cache_dir,
                     &inner.channels[channel_idx],
                     platform,
                     key.package_name.clone(),
@@ -201,52 +249,180 @@ impl Gateway {
 }
 
 async fn fetch_from_channel(
+    client: AuthenticatedClient,
+    cache_dir: PathBuf,
     channel: &Channel,
     platform: Platform,
-    package: String,
+    package_name: String,
 ) -> Result<Vec<RepoDataRecord>, GatewayError> {
-    let package_path = sparse_index_filename(&package).unwrap();
-
-    let index_url = channel
-        .platform_url(platform)
-        .join(&format!("{}", package_path.display()))
-        .unwrap();
-
     let channel_name: Arc<str> = channel.canonical_name().into();
     let platform_url = channel.platform_url(platform);
 
-    if let Ok(file_path) = index_url.to_file_path() {
-        // Read the file from disk.
-        let file = match tokio::fs::File::open(&file_path).await {
-            Ok(file) => BufReader::new(file),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(GatewayError::IoError(Arc::new(e))),
-        };
+    println!("Started download of {} on {platform}", &package_name);
 
-        // Deserialize each line individually
-        LinesStream::new(file.lines())
-            .map_err(|e| GatewayError::IoError(Arc::new(e)))
-            .and_then(move |line| {
-                let platform_url = platform_url.clone();
-                let channel_name = channel_name.clone();
-                async move {
-                    serde_json::from_str::<SparseIndexRecord>(&line)
-                        .map(|record| RepoDataRecord {
-                            package_record: record.package_record,
-                            url: platform_url
-                                .join(&record.file_name)
-                                .expect("must be able to append a filename"),
-                            file_name: record.file_name,
-                            channel: channel_name.clone(),
-                        })
-                        .map_err(|_| GatewayError::EncodingError)
-                }
-            })
-            .try_collect()
-            .await
+    let result = if let Ok(platform_path) = platform_url.to_file_path() {
+        fetch_from_local_channel(channel_name, &package_name, platform_path).await
     } else {
-        unreachable!("only local disk is supported")
+        fetch_from_remote_channel(client, cache_dir, channel_name, &package_name, platform_url)
+            .await
+    };
+
+    println!("Finished downloading {} on {platform}", &package_name);
+
+    result
+}
+
+/// Try to read [`RepoDataRecord`]s from a SparseIndexPackage file on disk.
+async fn fetch_from_local_channel(
+    channel_name: Arc<str>,
+    package_name: &str,
+    platform_path: PathBuf,
+) -> Result<Vec<RepoDataRecord>, GatewayError> {
+    let package_path = platform_path.join(sparse_index_filename(&package_name).unwrap());
+    let platform_url = Url::from_directory_path(platform_path)
+        .expect("platform path must refer to a valid directory");
+
+    // Read the file from disk. If the file is not found we simply return no records.
+    let file = match tokio::fs::File::open(&package_path).await {
+        Ok(file) => BufReader::new(file),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(GatewayError::IoError(Arc::new(e))),
+    };
+
+    // Deserialize each line individually
+    parse_sparse_index_package(file)
+        .map_ok(move |record| RepoDataRecord {
+            package_record: record.package_record,
+            url: platform_url
+                .join(&record.file_name)
+                .expect("must be able to append a filename"),
+            file_name: record.file_name,
+            channel: channel_name.clone(),
+        })
+        .try_collect()
+        .await
+}
+
+/// Try to read [`RepoDataRecord`]s from a [`SparseIndexPackage`] file at a remote url. Reads from
+/// the cache if thats possible.
+async fn fetch_from_remote_channel(
+    client: AuthenticatedClient,
+    cache_dir: PathBuf,
+    channel_name: Arc<str>,
+    package_name: &str,
+    platform_url: Url,
+) -> Result<Vec<RepoDataRecord>, GatewayError> {
+    // Determine the location of the [`SparseIndexPackage`] file.
+    let package_path = sparse_index_filename(package_name).expect("invalid package name");
+    let index_url = platform_url
+        .join(&package_path.to_string_lossy())
+        .expect("invalid package path");
+
+    remote_fetch(client, cache_dir, channel_name, platform_url, index_url).await
+}
+
+/// Try to read [`RepoDataRecord`]s from a [`SparseIndexPackage`] file at a remote url. Does not
+/// read from the cache but does store the result in the cache.
+async fn remote_fetch(
+    client: AuthenticatedClient,
+    cache_dir: PathBuf,
+    channel_name: Arc<str>,
+    platform_url: Url,
+    index_url: Url,
+) -> Result<Vec<RepoDataRecord>, GatewayError> {
+    // Construct the request for caching
+    let req = client
+        .get(index_url.clone())
+        .build()
+        .expect("failed to create request");
+
+    // Send the request.
+    let res = client.get(index_url.clone()).send().await?;
+
+    // Special case: 404.
+    // If the file is not found we simply assume there are no records for the package
+    if res.status() == StatusCode::NOT_FOUND {
+        println!("Not found! {}", &index_url);
+        return Ok(vec![]);
     }
+
+    // Filter out any other error cases
+    let res = res.error_for_status()?;
+
+    // Create a stream for the bytes with some backpressure.
+    let (bytes_sender, bytes_receiver) = broadcast::channel::<Bytes>(100);
+
+    // Construct a cache policy for the request
+    let cache_policy = CachePolicy::new(&req, &res);
+    let cache_future = if cache_policy.is_storable() {
+        // Open the cache writer
+        let mut bytes_receiver = bytes_sender.subscribe();
+        cacache::Writer::create(cache_dir, index_url)
+            .map_err(GatewayError::from)
+            .and_then(move |mut writer| async move {
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&cache_policy)
+                                .expect("failed to convert cache policy to json")
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+
+                // Receive bytes and write them to disk
+                while let Ok(bytes) = bytes_receiver.recv().await {
+                    writer.write_all(&bytes).await?;
+                }
+
+                writer.commit().await?;
+                Ok(())
+            })
+            .left_future()
+    } else {
+        futures::future::ready(Ok(())).right_future()
+    };
+
+    // Decode the records on a background task
+    let collect_records_future = parse_sparse_index_package(StreamReader::new(
+        BroadcastStream::new(bytes_receiver).map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+    ))
+    .map_ok(|record| RepoDataRecord {
+        package_record: record.package_record,
+        url: platform_url
+            .join(&record.file_name)
+            .expect("must be able to append a filename"),
+        file_name: record.file_name,
+        channel: channel_name.clone(),
+    })
+    .try_collect();
+
+    // Stream the bytes from the response
+    let copy_bytes_future = res
+        .bytes_stream()
+        .map_err(|e| GatewayError::from(e))
+        .try_for_each(move |bytes| {
+            let bytes_sender = bytes_sender.clone();
+            async move {
+                let _ = bytes_sender.send(bytes);
+                Ok(())
+            }
+        });
+
+    Ok(try_join!(collect_records_future, copy_bytes_future, cache_future)?.0)
+}
+
+/// Given a stream of bytes, parse individual lines as [`SparseIndexRecord`]s.
+fn parse_sparse_index_package<R: AsyncBufRead>(
+    reader: R,
+) -> impl Stream<Item = Result<SparseIndexRecord, GatewayError>> {
+    LinesStream::new(reader.lines())
+        .map_err(|e| GatewayError::IoError(Arc::new(e)))
+        .and_then(|line| async move {
+            serde_json::from_str::<SparseIndexRecord>(&line)
+                .map_err(|_| GatewayError::EncodingError)
+        })
 }
 
 #[cfg(test)]

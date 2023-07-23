@@ -1,5 +1,6 @@
 use itertools::Itertools;
 use rattler_conda_types::{sparse_index::SparseIndex, Channel, ChannelConfig, Platform, RepoData};
+use rattler_networking::AuthenticatedClient;
 use rattler_repodata_gateway::sparse_index::Gateway;
 use std::{
     path::{Path, PathBuf},
@@ -47,6 +48,7 @@ fn sparse_index_path() -> &'static Path {
 #[tokio::test]
 async fn test_gateway() {
     let sparse_index = sparse_index_path();
+    let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
 
     let before_parse = Instant::now();
 
@@ -57,9 +59,9 @@ async fn test_gateway() {
         &ChannelConfig::default(),
     );
 
-    let gateway = Gateway::from_channels([channel]);
+    let gateway = Gateway::from_channels(AuthenticatedClient::default(), cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python"])
+        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["jupyterlab"])
         .await
         .unwrap();
 
@@ -78,23 +80,21 @@ async fn test_gateway() {
         .collect::<Vec<_>>());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_remote_gateway() {
     let sparse_index = sparse_index_path();
+    let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
 
     let before_parse = Instant::now();
 
-    let repodata_server =
-        test_utils::SimpleChannelServer::new(
-            sparse_index,
-        );
+    let repodata_server = test_utils::SimpleChannelServer::new(sparse_index);
 
     // Create a gateway from the sparse index
     let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
 
-    let gateway = Gateway::from_channels([channel]);
+    let gateway = Gateway::from_channels(AuthenticatedClient::default(), &cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python"])
+        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["jupyterlab"])
         .await
         .unwrap();
 
@@ -103,6 +103,11 @@ async fn test_remote_gateway() {
     println!(
         "Parsing records took {}",
         human_duration::human_duration(&(after_parse - before_parse))
+    );
+
+    println!(
+        "Number of returned records {}",
+        records.values().map(|records| records.len()).sum::<usize>()
     );
 
     insta::assert_yaml_snapshot!(records
