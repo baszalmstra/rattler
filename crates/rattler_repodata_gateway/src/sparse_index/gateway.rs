@@ -1,27 +1,32 @@
 use bytes::Bytes;
 use elsa::sync::FrozenMap;
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use http_cache_semantics::CachePolicy;
 use itertools::Itertools;
 use parking_lot::Mutex;
-use rattler_conda_types::sparse_index::{
-    sparse_index_filename, SparseIndexRecord,
+use rattler_conda_types::{
+    sparse_index::{sparse_index_filename, SparseIndexRecord},
+    Channel, Platform, RepoDataRecord,
 };
-use rattler_conda_types::{Channel, Platform, RepoDataRecord};
 use rattler_networking::AuthenticatedClient;
 use reqwest::{Error, StatusCode};
-use std::collections::VecDeque;
-use std::io;
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::broadcast;
-use tokio::try_join;
-use tokio_stream::wrappers::{BroadcastStream, LinesStream};
-use tokio_stream::Stream;
+use std::{
+    collections::VecDeque,
+    io,
+    path::PathBuf,
+    sync::{Arc, Weak},
+};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt},
+    io::{AsyncWriteExt, BufReader},
+    sync::broadcast,
+    try_join,
+};
+use tokio_stream::{
+    wrappers::{BroadcastStream, LinesStream},
+    Stream,
+};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -258,7 +263,7 @@ async fn fetch_from_channel(
     let channel_name: Arc<str> = channel.canonical_name().into();
     let platform_url = channel.platform_url(platform);
 
-    println!("Started download of {} on {platform}", &package_name);
+    // println!("Started download of {} on {platform}", &package_name);
 
     let result = if let Ok(platform_path) = platform_url.to_file_path() {
         fetch_from_local_channel(channel_name, &package_name, platform_path).await
@@ -267,7 +272,7 @@ async fn fetch_from_channel(
             .await
     };
 
-    println!("Finished downloading {} on {platform}", &package_name);
+    // println!("Finished downloading {} on {platform}", &package_name);
 
     result
 }
@@ -342,7 +347,6 @@ async fn remote_fetch(
     // Special case: 404.
     // If the file is not found we simply assume there are no records for the package
     if res.status() == StatusCode::NOT_FOUND {
-        println!("Not found! {}", &index_url);
         return Ok(vec![]);
     }
 
@@ -355,31 +359,15 @@ async fn remote_fetch(
     // Construct a cache policy for the request
     let cache_policy = CachePolicy::new(&req, &res);
     let cache_future = if cache_policy.is_storable() {
-        // Open the cache writer
-        let mut bytes_receiver = bytes_sender.subscribe();
-        cacache::Writer::create(cache_dir, index_url)
-            .map_err(GatewayError::from)
-            .and_then(move |mut writer| async move {
-                writer
-                    .write_all(
-                        format!(
-                            "{}\n",
-                            serde_json::to_string(&cache_policy)
-                                .expect("failed to convert cache policy to json")
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-
-                // Receive bytes and write them to disk
-                while let Ok(bytes) = bytes_receiver.recv().await {
-                    writer.write_all(&bytes).await?;
-                }
-
-                writer.commit().await?;
-                Ok(())
-            })
-            .left_future()
+        // Write the contents the cache
+        write_to_cache(
+            cache_dir,
+            index_url,
+            cache_policy,
+            BroadcastStream::new(bytes_sender.subscribe())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+        )
+        .left_future()
     } else {
         futures::future::ready(Ok(())).right_future()
     };
@@ -413,16 +401,64 @@ async fn remote_fetch(
     Ok(try_join!(collect_records_future, copy_bytes_future, cache_future)?.0)
 }
 
+/// Writes the given bytes to the cache and prepends the file with the cache policy.
+async fn write_to_cache(
+    cache_dir: PathBuf,
+    index_url: Url,
+    cache_policy: CachePolicy,
+    mut bytes_stream: impl Stream<Item = io::Result<Bytes>> + Unpin,
+) -> Result<(), GatewayError> {
+    cacache::Writer::create(cache_dir, index_url)
+        .map_err(GatewayError::from)
+        .and_then(move |mut writer| async move {
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&cache_policy)
+                            .expect("failed to convert cache policy to json")
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+
+            // Receive bytes and write them to disk
+            while let Some(bytes) = bytes_stream.next().await {
+                let bytes = bytes?;
+                writer.write_all(&bytes).await?;
+            }
+
+            writer.commit().await?;
+            Ok(())
+        })
+        .await
+}
+
 /// Given a stream of bytes, parse individual lines as [`SparseIndexRecord`]s.
 fn parse_sparse_index_package<R: AsyncBufRead>(
     reader: R,
 ) -> impl Stream<Item = Result<SparseIndexRecord, GatewayError>> {
     LinesStream::new(reader.lines())
         .map_err(|e| GatewayError::IoError(Arc::new(e)))
-        .and_then(|line| async move {
-            serde_json::from_str::<SparseIndexRecord>(&line)
-                .map_err(|_| GatewayError::EncodingError)
-        })
+        .map_ok(|line| parse_sparse_index_record(line))
+        .try_buffered(10)
+}
+
+async fn parse_sparse_index_record(line: String) -> Result<SparseIndexRecord, GatewayError> {
+    serde_json::from_str::<SparseIndexRecord>(&line).map_err(|_| GatewayError::EncodingError)
+    // tokio::task::spawn_blocking(move || {
+    //     serde_json::from_str::<SparseIndexRecord>(&line).map_err(|_| GatewayError::EncodingError)
+    // })
+    // .map_ok_or_else(
+    //     |join_err| match join_err.try_into_panic() {
+    //         Ok(panic) => {
+    //             std::panic::resume_unwind(panic);
+    //         }
+    //         Err(_) => Err(GatewayError::Cancelled),
+    //     },
+    //     |record| record,
+    // )
+    // .await
 }
 
 #[cfg(test)]

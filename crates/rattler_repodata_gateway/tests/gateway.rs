@@ -61,7 +61,7 @@ async fn test_gateway() {
 
     let gateway = Gateway::from_channels(AuthenticatedClient::default(), cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["jupyterlab"])
+        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python", "pytorch", "rubin-env"])
         .await
         .unwrap();
 
@@ -70,6 +70,11 @@ async fn test_gateway() {
     println!(
         "Parsing records took {}",
         human_duration::human_duration(&(after_parse - before_parse))
+    );
+
+    println!(
+        "Number of returned records {}",
+        records.values().map(|records| records.len()).sum::<usize>()
     );
 
     insta::assert_yaml_snapshot!(records
@@ -94,7 +99,7 @@ async fn test_remote_gateway() {
 
     let gateway = Gateway::from_channels(AuthenticatedClient::default(), &cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["jupyterlab"])
+        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python", "pytorch", "rubin-env"])
         .await
         .unwrap();
 
