@@ -220,10 +220,14 @@ impl Gateway {
                 .await
                 {
                     Ok(records) => {
+                        // println!("inserting values for {:?}", &key);
                         inner.records.insert(key, records);
                         Ok(())
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        // println!("ERROR: {}", &err);
+                        Err(err)
+                    }
                 };
 
                 // Broadcast the result
@@ -240,16 +244,17 @@ impl Gateway {
             .recv()
             .await
             .map_err(|_| GatewayError::Cancelled)
-            .map(|_| {
-                (
-                    channel_idx,
-                    platform,
-                    self.inner
-                        .records
-                        .get(&key)
-                        .expect("records must be present in the frozen set"),
-                )
-            })
+            .map(|result| {
+                result.map(|_| {
+                    (
+                        channel_idx,
+                        platform,
+                        self.inner.records.get(&key).expect(&format!(
+                            "records must be present in the frozen set {key:?}"
+                        )),
+                    )
+                })
+            })?
     }
 }
 
@@ -265,16 +270,13 @@ async fn fetch_from_channel(
 
     // println!("Started download of {} on {platform}", &package_name);
 
-    let result = if let Ok(platform_path) = platform_url.to_file_path() {
-        fetch_from_local_channel(channel_name, &package_name, platform_path).await
-    } else {
-        fetch_from_remote_channel(client, cache_dir, channel_name, &package_name, platform_url)
-            .await
-    };
+    if platform_url.scheme() == "file" {
+        if let Ok(platform_path) = platform_url.to_file_path() {
+            return fetch_from_local_channel(channel_name, &package_name, platform_path).await;
+        }
+    }
 
-    // println!("Finished downloading {} on {platform}", &package_name);
-
-    result
+    fetch_from_remote_channel(client, cache_dir, channel_name, &package_name, platform_url).await
 }
 
 /// Try to read [`RepoDataRecord`]s from a SparseIndexPackage file on disk.
