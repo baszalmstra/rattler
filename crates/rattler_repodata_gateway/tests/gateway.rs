@@ -90,12 +90,12 @@ async fn test_gateway() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_remote_gateway() {
-    let sparse_index = sparse_index_path();
+    // let sparse_index = sparse_index_path();
     let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
 
     let before_parse = Instant::now();
 
-    let repodata_server = test_utils::SimpleChannelServer::new(sparse_index);
+    // let repodata_server = test_utils::SimpleChannelServer::new(sparse_index);
 
     // Create a gateway from the sparse index
     // let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());

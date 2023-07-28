@@ -181,28 +181,28 @@ impl From<&RepoData> for SparseIndex {
 #[cfg(test)]
 mod tests {
     use super::sparse_index_filename;
-    use std::path::{Path, PathBuf};
+    use std::path::{PathBuf};
 
     #[test]
     fn test_sparse_index_filename() {
         assert_eq!(
-            sparse_index_filename(Path::new("a")).unwrap(),
+            sparse_index_filename("a").unwrap(),
             PathBuf::from("1/a.json")
         );
         assert_eq!(
-            sparse_index_filename(Path::new("ab")).unwrap(),
+            sparse_index_filename("ab").unwrap(),
             PathBuf::from("2/ab.json")
         );
         assert_eq!(
-            sparse_index_filename(Path::new("foo")).unwrap(),
+            sparse_index_filename("foo").unwrap(),
             PathBuf::from("3/f/foo.json")
         );
         assert_eq!(
-            sparse_index_filename(Path::new("foobar")).unwrap(),
+            sparse_index_filename("foobar").unwrap(),
             PathBuf::from("fo/ob/foobar.json")
         );
         assert_eq!(
-            sparse_index_filename(Path::new("foobar.conda")).unwrap(),
+            sparse_index_filename("foobar.conda").unwrap(),
             PathBuf::from("fo/ob/foobar.conda.json")
         );
     }
