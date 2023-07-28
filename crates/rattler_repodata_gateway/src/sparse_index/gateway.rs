@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use elsa::sync::FrozenMap;
+use futures::future::MaybeDone::Future;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use http_cache_semantics::CachePolicy;
@@ -130,7 +131,9 @@ impl Gateway {
         let mut result: FxHashMap<&Channel, Vec<&RepoDataRecord>> = FxHashMap::default();
 
         // Keep a list of all pending futures
+        let mut total_requests = 0;
         let mut pending_futures = FuturesUnordered::new();
+        let mut pending_for_execution = VecDeque::new();
         loop {
             // Start fetching the records of any pending packages
             for ((package, platform), (channel_idx, _)) in pending
@@ -139,7 +142,17 @@ impl Gateway {
                 .cartesian_product(self.inner.channels.iter().enumerate())
             {
                 let fetch_records_future = self.fetch_records(channel_idx, package, platform);
-                pending_futures.push(fetch_records_future);
+                pending_for_execution.push_back(fetch_records_future);
+                total_requests += 1;
+            }
+
+            // Make sure there are no more than 50 requests at a time.
+            while !pending_for_execution.is_empty() {
+                if pending_futures.len() < 50 {
+                    pending_futures.push(pending_for_execution.pop_front().unwrap());
+                } else {
+                    break;
+                }
             }
 
             // Wait for any pending requests to come in, or if we processed them all, stop the loop.
@@ -165,6 +178,9 @@ impl Gateway {
                 .or_default()
                 .extend(records);
         }
+
+        println!("Total requests: {}", total_requests);
+        println!("Total packages: {}", seen.len());
 
         Ok(result)
     }
