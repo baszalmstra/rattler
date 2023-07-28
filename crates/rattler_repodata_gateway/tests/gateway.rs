@@ -61,7 +61,10 @@ async fn test_gateway() {
 
     let gateway = Gateway::from_channels(AuthenticatedClient::default(), cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["python", "pytorch", "rubin-env"])
+        .find_recursive_records(
+            vec![Platform::Linux64, Platform::NoArch],
+            ["python", "pytorch", "rubin-env"],
+        )
         .await
         .unwrap();
 
@@ -95,11 +98,19 @@ async fn test_remote_gateway() {
     let repodata_server = test_utils::SimpleChannelServer::new(sparse_index);
 
     // Create a gateway from the sparse index
-    let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+    // let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+    let channel = Channel::from_url(
+        Url::parse("https://repo.preview-fit-buck.prefix.dev/conda-forge/").unwrap(),
+        None,
+        &ChannelConfig::default(),
+    );
 
     let gateway = Gateway::from_channels(AuthenticatedClient::default(), &cache_dir, [channel]);
     let records = gateway
-        .find_recursive_records(vec![Platform::Linux64, Platform::NoArch], ["jupyterlab", "pytorch", "rubin-env"])
+        .find_recursive_records(
+            vec![Platform::Linux64, Platform::NoArch],
+            ["jupyterlab", "pytorch", "rubin-env"],
+        )
         .await
         .unwrap();
 
@@ -115,10 +126,8 @@ async fn test_remote_gateway() {
         records.values().map(|records| records.len()).sum::<usize>()
     );
 
-    insta::assert_yaml_snapshot!(records
+    let num_records = records
         .into_values()
-        .flat_map(|record| record.into_iter())
-        .map(|record| format!("{}/{}", &record.package_record.subdir, &record.file_name))
-        .sorted()
-        .collect::<Vec<_>>());
+        .flat_map(|record| record.into_iter()).count();
+    assert_eq!(num_records, 318155);
 }

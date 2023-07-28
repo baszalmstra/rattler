@@ -289,6 +289,8 @@ async fn fetch_from_local_channel(
     let platform_url = Url::from_directory_path(platform_path)
         .expect("platform path must refer to a valid directory");
 
+    println!("fetching {}", &platform_url);
+
     // Read the file from disk. If the file is not found we simply return no records.
     let file = match tokio::fs::File::open(&package_path).await {
         Ok(file) => BufReader::new(file),
@@ -324,6 +326,8 @@ async fn fetch_from_remote_channel(
     let index_url = platform_url
         .join(&package_path.to_string_lossy())
         .expect("invalid package path");
+
+    println!("fetching {}", &index_url);
 
     remote_fetch(client, cache_dir, channel_name, platform_url, index_url).await
 }
