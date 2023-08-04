@@ -3,7 +3,10 @@
 use crate::{PackageRecord, RepoData};
 use fxhash::FxHashMap;
 use itertools::Itertools;
+use rattler_digest::{HashingWriter, Sha256, Sha256Hash};
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -43,12 +46,16 @@ pub struct SparseIndexPackage {
 }
 
 impl SparseIndexPackage {
-    /// Write a sparse index package to a file
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), WriteSparseIndexError> {
+    /// Write a sparse index package to a file and return its sha256 hash.
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<Sha256Hash, WriteSparseIndexError> {
+        let mut hashing_buf_writer =
+            HashingWriter::<_, Sha256>::new(std::io::BufWriter::new(writer));
         for record in self.records.iter() {
-            writeln!(writer, "{}", serde_json::to_string(record)?)?;
+            writeln!(hashing_buf_writer, "{}", serde_json::to_string(record)?)?;
         }
-        Ok(())
+        let (mut buf_writer, hash) = hashing_buf_writer.finalize();
+        buf_writer.flush()?;
+        Ok(hash)
     }
 }
 
@@ -128,7 +135,12 @@ pub enum WriteSparseIndexError {
 impl SparseIndex {
     /// Write entire index to local path on filesystem
     /// directories are created if they do not exist yet
-    pub fn write_index_to(&self, path: &Path) -> Result<(), WriteSparseIndexError> {
+    pub fn write_index_to(&self, path: &Path) -> Result<SparseIndexNames, WriteSparseIndexError> {
+        let mut names = SparseIndexNames {
+            names: Default::default(),
+        };
+
+        // Write each individual package
         for (package, sparse_index_package) in self.packages.iter() {
             // Create the directory for the package
             let package_path = path.join(sparse_index_filename(package)?);
@@ -137,10 +149,16 @@ impl SparseIndex {
             // Write the file
             let file = std::fs::File::create(package_path)?;
             let mut writer = std::io::BufWriter::new(file);
-            sparse_index_package.write(&mut writer)?;
+            let hash = sparse_index_package.write(&mut writer)?;
+
+            // Store in `names`
+            names.insert(package.clone(), hash);
         }
 
-        Ok(())
+        // Write the names to the index as well
+        names.to_file(&path.join("names"))?;
+
+        Ok(names)
     }
 }
 
@@ -178,10 +196,53 @@ impl From<&RepoData> for SparseIndex {
     }
 }
 
+/// Holds the information stored in the `names.json` file located at the root of a subdirectory of
+/// a sparse index. It contains the names of all the packages stored in the specific subdirectory
+/// of the index as well as the SHA256 hash of the [`SparseIndexPackage`] file associated with the
+/// name. This allows a client to cache packages with a very high degree of certainty.
+pub struct SparseIndexNames {
+    /// A mapping from package name to the first 8 bytes of a sha256 hash of the associated
+    /// [`SparseIndexPackage`] file.
+    pub names: FxHashMap<String, [u8; 8]>,
+}
+
+impl SparseIndexNames {
+    /// Adds a package and its hash to this instance
+    pub fn insert(&mut self, name: String, hash: Sha256Hash) {
+        self.names.insert(name, (&hash[0..8]).try_into().unwrap());
+    }
+}
+
+impl SparseIndexNames {
+    /// Writes the contents of this instance to a file.
+    pub fn to_file(&self, path: &Path) -> std::io::Result<()> {
+        static VERSION: u16 = 1;
+
+        let mut writer = std::io::BufWriter::new(File::create(path)?);
+
+        // Write a magic and version
+        writer.write_all(b"NAME")?;
+        writer.write_all(&VERSION.to_le_bytes())?;
+
+        // Write the number of names in the file
+        writer.write_all(&(self.names.len() as u64).to_le_bytes())?;
+
+        // Write all entries
+        for (name, hash) in self.names.iter() {
+            let c_name =
+                CString::new(name.as_str()).expect("package name should not contain a null");
+            writer.write_all(c_name.as_bytes())?;
+            writer.write_all(hash)?;
+        }
+
+        writer.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sparse_index_filename;
-    use std::path::{PathBuf};
+    use std::path::PathBuf;
 
     #[test]
     fn test_sparse_index_filename() {

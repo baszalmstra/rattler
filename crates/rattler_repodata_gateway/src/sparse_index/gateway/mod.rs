@@ -1,9 +1,10 @@
-use bytes::Bytes;
+mod local;
+mod remote;
+mod source;
+
 use elsa::sync::FrozenMap;
-use futures::future::MaybeDone::Future;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use fxhash::{FxHashMap, FxHashSet};
-use http_cache_semantics::CachePolicy;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use rattler_conda_types::{
@@ -11,7 +12,8 @@ use rattler_conda_types::{
     Channel, Platform, RepoDataRecord,
 };
 use rattler_networking::AuthenticatedClient;
-use reqwest::{Error, StatusCode};
+use reqwest::Error;
+use source::SubdirSource;
 use std::{
     collections::VecDeque,
     io,
@@ -19,16 +21,11 @@ use std::{
     sync::{Arc, Weak},
 };
 use tokio::{
+    io::AsyncWriteExt,
     io::{AsyncBufRead, AsyncBufReadExt},
-    io::{AsyncWriteExt, BufReader},
     sync::broadcast,
-    try_join,
 };
-use tokio_stream::{
-    wrappers::{BroadcastStream, LinesStream},
-    Stream,
-};
-use tokio_util::io::StreamReader;
+use tokio_stream::{wrappers::LinesStream, Stream, StreamExt};
 use url::Url;
 
 /// An error that can occur when accesing records in the [`Gateway`]
@@ -49,6 +46,9 @@ pub enum GatewayError {
 
     #[error(transparent)]
     CacheError(#[from] Arc<cacache::Error>),
+
+    #[error("invalid subdir url '{0}'")]
+    InvalidSubdirUrl(Url),
 }
 
 impl From<reqwest::Error> for GatewayError {
@@ -81,36 +81,118 @@ struct CacheKey {
     package_name: String,
 }
 
-type FetchResultChannel = broadcast::Sender<Result<(), GatewayError>>;
+type FetchResultChannel = Weak<broadcast::Sender<Result<(), GatewayError>>>;
+type InFlightSubdirChannel = Weak<broadcast::Sender<Result<(), GatewayError>>>;
 
 pub struct GatewayInner {
+    /// The client to use to download remote files
     client: AuthenticatedClient,
+
+    /// The directory to store caches
     cache_dir: PathBuf,
-    channels: Vec<Channel>,
 
-    /// A mapping from platform and package name to its records.
-    records: FrozenMap<CacheKey, Vec<RepoDataRecord>>,
+    /// A mapping of all channel subdirs this instance keeps track of and the data we know about
+    /// their contents.
+    subdirs: FrozenMap<(Channel, Platform), Subdir>,
 
-    /// A mapping from platform and package name to ongoing requests.
-    in_flight: Mutex<FxHashMap<CacheKey, Weak<FetchResultChannel>>>,
+    /// A mapping of in-flight requests.
+    in_flight: Mutex<FxHashMap<(Channel, Platform), InFlightSubdirChannel>>,
+}
+
+/// Keeps track of a single channel subdirectory and all the packages we retrieved from it so far.
+struct Subdir {
+    /// Where to get the data from.
+    source: SubdirSource,
+
+    /// Records per package
+    records: FrozenMap<String, Vec<RepoDataRecord>>,
+
+    /// Current requests that are in-flight.
+    in_flight: Mutex<FxHashMap<String, FetchResultChannel>>,
 }
 
 impl Gateway {
     /// Construct a new gateway from one or more channels.
-    pub fn from_channels(
-        client: AuthenticatedClient,
-        cache_dir: impl Into<PathBuf>,
-        channels: impl IntoIterator<Item = Channel>,
-    ) -> Self {
+    pub fn new(client: AuthenticatedClient, cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             inner: Arc::new(GatewayInner {
                 client,
                 cache_dir: cache_dir.into(),
-                channels: channels.into_iter().collect(),
-                records: FrozenMap::default(),
-                in_flight: Mutex::new(FxHashMap::default()),
+                subdirs: Default::default(),
+                in_flight: Default::default(),
             }),
         }
+    }
+
+    /// Retrieve the specified subdirectory.
+    async fn subdir(&self, channel: &Channel, platform: Platform) -> Result<&Subdir, GatewayError> {
+        let key = (channel.clone(), platform.clone());
+        let inner = self.inner.as_ref();
+
+        // Fast path: did we already fetch everything we need to know about this subdir?
+        if let Some(subdir) = inner.subdirs.get(&key) {
+            return Ok(subdir);
+        }
+
+        // Check if there is an in-flight request
+        let mut in_flight = inner.in_flight.lock();
+
+        // Now that we acquired the lock, another task may have already written its results
+        // in the subdirs map. Check if that's the case while holding on to the lock.
+        if let Some(subdir) = inner.subdirs.get(&key) {
+            return Ok(subdir);
+        }
+
+        // Check if there is an in flight request
+        let mut receiver = if let Some(sender) = in_flight.get(&key).and_then(Weak::upgrade) {
+            sender.subscribe()
+        } else {
+            // Create a new sender over which we can send results to other channels.
+            let (tx, rx) = broadcast::channel(1);
+            let tx = Arc::new(tx);
+            in_flight.insert(key.clone(), Arc::downgrade(&tx));
+
+            // Spawn a task to fetch the subdir
+            let inner = self.inner.clone();
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                // Construct a new `Subdir`
+                let subdir = Subdir::new(
+                    inner.client.clone(),
+                    inner.cache_dir.clone(),
+                    channel.clone(),
+                    platform,
+                )
+                .await;
+
+                // Store the subdirectory in the inner data structure.
+                let result = match subdir {
+                    Ok(subdir) => {
+                        inner.subdirs.insert((channel, platform), subdir);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+
+                let _ = tx.send(result);
+            });
+
+            rx
+        };
+
+        // Drop the in-flight lock or we will dead-lock while waiting for it to finish.
+        drop(in_flight);
+
+        // Wait for the task to finish
+        let result = receiver.recv().await.map_err(|_| GatewayError::Cancelled)?;
+
+        // Get the result from the frozen set.
+        result.map(|_| {
+            inner
+                .subdirs
+                .get(&key)
+                .expect(&format!("subdir must be present in the frozen map"))
+        })
     }
 
     /// Recursively fetching all [`RepoDataRecord]`s for the specified package names from the given
@@ -274,6 +356,36 @@ impl Gateway {
     }
 }
 
+impl Subdir {
+    /// Constructs a new subdir from a channel.
+    pub async fn new(
+        client: AuthenticatedClient,
+        cache_dir: PathBuf,
+        channel: Channel,
+        platform: Platform,
+    ) -> Result<Subdir, GatewayError> {
+        let source = SubdirSource::new(channel, platform).await?;
+        Ok(Self {
+            source,
+            records: Default::default(),
+            in_flight: Default::default(),
+        })
+    }
+
+    /// Fetch the records from the source
+    async fn fetch_records_inner(&self, package_name: &str) -> Result<Vec<RepoDataRecord>, GatewayError> {
+        match &self.source {
+            SubdirSource::LocalSparseIndex(local) => local.fetch_records(package_name).await,
+            SubdirSource::RemoteSparseIndex(_) => unreachable!(),
+        }
+    }
+
+    /// Fetch
+}
+
+/// Fetch the [`RepoDataRecords`] for a named packaged that are part of the specified channel and
+/// platform. If no such records exist (because the package only has entries for another platform
+/// for example), this method returns an empty `Vec`.
 async fn fetch_from_channel(
     client: AuthenticatedClient,
     cache_dir: PathBuf,
@@ -284,48 +396,16 @@ async fn fetch_from_channel(
     let channel_name: Arc<str> = channel.canonical_name().into();
     let platform_url = channel.platform_url(platform);
 
-    // println!("Started download of {} on {platform}", &package_name);
-
+    // If the channel resides on the filesystem, we read it directly from there.
     if platform_url.scheme() == "file" {
         if let Ok(platform_path) = platform_url.to_file_path() {
-            return fetch_from_local_channel(channel_name, &package_name, platform_path).await;
+            return local::fetch_from_local_channel(channel_name, &package_name, platform_path)
+                .await;
         }
     }
 
+    // Otherwise, we have to perform an http request
     fetch_from_remote_channel(client, cache_dir, channel_name, &package_name, platform_url).await
-}
-
-/// Try to read [`RepoDataRecord`]s from a SparseIndexPackage file on disk.
-async fn fetch_from_local_channel(
-    channel_name: Arc<str>,
-    package_name: &str,
-    platform_path: PathBuf,
-) -> Result<Vec<RepoDataRecord>, GatewayError> {
-    let package_path = platform_path.join(sparse_index_filename(&package_name).unwrap());
-    let platform_url = Url::from_directory_path(platform_path)
-        .expect("platform path must refer to a valid directory");
-
-    println!("fetching {}", &platform_url);
-
-    // Read the file from disk. If the file is not found we simply return no records.
-    let file = match tokio::fs::File::open(&package_path).await {
-        Ok(file) => BufReader::new(file),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(GatewayError::IoError(Arc::new(e))),
-    };
-
-    // Deserialize each line individually
-    parse_sparse_index_package(file)
-        .map_ok(move |record| RepoDataRecord {
-            package_record: record.package_record,
-            url: platform_url
-                .join(&record.file_name)
-                .expect("must be able to append a filename"),
-            file_name: record.file_name,
-            channel: channel_name.clone(),
-        })
-        .try_collect()
-        .await
 }
 
 /// Try to read [`RepoDataRecord`]s from a [`SparseIndexPackage`] file at a remote url. Reads from
@@ -343,121 +423,11 @@ async fn fetch_from_remote_channel(
         .join(&package_path.to_string_lossy())
         .expect("invalid package path");
 
-    println!("fetching {}", &index_url);
-
-    remote_fetch(client, cache_dir, channel_name, platform_url, index_url).await
-}
-
-/// Try to read [`RepoDataRecord`]s from a [`SparseIndexPackage`] file at a remote url. Does not
-/// read from the cache but does store the result in the cache.
-async fn remote_fetch(
-    client: AuthenticatedClient,
-    cache_dir: PathBuf,
-    channel_name: Arc<str>,
-    platform_url: Url,
-    index_url: Url,
-) -> Result<Vec<RepoDataRecord>, GatewayError> {
-    // Construct the request for caching
-    let req = client
-        .get(index_url.clone())
-        .build()
-        .expect("failed to create request");
-
-    // Send the request.
-    let res = client.get(index_url.clone()).send().await?;
-
-    // Special case: 404.
-    // If the file is not found we simply assume there are no records for the package
-    if res.status() == StatusCode::NOT_FOUND {
-        return Ok(vec![]);
-    }
-
-    // Filter out any other error cases
-    let res = res.error_for_status()?;
-
-    // Create a stream for the bytes with some backpressure.
-    let (bytes_sender, bytes_receiver) = broadcast::channel::<Bytes>(100);
-
-    // Construct a cache policy for the request
-    let cache_policy = CachePolicy::new(&req, &res);
-    let cache_future = if cache_policy.is_storable() {
-        // Write the contents the cache
-        write_to_cache(
-            cache_dir,
-            index_url,
-            cache_policy,
-            BroadcastStream::new(bytes_sender.subscribe())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
-        )
-        .left_future()
-    } else {
-        futures::future::ready(Ok(())).right_future()
-    };
-
-    // Decode the records on a background task
-    let collect_records_future = parse_sparse_index_package(StreamReader::new(
-        BroadcastStream::new(bytes_receiver).map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
-    ))
-    .map_ok(|record| RepoDataRecord {
-        package_record: record.package_record,
-        url: platform_url
-            .join(&record.file_name)
-            .expect("must be able to append a filename"),
-        file_name: record.file_name,
-        channel: channel_name.clone(),
-    })
-    .try_collect();
-
-    // Stream the bytes from the response
-    let copy_bytes_future = res
-        .bytes_stream()
-        .map_err(|e| GatewayError::from(e))
-        .try_for_each(move |bytes| {
-            let bytes_sender = bytes_sender.clone();
-            async move {
-                let _ = bytes_sender.send(bytes);
-                Ok(())
-            }
-        });
-
-    Ok(try_join!(collect_records_future, copy_bytes_future, cache_future)?.0)
-}
-
-/// Writes the given bytes to the cache and prepends the file with the cache policy.
-async fn write_to_cache(
-    cache_dir: PathBuf,
-    index_url: Url,
-    cache_policy: CachePolicy,
-    mut bytes_stream: impl Stream<Item = io::Result<Bytes>> + Unpin,
-) -> Result<(), GatewayError> {
-    cacache::Writer::create(cache_dir, index_url)
-        .map_err(GatewayError::from)
-        .and_then(move |mut writer| async move {
-            writer
-                .write_all(
-                    format!(
-                        "{}\n",
-                        serde_json::to_string(&cache_policy)
-                            .expect("failed to convert cache policy to json")
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-
-            // Receive bytes and write them to disk
-            while let Some(bytes) = bytes_stream.next().await {
-                let bytes = bytes?;
-                writer.write_all(&bytes).await?;
-            }
-
-            writer.commit().await?;
-            Ok(())
-        })
-        .await
+    remote::remote_fetch(client, cache_dir, channel_name, platform_url, index_url).await
 }
 
 /// Given a stream of bytes, parse individual lines as [`SparseIndexRecord`]s.
-fn parse_sparse_index_package<R: AsyncBufRead>(
+fn parse_sparse_index_package_stream<R: AsyncBufRead>(
     reader: R,
 ) -> impl Stream<Item = Result<SparseIndexRecord, GatewayError>> {
     LinesStream::new(reader.lines())
@@ -466,21 +436,27 @@ fn parse_sparse_index_package<R: AsyncBufRead>(
         .try_buffered(10)
 }
 
+/// Given a stream of bytes, collect them into a Vec of [`SparseIndexRecord`]s.
+async fn parse_sparse_index_package<R: AsyncBufRead>(
+    channel_name: Arc<str>,
+    platform_url: Url,
+    reader: R,
+) -> Result<Vec<RepoDataRecord>, GatewayError> {
+    parse_sparse_index_package_stream(reader)
+        .map_ok(|record| RepoDataRecord {
+            package_record: record.package_record,
+            url: platform_url
+                .join(&record.file_name)
+                .expect("must be able to append a filename"),
+            file_name: record.file_name,
+            channel: channel_name.clone(),
+        })
+        .try_collect()
+        .await
+}
+
 async fn parse_sparse_index_record(line: String) -> Result<SparseIndexRecord, GatewayError> {
     serde_json::from_str::<SparseIndexRecord>(&line).map_err(|_| GatewayError::EncodingError)
-    // tokio::task::spawn_blocking(move || {
-    //     serde_json::from_str::<SparseIndexRecord>(&line).map_err(|_| GatewayError::EncodingError)
-    // })
-    // .map_ok_or_else(
-    //     |join_err| match join_err.try_into_panic() {
-    //         Ok(panic) => {
-    //             std::panic::resume_unwind(panic);
-    //         }
-    //         Err(_) => Err(GatewayError::Cancelled),
-    //     },
-    //     |record| record,
-    // )
-    // .await
 }
 
 #[cfg(test)]

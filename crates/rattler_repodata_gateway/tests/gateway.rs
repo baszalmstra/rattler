@@ -90,22 +90,21 @@ async fn test_gateway() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_remote_gateway() {
-    // let sparse_index = sparse_index_path();
-    let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
-
-    let before_parse = Instant::now();
-
-    // let repodata_server = test_utils::SimpleChannelServer::new(sparse_index);
 
     // Create a gateway from the sparse index
-    // let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
-    let channel = Channel::from_url(
-        Url::parse("https://repo.preview-fit-buck.prefix.dev/conda-forge/").unwrap(),
-        None,
-        &ChannelConfig::default(),
-    );
+    let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
+    let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+    // let channel = Channel::from_url(
+    //     Url::parse("https://repo.preview-fit-buck.prefix.dev/conda-forge/").unwrap(),
+    //     None,
+    //     &ChannelConfig::default(),
+    // );
 
+    let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
     let gateway = Gateway::from_channels(AuthenticatedClient::default(), &cache_dir, [channel]);
+
+    // Get all the interesting records
+    let before_parse = Instant::now();
     let records = gateway
         .find_recursive_records(
             vec![Platform::Linux64, Platform::NoArch],
@@ -113,7 +112,6 @@ async fn test_remote_gateway() {
         )
         .await
         .unwrap();
-
     let after_parse = Instant::now();
 
     println!(

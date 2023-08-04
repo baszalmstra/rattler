@@ -22,6 +22,7 @@ elsa = "1.8.1"
 futures = "0.3.28"
 fxhash = { version = "0.2.1" }
 hex = { version = "0.4.3", features = ["serde"] }
+http = { version = "0.2.9" }
 http-cache-semantics = { version = "1.0.1", features = ["reqwest"] }
 humansize = "2.1.3"
 humantime = "2.1.0"
