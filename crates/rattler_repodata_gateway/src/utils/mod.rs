@@ -2,13 +2,13 @@
 
 pub(crate) use encoding::{AsyncEncoding, Encoding};
 pub(crate) use flock::LockedFile;
+pub(crate) use frozen_coalescing_map::{CoalescingError, FrozenCoalescingMap};
 use std::fmt::Write;
 use url::Url;
 
 mod encoding;
-
-
 mod flock;
+mod frozen_coalescing_map;
 
 /// Convert a URL to a cache filename
 pub(crate) fn url_to_cache_filename(url: &Url) -> String {

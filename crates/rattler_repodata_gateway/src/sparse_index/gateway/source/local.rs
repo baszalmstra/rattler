@@ -1,4 +1,4 @@
-use crate::sparse_index::gateway::{parse_sparse_index_package, parse_sparse_index_package_stream};
+use crate::sparse_index::gateway::parse_sparse_index_package;
 use crate::sparse_index::GatewayError;
 use futures::TryStreamExt;
 use rattler_conda_types::sparse_index::sparse_index_filename;

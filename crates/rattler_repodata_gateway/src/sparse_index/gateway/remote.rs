@@ -1,5 +1,4 @@
 use super::GatewayError;
-use crate::sparse_index::gateway::parse_sparse_index_package;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use http::{HeaderMap, StatusCode};
@@ -27,7 +26,7 @@ pub async fn remote_fetch(
     // Try to read from the cache
     match cacache::Reader::open(&cache_dir, index_url.clone()).await {
         Ok(cache_entry) => {
-            read_from_cache(
+            read_records_from_cache(
                 cache_entry,
                 client.clone(),
                 cache_dir.clone(),
@@ -53,7 +52,7 @@ pub async fn remote_fetch(
     }
 }
 
-pub async fn read_from_cache(
+pub async fn read_records_from_cache(
     reader: cacache::Reader,
     client: AuthenticatedClient,
     cache_dir: PathBuf,

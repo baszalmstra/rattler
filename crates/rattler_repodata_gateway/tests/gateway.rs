@@ -59,9 +59,10 @@ async fn test_gateway() {
         &ChannelConfig::default(),
     );
 
-    let gateway = Gateway::from_channels(AuthenticatedClient::default(), cache_dir, [channel]);
+    let gateway = Gateway::new(AuthenticatedClient::default(), cache_dir);
     let records = gateway
         .find_recursive_records(
+            [&channel],
             vec![Platform::Linux64, Platform::NoArch],
             ["python", "pytorch", "rubin-env"],
         )
@@ -90,7 +91,6 @@ async fn test_gateway() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_remote_gateway() {
-
     // Create a gateway from the sparse index
     let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
     let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
@@ -101,12 +101,13 @@ async fn test_remote_gateway() {
     // );
 
     let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
-    let gateway = Gateway::from_channels(AuthenticatedClient::default(), &cache_dir, [channel]);
+    let gateway = Gateway::new(AuthenticatedClient::default(), &cache_dir);
 
     // Get all the interesting records
     let before_parse = Instant::now();
     let records = gateway
         .find_recursive_records(
+            [&channel],
             vec![Platform::Linux64, Platform::NoArch],
             ["jupyterlab", "pytorch", "rubin-env"],
         )
@@ -126,6 +127,7 @@ async fn test_remote_gateway() {
 
     let num_records = records
         .into_values()
-        .flat_map(|record| record.into_iter()).count();
+        .flat_map(|record| record.into_iter())
+        .count();
     assert_eq!(num_records, 318155);
 }

@@ -1,6 +1,6 @@
 ---
 source: crates/rattler_repodata_gateway/tests/gateway.rs
-assertion_line: 83
+assertion_line: 84
 expression: "records.into_values().flat_map(|record|\n                    record.into_iter()).map(|record|\n                format!(\"{}/{}\", & record.package_record.subdir, &\n                    record.file_name)).sorted().collect::<Vec<_>>()"
 ---
 - linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2

@@ -10,14 +10,14 @@ pub enum SubdirSource {
 }
 
 impl SubdirSource {
-    pub fn new(channel: Channel, platform: Platform) -> Result<Self, GatewayError> {
+    pub async fn new(channel: Channel, platform: Platform) -> Result<Self, GatewayError> {
         // Determine the type of source of the channel based on the URL scheme.
         let platform_url = channel.platform_url(platform);
         let channel_name = channel.canonical_name().into();
 
         // If the URL uses the file scheme use that
         if platform_url.scheme() == "file" {
-            if let Some(root) = platform_url.to_file_path() {
+            if let Ok(root) = platform_url.to_file_path() {
                 return Ok(SubdirSource::LocalSparseIndex(local::LocalSparseIndex {
                     root,
                     channel_name,
