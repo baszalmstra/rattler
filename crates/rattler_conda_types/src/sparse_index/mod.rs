@@ -1,15 +1,19 @@
 //! Contains code regarding the Sparse Index, which is a different way of handling the retrieval
 //! of records from the index.
 use crate::{PackageRecord, RepoData};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fxhash::FxHashMap;
 use itertools::Itertools;
 use rattler_digest::{HashingWriter, Sha256, Sha256Hash};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufRead, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+static NAMES_FILE_MAGIC: &[u8; 4] = b"NAME";
+static NAMES_FILE_VERSION: u16 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 /// Record in a sparse index
@@ -216,26 +220,63 @@ impl SparseIndexNames {
 impl SparseIndexNames {
     /// Writes the contents of this instance to a file.
     pub fn to_file(&self, path: &Path) -> std::io::Result<()> {
-        static VERSION: u16 = 1;
-
         let mut writer = std::io::BufWriter::new(File::create(path)?);
 
         // Write a magic and version
-        writer.write_all(b"NAME")?;
-        writer.write_all(&VERSION.to_le_bytes())?;
-
-        // Write the number of names in the file
-        writer.write_all(&(self.names.len() as u64).to_le_bytes())?;
+        writer.write_all(NAMES_FILE_MAGIC)?;
+        writer.write_u16::<LittleEndian>(NAMES_FILE_VERSION)?;
 
         // Write all entries
         for (name, hash) in self.names.iter() {
             let c_name =
                 CString::new(name.as_str()).expect("package name should not contain a null");
-            writer.write_all(c_name.as_bytes())?;
+            writer.write_all(c_name.as_bytes_with_nul())?;
             writer.write_all(hash)?;
         }
 
         writer.flush()
+    }
+
+    /// Parse the file from an async reader
+    pub fn from_bytes(slice: &[u8]) -> std::io::Result<Self> {
+        let mut reader = Cursor::new(slice);
+
+        // Verify the magic of the file
+        let mut magic = *NAMES_FILE_MAGIC;
+        reader.read_exact(magic.as_mut())?;
+        if &magic != NAMES_FILE_MAGIC {
+            return Err(std::io::Error::from(ErrorKind::InvalidData));
+        }
+
+        // Determine the version of the file
+        let version = reader.read_u16::<LittleEndian>()?;
+        if version != 1 {
+            return Err(std::io::Error::from(ErrorKind::InvalidData));
+        }
+
+        // Read the individual entries
+        let mut names = FxHashMap::default();
+        loop {
+            // Read the next package name from the file
+            let mut name_bytes = Vec::new();
+            let name_len = reader.read_until(b'\0', &mut name_bytes)?;
+            if name_len == 0 {
+                break;
+            }
+
+            // Safe because we read up until the first nul terminating byte
+            let name = unsafe { CString::from_vec_with_nul_unchecked(name_bytes) }
+                .into_string()
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+
+            // Read the hash of the file from the package
+            let mut hash_bytes: [u8; 8] = [0; 8];
+            reader.read_exact(&mut hash_bytes)?;
+
+            names.insert(name.to_owned(), hash_bytes);
+        }
+
+        Ok(Self { names })
     }
 }
 

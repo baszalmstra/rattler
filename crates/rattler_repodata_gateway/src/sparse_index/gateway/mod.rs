@@ -1,10 +1,13 @@
 // mod local;
 // mod remote;
+mod http;
 mod source;
 
+use crate::sparse_index::gateway::source::SubdirSourceError;
 use crate::utils::{CoalescingError, FrozenCoalescingMap};
+use ::http::StatusCode;
 use futures::stream::FuturesUnordered;
-use futures::{stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{stream, StreamExt, TryFutureExt, TryStreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use itertools::Itertools;
 use rattler_conda_types::{sparse_index::SparseIndexRecord, Channel, Platform, RepoDataRecord};
@@ -12,18 +15,8 @@ use rattler_networking::AuthenticatedClient;
 use reqwest::Error;
 use source::SubdirSource;
 use std::collections::VecDeque;
-use std::future::Future;
-use std::ops::Sub;
-use std::{
-    io,
-    path::PathBuf,
-    sync::{Arc, Weak},
-};
-use tokio::{
-    io::AsyncWriteExt,
-    io::{AsyncBufRead, AsyncBufReadExt},
-    sync::broadcast,
-};
+use std::{io, path::PathBuf, sync::Arc};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio_stream::{wrappers::LinesStream, Stream};
 use url::Url;
 
@@ -43,17 +36,20 @@ pub enum GatewayError {
     #[error(transparent)]
     HttpError(#[from] Arc<reqwest::Error>),
 
+    #[error("HTTP status error ({0}) for {1}")]
+    HttpStatus(StatusCode, Url),
+
     #[error(transparent)]
     CacheError(#[from] Arc<cacache::Error>),
 
-    #[error("invalid subdir url '{0}'")]
-    InvalidSubdirUrl(Url),
+    #[error(transparent)]
+    SubDirError(#[from] Arc<SubdirSourceError>),
 }
 
-impl From<CoalescingError<GatewayError>> for GatewayError {
-    fn from(value: CoalescingError<GatewayError>) -> Self {
+impl<E: Into<GatewayError>> From<CoalescingError<E>> for GatewayError {
+    fn from(value: CoalescingError<E>) -> Self {
         match value {
-            CoalescingError::CacheError(e) => e,
+            CoalescingError::CacheError(e) => e.into(),
             CoalescingError::Cancelled => GatewayError::Cancelled,
         }
     }
@@ -77,20 +73,10 @@ impl From<cacache::Error> for GatewayError {
     }
 }
 
-/// An object that allows fetching and caching [`RepoDataRecord`]s.
+/// An object that allows fetching and caching [`RepoDataRecord`]s from various sources.
 pub struct Gateway {
     inner: Arc<GatewayInner>,
 }
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-struct CacheKey {
-    channel_idx: usize,
-    platform: Platform,
-    package_name: String,
-}
-
-type FetchResultChannel = Weak<broadcast::Sender<Result<(), GatewayError>>>;
-type InFlightSubdirChannel = Weak<broadcast::Sender<Result<(), GatewayError>>>;
 
 pub struct GatewayInner {
     /// The client to use to download remote files
@@ -129,12 +115,14 @@ impl Gateway {
                     channel.clone(),
                     platform,
                 )
+                .map_err(Arc::new)
+                .map_err(GatewayError::from)
                 .map_ok(Box::new)
             })
             .await?)
     }
 
-    /// Recursively fetching all [`RepoDataRecord]`s for the specified package names from the given
+    /// Recursively fetches all [`RepoDataRecord]`s for the specified package names from the given
     /// channels.
     pub async fn find_recursive_records<'c>(
         &self,
@@ -222,94 +210,6 @@ impl Gateway {
 
         Ok(result)
     }
-    //
-    // /// Downloads all the records for the package with the given name.
-    // #[allow(clippy::await_holding_lock)] // This is a false positive. The `in_flight` lock is not held while awaiting. It is dropped on time.
-    // async fn fetch_records(
-    //     &self,
-    //     channel_idx: usize,
-    //     package_name: String,
-    //     platform: Platform,
-    // ) -> Result<(usize, Platform, &[RepoDataRecord]), GatewayError> {
-    //     let key = CacheKey {
-    //         channel_idx,
-    //         package_name,
-    //         platform,
-    //     };
-    //
-    //     // If we already have the records we can return them immediately.
-    //     if let Some(records) = self.inner.records.get(&key) {
-    //         return Ok((channel_idx, platform, records));
-    //     }
-    //
-    //     // Otherwise, we look for an in-flight request
-    //     let mut in_flight = self.inner.in_flight.lock();
-    //
-    //     // Now that we acquired the lock, another task may have already written its results
-    //     // in the records map. Check if that's the case while holding on to the lock.
-    //     if let Some(records) = self.inner.records.get(&key) {
-    //         return Ok((channel_idx, platform, records));
-    //     }
-    //
-    //     // Check if there is an in flight request for our package
-    //     let mut receiver = if let Some(sender) = in_flight.get(&key).and_then(Weak::upgrade) {
-    //         sender.subscribe()
-    //     } else {
-    //         let (tx, rx) = broadcast::channel(1);
-    //         let tx = Arc::new(tx);
-    //         in_flight.insert(key.clone(), Arc::downgrade(&tx));
-    //
-    //         let inner = self.inner.clone();
-    //         let key = key.clone();
-    //         let client = self.inner.client.clone();
-    //         let cache_dir = self.inner.cache_dir.clone();
-    //         tokio::spawn(async move {
-    //             let result = match fetch_from_channel(
-    //                 client,
-    //                 cache_dir,
-    //                 &inner.channels[channel_idx],
-    //                 platform,
-    //                 key.package_name.clone(),
-    //             )
-    //             .await
-    //             {
-    //                 Ok(records) => {
-    //                     // println!("inserting values for {:?}", &key);
-    //                     inner.records.insert(key, records);
-    //                     Ok(())
-    //                 }
-    //                 Err(err) => {
-    //                     // println!("ERROR: {}", &err);
-    //                     Err(err)
-    //                 }
-    //             };
-    //
-    //             // Broadcast the result
-    //             let _ = tx.send(result);
-    //         });
-    //
-    //         rx
-    //     };
-    //
-    //     // Drop the in-flight lock or we will dead-lock while waiting for it to finish.
-    //     drop(in_flight);
-    //
-    //     receiver
-    //         .recv()
-    //         .await
-    //         .map_err(|_| GatewayError::Cancelled)
-    //         .map(|result| {
-    //             result.map(|_| {
-    //                 (
-    //                     channel_idx,
-    //                     platform,
-    //                     self.inner.records.get(&key).expect(&format!(
-    //                         "records must be present in the frozen set {key:?}"
-    //                     )),
-    //                 )
-    //             })
-    //         })?
-    // }
 }
 
 /// Keeps track of a single channel subdirectory and all the packages we retrieved from it so far.
@@ -328,8 +228,8 @@ impl Subdir {
         cache_dir: PathBuf,
         channel: Channel,
         platform: Platform,
-    ) -> Result<Subdir, GatewayError> {
-        let source = SubdirSource::new(channel, platform).await?;
+    ) -> Result<Subdir, SubdirSourceError> {
+        let source = SubdirSource::new(client, cache_dir, channel, platform).await?;
         Ok(Self {
             source: Arc::new(source),
             records: Default::default(),
@@ -351,56 +251,15 @@ impl Subdir {
                         SubdirSource::LocalSparseIndex(local) => {
                             local.fetch_records(&pkg_name).await
                         }
-                        SubdirSource::RemoteSparseIndex(_) => unreachable!(),
+                        SubdirSource::RemoteSparseIndex(remote) => {
+                            remote.fetch_records(&pkg_name).await
+                        }
                     }
                 }
             })
             .await?)
     }
 }
-//
-// /// Fetch the [`RepoDataRecords`] for a named packaged that are part of the specified channel and
-// /// platform. If no such records exist (because the package only has entries for another platform
-// /// for example), this method returns an empty `Vec`.
-// async fn fetch_from_channel(
-//     client: AuthenticatedClient,
-//     cache_dir: PathBuf,
-//     channel: &Channel,
-//     platform: Platform,
-//     package_name: String,
-// ) -> Result<Vec<RepoDataRecord>, GatewayError> {
-//     let channel_name: Arc<str> = channel.canonical_name().into();
-//     let platform_url = channel.platform_url(platform);
-//
-//     // If the channel resides on the filesystem, we read it directly from there.
-//     if platform_url.scheme() == "file" {
-//         if let Ok(platform_path) = platform_url.to_file_path() {
-//             return local::fetch_from_local_channel(channel_name, &package_name, platform_path)
-//                 .await;
-//         }
-//     }
-//
-//     // Otherwise, we have to perform an http request
-//     fetch_from_remote_channel(client, cache_dir, channel_name, &package_name, platform_url).await
-// }
-//
-// /// Try to read [`RepoDataRecord`]s from a [`SparseIndexPackage`] file at a remote url. Reads from
-// /// the cache if thats possible.
-// async fn fetch_from_remote_channel(
-//     client: AuthenticatedClient,
-//     cache_dir: PathBuf,
-//     channel_name: Arc<str>,
-//     package_name: &str,
-//     platform_url: Url,
-// ) -> Result<Vec<RepoDataRecord>, GatewayError> {
-//     // Determine the location of the [`SparseIndexPackage`] file.
-//     let package_path = sparse_index_filename(package_name).expect("invalid package name");
-//     let index_url = platform_url
-//         .join(&package_path.to_string_lossy())
-//         .expect("invalid package path");
-//
-//     remote::remote_fetch(client, cache_dir, channel_name, platform_url, index_url).await
-// }
 
 /// Given a stream of bytes, parse individual lines as [`SparseIndexRecord`]s.
 fn parse_sparse_index_package_stream<R: AsyncBufRead>(
@@ -434,6 +293,3 @@ async fn parse_sparse_index_package<R: AsyncBufRead>(
 async fn parse_sparse_index_record(line: String) -> Result<SparseIndexRecord, GatewayError> {
     serde_json::from_str::<SparseIndexRecord>(&line).map_err(|_| GatewayError::EncodingError)
 }
-
-#[cfg(test)]
-mod test {}

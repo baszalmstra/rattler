@@ -1,8 +1,8 @@
 use crate::sparse_index::gateway::parse_sparse_index_package;
 use crate::sparse_index::GatewayError;
-use futures::TryStreamExt;
 use rattler_conda_types::sparse_index::sparse_index_filename;
 use rattler_conda_types::RepoDataRecord;
+use std::fmt::{Display};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::BufReader;
@@ -15,6 +15,14 @@ pub struct LocalSparseIndex {
 }
 
 impl LocalSparseIndex {
+    /// Constructs a new instance from the specified local directory.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            channel_name: Url::from_directory_path(&path).unwrap().to_string().into(),
+            root: path,
+        }
+    }
+
     /// Fetch information about the specified package.
     pub async fn fetch_records(
         &self,
