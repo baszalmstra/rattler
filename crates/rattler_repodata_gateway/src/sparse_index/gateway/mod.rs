@@ -104,7 +104,7 @@ impl Gateway {
 
     /// Retrieve the specified subdirectory.
     async fn subdir(&self, channel: &Channel, platform: Platform) -> Result<&Subdir, GatewayError> {
-        let key = (channel.clone(), platform.clone());
+        let key = (channel.clone(), platform);
         let inner = self.inner.as_ref();
         Ok(inner
             .subdirs
@@ -161,18 +161,32 @@ impl Gateway {
 
         // Keep a list of all pending futures
         let mut total_requests = 0;
+        let mut total_packages_from_prefetch = 0;
         let mut pending_futures = FuturesUnordered::new();
         let mut pending_for_execution = VecDeque::new();
         loop {
             // Start fetching the records of any pending packages
-            for (package, (channel, subdir)) in pending.drain(..).cartesian_product(subdirs.iter())
-            {
-                let channel: &'c Channel = *channel;
-                let fetch_records_future = subdir
-                    .get_or_cache_records(package)
-                    .map_ok(move |records| (channel, records));
-                pending_for_execution.push_back(fetch_records_future);
-                total_requests += 1;
+            while let Some(pkg_name) = pending.pop_front() {
+                // Create tasks to fetch records from all subdirs
+                for (channel, subdir) in subdirs.iter() {
+                    let fetch_records_future = subdir
+                        .get_or_cache_records(pkg_name.clone())
+                        .map_ok(move |records| (*channel, records));
+                    pending_for_execution.push_back(fetch_records_future);
+                    total_requests += 1;
+                }
+
+                // Find any dependencies that we can start prefetching before the records are
+                // fetched.
+                for (_, subdir) in subdirs.iter() {
+                    for dep_name in subdir.prefetch_hints(&pkg_name) {
+                        if !seen.contains(&dep_name) {
+                            pending.push_back(dep_name.to_owned());
+                            seen.insert(dep_name.to_owned());
+                            total_packages_from_prefetch += 1;
+                        }
+                    }
+                }
             }
 
             // Make sure there are no more than 50 requests at a time.
@@ -190,13 +204,13 @@ impl Gateway {
                 None => break,
             };
 
-            // Iterate over all dependencies in the repodata records and try to get their data as well.
-            for record in records {
+            // Add the dependencies of all the records.
+            for record in records.iter() {
                 for dependency in record.package_record.depends.iter() {
-                    let dependency_name = dependency.split_once(' ').unwrap_or((dependency, "")).0;
-                    if !seen.contains(dependency_name) {
-                        pending.push_back(dependency_name.to_string());
-                        seen.insert(dependency_name.to_string());
+                    let dep_name = dependency.split_once(' ').unwrap_or((dependency, "")).0;
+                    if !seen.contains(dep_name) {
+                        pending.push_back(dep_name.to_owned());
+                        seen.insert(dep_name.to_owned());
                     }
                 }
             }
@@ -207,6 +221,10 @@ impl Gateway {
 
         println!("Total requests: {}", total_requests);
         println!("Total packages: {}", seen.len());
+        println!(
+            "Total packages from prefetch: {}",
+            total_packages_from_prefetch
+        );
 
         Ok(result)
     }
@@ -259,6 +277,19 @@ impl Subdir {
             })
             .await?)
     }
+
+    /// Returns hints on which packages to prefetch for package with the given name. This method
+    /// should be used to determine which dependent packages to fetch without actually fetching
+    /// the metadata of the package.
+    ///
+    /// Package records will still be fetched and inspected so the package names returned from this
+    /// function may be incorrect.
+    pub fn prefetch_hints(&self, package_name: &str) -> Vec<String> {
+        match self.source.as_ref() {
+            SubdirSource::LocalSparseIndex(_) => vec![],
+            SubdirSource::RemoteSparseIndex(source) => source.prefetch_hints(package_name),
+        }
+    }
 }
 
 /// Given a stream of bytes, parse individual lines as [`SparseIndexRecord`]s.
@@ -267,7 +298,7 @@ fn parse_sparse_index_package_stream<R: AsyncBufRead>(
 ) -> impl Stream<Item = Result<SparseIndexRecord, GatewayError>> {
     LinesStream::new(reader.lines())
         .map_err(|e| GatewayError::IoError(Arc::new(e)))
-        .map_ok(|line| parse_sparse_index_record(line))
+        .map_ok(parse_sparse_index_record)
         .try_buffered(10)
 }
 

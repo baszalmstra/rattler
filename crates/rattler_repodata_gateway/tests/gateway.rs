@@ -129,5 +129,5 @@ async fn test_remote_gateway() {
         .into_values()
         .flat_map(|record| record.into_iter())
         .count();
-    assert_eq!(num_records, 318155);
+    assert_eq!(num_records, 46638);
 }

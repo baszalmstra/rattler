@@ -2,7 +2,7 @@
 //! of records from the index.
 use crate::{PackageRecord, RepoData};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use itertools::Itertools;
 use rattler_digest::{HashingWriter, Sha256, Sha256Hash};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,9 @@ use thiserror::Error;
 
 static NAMES_FILE_MAGIC: &[u8; 4] = b"NAME";
 static NAMES_FILE_VERSION: u16 = 1;
+
+static DEPENDENCIES_FILE_MAGIC: &[u8; 4] = b"DEPS";
+static DEPENDENCIES_FILE_VERSION: u16 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 /// Record in a sparse index
@@ -144,6 +147,10 @@ impl SparseIndex {
             names: Default::default(),
         };
 
+        let mut dependencies = SparseIndexDependencies {
+            dependencies: Default::default(),
+        };
+
         // Write each individual package
         for (package, sparse_index_package) in self.packages.iter() {
             // Create the directory for the package
@@ -155,12 +162,32 @@ impl SparseIndex {
             let mut writer = std::io::BufWriter::new(file);
             let hash = sparse_index_package.write(&mut writer)?;
 
+            // Determine the dependencies of the package
+            let deps = sparse_index_package
+                .records
+                .iter()
+                .flat_map(|record| {
+                    record.package_record.depends.iter().map(|dependency| {
+                        dependency
+                            .split_once(' ')
+                            .unwrap_or((dependency, ""))
+                            .0
+                            .to_owned()
+                    })
+                })
+                .sorted()
+                .dedup()
+                .collect();
+
+            dependencies.dependencies.insert(package.clone(), deps);
+
             // Store in `names`
             names.insert(package.clone(), hash);
         }
 
         // Write the names to the index as well
         names.to_file(&path.join("names"))?;
+        dependencies.to_file(&path.join("dependencies"))?;
 
         Ok(names)
     }
@@ -193,7 +220,7 @@ impl From<&RepoData> for SparseIndex {
             })
             .into_group_map_by(|record| record.package_record.name.clone())
             .into_iter()
-            .map(|(name, records)| (name.clone(), SparseIndexPackage { records }))
+            .map(|(name, records)| (name, SparseIndexPackage { records }))
             .collect();
 
         SparseIndex { packages }
@@ -277,6 +304,101 @@ impl SparseIndexNames {
         }
 
         Ok(Self { names })
+    }
+}
+
+/// Contains a mapping of package records to all dependencies.
+pub struct SparseIndexDependencies {
+    /// For each package all dependencies referenced by its records.
+    pub dependencies: FxHashMap<String, FxHashSet<String>>,
+}
+
+impl SparseIndexDependencies {
+    /// Writes the contents of this instance to a file.
+    pub fn to_file(&self, path: &Path) -> std::io::Result<()> {
+        let mut writer = std::io::BufWriter::new(File::create(path)?);
+
+        // Write a magic and version
+        writer.write_all(DEPENDENCIES_FILE_MAGIC)?;
+        writer.write_u16::<LittleEndian>(DEPENDENCIES_FILE_VERSION)?;
+
+        // Write all entries
+        for (name, deps) in self.dependencies.iter() {
+            let c_name =
+                CString::new(name.as_str()).expect("package name should not contain a null");
+            writer.write_all(c_name.as_bytes_with_nul())?;
+
+            // Write all dependencies
+            for dep in deps.iter() {
+                let c_name =
+                    CString::new(dep.as_str()).expect("depdency name should not contain a null");
+                writer.write_all(c_name.as_bytes_with_nul())?;
+            }
+
+            // Write a null terminator to indicate the end of the dependencies
+            writer.write_u8(b'\0')?;
+        }
+
+        writer.flush()
+    }
+
+    /// Parses an instance from bytes.
+    pub fn from_bytes(slice: &[u8]) -> std::io::Result<Self> {
+        let mut reader = Cursor::new(slice);
+
+        // Verify the magic of the file
+        let mut magic = *DEPENDENCIES_FILE_MAGIC;
+        reader.read_exact(magic.as_mut())?;
+        if &magic != DEPENDENCIES_FILE_MAGIC {
+            return Err(std::io::Error::from(ErrorKind::InvalidData));
+        }
+
+        // Determine the version of the file
+        let version = reader.read_u16::<LittleEndian>()?;
+        if version != 1 {
+            return Err(std::io::Error::from(ErrorKind::InvalidData));
+        }
+
+        // Read the individual entries
+        let mut dependencies = FxHashMap::default();
+        loop {
+            // Read the next package name from the file
+            let mut name_bytes = Vec::new();
+            let name_len = reader.read_until(b'\0', &mut name_bytes)?;
+            if name_len == 0 {
+                break;
+            }
+
+            // Safe because we read up until the first nul terminating byte
+            let name = unsafe { CString::from_vec_with_nul_unchecked(name_bytes) }
+                .into_string()
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+
+            let mut package_deps = FxHashSet::default();
+            loop {
+                // Read the next package name from the file
+                let mut dep_name_bytes = Vec::new();
+                let dep_name_len = reader.read_until(b'\0', &mut dep_name_bytes)?;
+                if dep_name_len == 1 {
+                    // If we only read a single byte it means we read an empty string
+                    break;
+                } else if dep_name_len == 0 {
+                    // Premature EOF
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+
+                // Safe because we read up until the first nul terminating byte
+                let dep_name = unsafe { CString::from_vec_with_nul_unchecked(dep_name_bytes) }
+                    .into_string()
+                    .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+
+                package_deps.insert(dep_name);
+            }
+
+            dependencies.insert(name.to_owned(), package_deps);
+        }
+
+        Ok(Self { dependencies })
     }
 }
 

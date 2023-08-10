@@ -2,7 +2,6 @@ use crate::sparse_index::gateway::parse_sparse_index_package;
 use crate::sparse_index::GatewayError;
 use rattler_conda_types::sparse_index::sparse_index_filename;
 use rattler_conda_types::RepoDataRecord;
-use std::fmt::{Display};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::BufReader;
@@ -28,9 +27,7 @@ impl LocalSparseIndex {
         &self,
         package_name: &str,
     ) -> Result<Vec<RepoDataRecord>, GatewayError> {
-        let package_path = self
-            .root
-            .join(sparse_index_filename(&package_name).unwrap());
+        let package_path = self.root.join(sparse_index_filename(package_name).unwrap());
         let platform_url = Url::from_directory_path(&self.root)
             .expect("platform path must refer to a valid directory");
 

@@ -13,9 +13,11 @@ pub struct FrozenCoalescingMap<K, V, E> {
     inner: Arc<FrozenCoalescingMapInner<K, V, E>>,
 }
 
+type ResultChannel<E> = Weak<broadcast::Sender<Result<(), E>>>;
+
 struct FrozenCoalescingMapInner<K, V, E> {
     values: FrozenMap<K, V>,
-    in_flight: Mutex<FxHashMap<K, Weak<broadcast::Sender<Result<(), E>>>>>,
+    in_flight: Mutex<FxHashMap<K, ResultChannel<E>>>,
 }
 
 #[derive(Error, Clone)]
@@ -39,10 +41,7 @@ impl<K, V, E> Default for FrozenCoalescingMap<K, V, E> {
 }
 
 impl<K: Eq + Hash + Clone, V: StableDeref, E> FrozenCoalescingMap<K, V, E> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+    #[allow(clippy::await_holding_lock)]
     pub async fn get_or_cache<Q: ?Sized, F, Fut>(
         &self,
         key: &Q,
@@ -67,7 +66,7 @@ impl<K: Eq + Hash + Clone, V: StableDeref, E> FrozenCoalescingMap<K, V, E> {
         let mut in_flight = inner.in_flight.lock();
 
         // If there is an ongoing request, subscribe to its output. Otherwise start a new request.
-        let mut receiver = if let Some(sender) = in_flight.get(&key).and_then(Weak::upgrade) {
+        let mut receiver = if let Some(sender) = in_flight.get(key).and_then(Weak::upgrade) {
             // There is an ongoing request, just wait for that request to finish.
             sender.subscribe()
         } else {
@@ -118,8 +117,8 @@ impl<K: Eq + Hash + Clone, V: StableDeref, E> FrozenCoalescingMap<K, V, E> {
         result.map_err(CoalescingError::CacheError).map(|_| {
             inner
                 .values
-                .get(&key)
-                .expect(&format!("value must be present in the frozen map"))
+                .get(key)
+                .expect("value must be present in the frozen map")
         })
     }
 }

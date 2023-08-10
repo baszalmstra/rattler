@@ -246,7 +246,10 @@ macro_rules! solver_backend_tests {
                 "https://conda.anaconda.org/conda-forge/linux-64/foo-3.0.2-py36h1af98f8_1.conda",
                 info.url.to_string()
             );
-            assert_eq!("https://conda.anaconda.org/conda-forge/", info.channel.as_ref());
+            assert_eq!(
+                "https://conda.anaconda.org/conda-forge/",
+                info.channel.as_ref()
+            );
             assert_eq!("foo", info.package_record.name);
             assert_eq!("linux-64", info.package_record.subdir);
             assert_eq!("3.0.2", info.package_record.version.to_string());
@@ -440,7 +443,10 @@ mod libsolv_c {
             "https://conda.anaconda.org/conda-forge/linux-64/foo-3.0.2-py36h1af98f8_1.conda",
             info.url.to_string()
         );
-        assert_eq!("https://conda.anaconda.org/conda-forge/", info.channel.as_ref());
+        assert_eq!(
+            "https://conda.anaconda.org/conda-forge/",
+            info.channel.as_ref()
+        );
         assert_eq!("foo", info.package_record.name);
         assert_eq!("linux-64", info.package_record.subdir);
         assert_eq!("3.0.2", info.package_record.version.to_string());

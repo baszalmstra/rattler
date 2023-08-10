@@ -47,6 +47,7 @@ pub async fn get(
 
 /// Read any cache entry for the specified `url`. Returns both the cache policy from the last cached
 /// request as well as an async reader to read the contents of the cache.
+#[allow(dead_code)]
 async fn get_from_cache(cache_dir: &Path, url: Url) -> Option<(CachePolicy, impl AsyncBufRead)> {
     // Open the file for reading again
     let reader = cacache::Reader::open(cache_dir, url).await.ok()?;
