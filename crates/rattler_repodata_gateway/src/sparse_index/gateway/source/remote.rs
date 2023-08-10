@@ -10,6 +10,7 @@ use tokio::io::AsyncReadExt;
 use url::Url;
 use crate::sparse_index::GatewayError;
 
+/// A possible error returned by [`RemoteSparseIndex::new`].
 #[derive(Error, Debug)]
 pub enum RemoteSparseIndexError {
     #[error("failed to fetch `names` from remote channel at {0}")]
@@ -74,6 +75,7 @@ impl RemoteSparseIndex {
     }
 }
 
+/// An error that can be returned by [`fetch_names`].
 #[derive(Error, Debug)]
 pub enum FetchNamesError {
     #[error(transparent)]
