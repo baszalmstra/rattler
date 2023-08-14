@@ -245,10 +245,8 @@ impl SparseIndexNames {
 }
 
 impl SparseIndexNames {
-    /// Writes the contents of this instance to a file.
-    pub fn to_file(&self, path: &Path) -> std::io::Result<()> {
-        let mut writer = std::io::BufWriter::new(File::create(path)?);
-
+    /// Writes the contents of this instance to a writer.
+    pub fn to_writer(&self, mut writer: impl Write) -> std::io::Result<()> {
         // Write a magic and version
         writer.write_all(NAMES_FILE_MAGIC)?;
         writer.write_u16::<LittleEndian>(NAMES_FILE_VERSION)?;
@@ -262,6 +260,12 @@ impl SparseIndexNames {
         }
 
         writer.flush()
+    }
+
+    /// Writes the contents of this instance to a file.
+    pub fn to_file(&self, path: &Path) -> std::io::Result<()> {
+        let writer = std::io::BufWriter::new(File::create(path)?);
+        self.to_writer(writer)
     }
 
     /// Parse the file from an async reader
