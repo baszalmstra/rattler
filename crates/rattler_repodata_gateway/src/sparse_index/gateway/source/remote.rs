@@ -33,7 +33,7 @@ pub struct RemoteSparseIndex {
     names: SparseIndexNames,
 
     /// Package dependencies
-    dependencies: SparseIndexDependencies,
+    dependencies: Option<SparseIndexDependencies>,
 
     /// The root url (`http(s)?://channel/platform/`)
     root: Url,
@@ -88,8 +88,9 @@ impl RemoteSparseIndex {
     /// function may be incorrect.
     pub fn prefetch_hints(&self, package_name: &str) -> Vec<String> {
         self.dependencies
-            .dependencies
-            .get(package_name)
+            .as_ref()
+            .map(|deps| deps.dependencies.get(package_name))
+            .flatten()
             .into_iter()
             .flatten()
             .cloned()
@@ -189,12 +190,19 @@ async fn fetch_dependencies(
     client: &AuthenticatedClient,
     cache_dir: &Path,
     root: Url,
-) -> Result<SparseIndexDependencies, FetchDependenciesError> {
+) -> Result<Option<SparseIndexDependencies>, FetchDependenciesError> {
     let names_url = root.join("dependencies").unwrap();
     let (status_code, mut names_body) =
         super::super::http::get(client, cache_dir, names_url.clone())
             .await
             .map_err(FetchDependenciesError::from)?;
+
+    // Its Ok if the dependencies file is missing
+    if status_code == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    // Any other error is an error
     if !status_code.is_success() {
         return Err(FetchDependenciesError::HttpStatus(status_code, names_url));
     }
@@ -207,5 +215,5 @@ async fn fetch_dependencies(
         .map_err(FetchDependenciesError::from)?;
     let names = SparseIndexDependencies::from_bytes(&names_bytes)
         .map_err(FetchDependenciesError::ParseError)?;
-    Ok(names)
+    Ok(Some(names))
 }
