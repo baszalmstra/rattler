@@ -9,9 +9,11 @@ use rattler_conda_types::{Channel, Platform, RepoDataRecord};
 use rattler_networking::AuthenticatedClient;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::try_join;
+use tracing::instrument;
 use url::Url;
 
 /// A possible error returned by [`RemoteSparseIndex::new`].
@@ -98,6 +100,7 @@ impl RemoteSparseIndex {
     }
 
     /// Fetch information about the specified package.
+    #[instrument(skip(self), fields(channel=%self.root))]
     pub async fn fetch_records(
         &self,
         package_name: &str,
@@ -107,6 +110,8 @@ impl RemoteSparseIndex {
         if !self.contains(package_name) {
             return Ok(vec![]);
         }
+
+        let fetch_start = Instant::now();
 
         // Determine the url for the package
         let file_name =
@@ -122,6 +127,13 @@ impl RemoteSparseIndex {
         if !status.is_success() {
             return Err(GatewayError::HttpStatus(status, file_url));
         }
+
+        let fetch_end = Instant::now();
+        println!(
+            "fetched '{package_name} from {} in {} ms",
+            &self.root,
+            (fetch_end - fetch_start).as_millis()
+        );
 
         // Decode the info
         parse_sparse_index_package(self.channel_name.clone(), self.root.clone(), body).await

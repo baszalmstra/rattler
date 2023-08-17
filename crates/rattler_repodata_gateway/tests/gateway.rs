@@ -92,13 +92,13 @@ async fn test_gateway() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_remote_gateway() {
     // Create a gateway from the sparse index
-    let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
-    let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
-    // let channel = Channel::from_url(
-    //     Url::parse("https://repo.preview-fit-buck.prefix.dev/conda-forge/").unwrap(),
-    //     None,
-    //     &ChannelConfig::default(),
-    // );
+    // let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
+    // let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+    let channel = Channel::from_url(
+        Url::parse("https://repo.preview-fit-buck.prefix.dev/conda-forge/").unwrap(),
+        None,
+        &ChannelConfig::default(),
+    );
 
     let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
     let gateway = Gateway::new(AuthenticatedClient::default(), &cache_dir);
