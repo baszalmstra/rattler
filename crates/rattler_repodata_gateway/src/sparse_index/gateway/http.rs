@@ -1,6 +1,6 @@
 use crate::sparse_index::GatewayError;
 use futures::{StreamExt, TryStreamExt};
-use http::StatusCode;
+use http::{StatusCode, Version};
 use http_cache_semantics::CachePolicy;
 use rattler_networking::AuthenticatedClient;
 use std::path::Path;
@@ -81,6 +81,8 @@ async fn fetch_and_cache(
     let (client, request) = client.get(url.clone()).build_split();
     let request = request?;
     let response = client.execute(request.try_clone().unwrap()).await?;
+
+    // dbg!(response.headers().get(http::header::CONTENT_ENCODING));
     let status_code = response.status();
 
     let cache_policy = CachePolicy::new(&request, &response);

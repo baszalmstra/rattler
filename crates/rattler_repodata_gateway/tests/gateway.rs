@@ -1,7 +1,8 @@
 use itertools::Itertools;
 use rattler_conda_types::{sparse_index::SparseIndex, Channel, ChannelConfig, Platform, RepoData};
-use rattler_networking::AuthenticatedClient;
+use rattler_networking::{AuthenticatedClient, AuthenticationStorage};
 use rattler_repodata_gateway::sparse_index::Gateway;
+use reqwest::Client;
 use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -59,7 +60,16 @@ async fn test_gateway() {
         &ChannelConfig::default(),
     );
 
-    let gateway = Gateway::new(AuthenticatedClient::default(), cache_dir);
+    let client = AuthenticatedClient::from_client(
+        Client::builder()
+            .connection_verbose(true)
+            .http2_prior_knowledge()
+            .build()
+            .unwrap(),
+        AuthenticationStorage::new("rattler", &PathBuf::from("~/.rattler")),
+    );
+
+    let gateway = Gateway::new(client, cache_dir);
     let records = gateway
         .find_recursive_records(
             [&channel],
@@ -90,18 +100,29 @@ async fn test_gateway() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+// #[tracing_test::traced_test]
 async fn test_remote_gateway() {
     // Create a gateway from the sparse index
-    // let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
-    // let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
-    let channel = Channel::from_url(
-        Url::parse("https://repo.preview-fit-buck.prefix.dev/conda-forge/").unwrap(),
-        None,
-        &ChannelConfig::default(),
+    let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
+    let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+    // let channel = Channel::from_url(
+    //     Url::parse("https://repo.prefiks.dev/conda-forge/").unwrap(),
+    //     None,
+    //     &ChannelConfig::default(),
+    // );
+
+    let client = AuthenticatedClient::from_client(
+        Client::builder()
+            // .http2_prior_knowledge()
+            .http2_adaptive_window(true)
+            .brotli(true)
+            .build()
+            .unwrap(),
+        AuthenticationStorage::new("rattler", &PathBuf::from("~/.rattler")),
     );
 
     let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-cache");
-    let gateway = Gateway::new(AuthenticatedClient::default(), &cache_dir);
+    let gateway = Gateway::new(client, &cache_dir);
 
     // Get all the interesting records
     let before_parse = Instant::now();
@@ -109,7 +130,7 @@ async fn test_remote_gateway() {
         .find_recursive_records(
             [&channel],
             vec![Platform::Linux64, Platform::NoArch],
-            ["jupyterlab", "pytorch", "rubin-env"],
+            ["rubin-env"],
         )
         .await
         .unwrap();

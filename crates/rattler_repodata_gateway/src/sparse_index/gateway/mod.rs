@@ -16,7 +16,7 @@ use reqwest::Error;
 use source::SubdirSource;
 use std::collections::VecDeque;
 use std::{io, path::PathBuf, sync::Arc};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio_stream::{wrappers::LinesStream, Stream};
 use url::Url;
 
@@ -191,7 +191,7 @@ impl Gateway {
 
             // Make sure there are no more than 50 requests at a time.
             while !pending_for_execution.is_empty() {
-                if pending_futures.len() < 50 {
+                if pending_futures.len() < 100 {
                     pending_futures.push(pending_for_execution.pop_front().unwrap());
                 } else {
                     break;
@@ -296,7 +296,11 @@ impl Subdir {
 fn parse_sparse_index_package_stream<R: AsyncBufRead>(
     reader: R,
 ) -> impl Stream<Item = Result<SparseIndexRecord, GatewayError>> {
-    LinesStream::new(reader.lines())
+    // Decompress the reader
+    let decoded_stream =
+        BufReader::new(async_compression::tokio::bufread::ZstdDecoder::new(reader));
+
+    LinesStream::new(decoded_stream.lines())
         .map_err(|e| GatewayError::IoError(Arc::new(e)))
         .map_ok(parse_sparse_index_record)
         .try_buffered(10)

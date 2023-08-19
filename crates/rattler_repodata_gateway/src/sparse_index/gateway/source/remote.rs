@@ -124,16 +124,17 @@ impl RemoteSparseIndex {
         // Get the data from the server
         let (status, body) =
             super::super::http::get(&self.client, &self.cache_dir, file_url.clone()).await?;
+        // println!("{}", &file_url);
         if !status.is_success() {
             return Err(GatewayError::HttpStatus(status, file_url));
         }
 
         let fetch_end = Instant::now();
-        println!(
-            "fetched '{package_name} from {} in {} ms",
-            &self.root,
-            (fetch_end - fetch_start).as_millis()
-        );
+        // println!(
+        //     "fetched '{package_name} from {} in {} ms",
+        //     &self.root,
+        //     (fetch_end - fetch_start).as_millis()
+        // );
 
         // Decode the info
         parse_sparse_index_package(self.channel_name.clone(), self.root.clone(), body).await

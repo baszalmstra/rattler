@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{BufRead, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use zstd::Encoder;
 
 static NAMES_FILE_MAGIC: &[u8; 4] = b"NAME";
 static NAMES_FILE_VERSION: u16 = 1;
@@ -55,11 +56,13 @@ pub struct SparseIndexPackage {
 impl SparseIndexPackage {
     /// Write a sparse index package to a file and return its sha256 hash.
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<Sha256Hash, WriteSparseIndexError> {
-        let mut hashing_buf_writer =
+        let hashing_buf_writer =
             HashingWriter::<_, Sha256>::new(std::io::BufWriter::new(writer));
+        let mut encoder = Encoder::new(hashing_buf_writer, 19).unwrap();
         for record in self.records.iter() {
-            writeln!(hashing_buf_writer, "{}", serde_json::to_string(record)?)?;
+            writeln!(encoder, "{}", serde_json::to_string(record)?)?;
         }
+        let hashing_buf_writer = encoder.finish().unwrap();
         let (mut buf_writer, hash) = hashing_buf_writer.finalize();
         buf_writer.flush()?;
         Ok(hash)
@@ -102,25 +105,25 @@ pub fn sparse_index_filename(package_name: &str) -> Result<PathBuf, SparseIndexF
         // Will yield something like 1/a
         1 => {
             new_path.push("1");
-            new_path.push(format!("{package_name}.json"));
+            new_path.push(format!("{package_name}.json.zst"));
         }
         // Will yield something like 2/ab
         2 => {
             new_path.push("2");
-            new_path.push(format!("{package_name}.json"));
+            new_path.push(format!("{package_name}.json.zst"));
         }
 
         // Will yield something like 3/ab/abc
         3 => {
             new_path.push("3");
             new_path.push(&package_name[0..1]);
-            new_path.push(format!("{package_name}.json"));
+            new_path.push(format!("{package_name}.json.zst"));
         }
         // Will yield something like py/th/python
         _ => {
             new_path.push(&package_name[0..2]);
             new_path.push(&package_name[2..4]);
-            new_path.push(format!("{package_name}.json"));
+            new_path.push(format!("{package_name}.json.zst"));
         }
     }
 
