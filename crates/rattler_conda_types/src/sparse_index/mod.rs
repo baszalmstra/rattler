@@ -54,11 +54,16 @@ pub struct SparseIndexPackage {
 }
 
 impl SparseIndexPackage {
-    /// Write a sparse index package to a file and return its sha256 hash.
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<Sha256Hash, WriteSparseIndexError> {
-        let hashing_buf_writer =
-            HashingWriter::<_, Sha256>::new(std::io::BufWriter::new(writer));
-        let mut encoder = Encoder::new(hashing_buf_writer, 19).unwrap();
+    /// Write a sparse index package to a file and return its sha256 hash. The `compression_level`
+    /// is a value between 0 and 22. 1 indicates the lowest compression settings, 22 is the highest.
+    /// When specifying 0, the default is used (3 at the time of writing).
+    pub fn write<W: Write>(
+        &self,
+        writer: &mut W,
+        compression_level: i32,
+    ) -> Result<Sha256Hash, WriteSparseIndexError> {
+        let hashing_buf_writer = HashingWriter::<_, Sha256>::new(std::io::BufWriter::new(writer));
+        let mut encoder = Encoder::new(hashing_buf_writer, compression_level).unwrap();
         for record in self.records.iter() {
             writeln!(encoder, "{}", serde_json::to_string(record)?)?;
         }
@@ -143,9 +148,17 @@ pub enum WriteSparseIndexError {
 }
 
 impl SparseIndex {
-    /// Write entire index to local path on filesystem
-    /// directories are created if they do not exist yet
-    pub fn write_index_to(&self, path: &Path) -> Result<SparseIndexNames, WriteSparseIndexError> {
+    /// Write entire index to local path on filesystem directories are created if they do not exist
+    /// yet.
+    ///
+    /// The `compression_level` is a value between 0 and 22. 1 indicates the lowest compression
+    /// settings, 22 is the highest. When specifying 0, the default is used (3 at the time of
+    /// writing).
+    pub fn write_index_to(
+        &self,
+        path: &Path,
+        compression_level: i32,
+    ) -> Result<SparseIndexNames, WriteSparseIndexError> {
         let mut names = SparseIndexNames {
             names: Default::default(),
         };
@@ -163,7 +176,7 @@ impl SparseIndex {
             // Write the file
             let file = std::fs::File::create(package_path)?;
             let mut writer = std::io::BufWriter::new(file);
-            let hash = sparse_index_package.write(&mut writer)?;
+            let hash = sparse_index_package.write(&mut writer, compression_level)?;
 
             // Determine the dependencies of the package
             let deps = sparse_index_package

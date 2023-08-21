@@ -34,9 +34,9 @@ fn sparse_index_path() -> &'static Path {
 
             // Write to disk
             linux_64
-                .write_index_to(&index_path.join("linux-64"))
+                .write_index_to(&index_path.join("linux-64"), 1)
                 .unwrap();
-            noarch.write_index_to(&index_path.join("noarch")).unwrap();
+            noarch.write_index_to(&index_path.join("noarch"), 1).unwrap();
 
             println!("Sparse index written to: {}", index_path.display());
         } else {
