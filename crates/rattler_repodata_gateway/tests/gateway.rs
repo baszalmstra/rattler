@@ -103,13 +103,13 @@ async fn test_gateway() {
 // #[tracing_test::traced_test]
 async fn test_remote_gateway() {
     // Create a gateway from the sparse index
-    let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
-    let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
-    // let channel = Channel::from_url(
-    //     Url::parse("https://repo.prefiks.dev/conda-forge/").unwrap(),
-    //     None,
-    //     &ChannelConfig::default(),
-    // );
+    // let repodata_server = test_utils::SimpleChannelServer::new(sparse_index_path());
+    // let channel = Channel::from_url(repodata_server.url(), None, &ChannelConfig::default());
+    let channel = Channel::from_url(
+        Url::parse("https://repo.prefiks.dev/conda-forge/").unwrap(),
+        None,
+        &ChannelConfig::default(),
+    );
 
     let client = AuthenticatedClient::from_client(
         Client::builder()
@@ -150,5 +150,5 @@ async fn test_remote_gateway() {
         .into_values()
         .flat_map(|record| record.into_iter())
         .count();
-    assert_eq!(num_records, 46638);
+    assert_eq!(num_records, 337232);
 }
