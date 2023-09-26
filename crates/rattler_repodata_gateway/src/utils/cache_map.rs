@@ -1,13 +1,13 @@
 use elsa::sync::FrozenMap;
 use parking_lot::Mutex;
 use stable_deref_trait::StableDeref;
+use std::collections::HashMap;
 use std::{
     borrow::Borrow,
     future::Future,
     hash::Hash,
     sync::{Arc, Weak},
 };
-use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -19,13 +19,16 @@ type ResultChannel<E> = Weak<broadcast::Sender<Result<(), E>>>;
 
 struct CacheMapInner<K, V, E> {
     values: FrozenMap<K, V>,
-    in_flight: Mutex<HashMap<K, ResultChannel<E>>>,
+    in_flight: Mutex<HashMap<K, ResultChannel<Arc<Mutex<Option<E>>>>>>,
 }
 
 #[derive(Error, Clone)]
 pub enum CoalescingError<E> {
     #[error(transparent)]
     CacheError(E),
+
+    #[error("a concurrent running operation failed")]
+    CoalescedOperationFailed,
 
     #[error("cancelled")]
     Cancelled,
@@ -52,7 +55,7 @@ impl<K: Eq + Hash + Clone, V: StableDeref, E> CacheMap<K, V, E> {
     where
         K: Borrow<Q> + Send + Sync + 'static,
         Q: Hash + Eq + ToOwned<Owned = K>,
-        E: Send + Clone + 'static,
+        E: Send + 'static,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>> + Send + 'static,
         V: Send + Sync + 'static,
@@ -72,7 +75,7 @@ impl<K: Eq + Hash + Clone, V: StableDeref, E> CacheMap<K, V, E> {
             // There is an ongoing request, just wait for that request to finish.
             sender.subscribe()
         } else {
-            let (tx, rx) = broadcast::channel::<Result<(), E>>(1);
+            let (tx, rx) = broadcast::channel::<Result<(), Arc<Mutex<Option<E>>>>>(1);
             let tx = Arc::new(tx);
             let key = key.to_owned();
 
@@ -96,7 +99,7 @@ impl<K: Eq + Hash + Clone, V: StableDeref, E> CacheMap<K, V, E> {
                         inner.values.insert(key.clone(), value);
                         Ok(())
                     }
-                    Err(e) => Err(e),
+                    Err(e) => Err(Arc::new(Mutex::new(Some(e)))),
                 };
 
                 let _ = tx.send(broadcast);
@@ -116,11 +119,15 @@ impl<K: Eq + Hash + Clone, V: StableDeref, E> CacheMap<K, V, E> {
             .map_err(|_| CoalescingError::Cancelled)?;
 
         // Get the result from the frozen set.
-        result.map_err(CoalescingError::CacheError).map(|_| {
-            inner
+        match result {
+            Err(err) => match Mutex::lock_arc(&err).take() {
+                Some(e) => Err(CoalescingError::CacheError(e)),
+                None => Err(CoalescingError::CoalescedOperationFailed),
+            },
+            Ok(_) => Ok(inner
                 .values
                 .get(key)
-                .expect("value must be present in the frozen map")
-        })
+                .expect("value must be present in the frozen map")),
+        }
     }
 }

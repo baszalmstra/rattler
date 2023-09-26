@@ -8,8 +8,8 @@ mod encoding;
 #[cfg(test)]
 pub(crate) mod simple_channel_server;
 
-mod flock;
 pub mod cache_map;
+mod flock;
 
 /// Convert a URL to a cache filename
 pub(crate) fn url_to_cache_filename(url: &Url) -> String {

@@ -91,7 +91,7 @@ impl Channel {
     /// Constructs a new [`Channel`] from a `Url` and associated platforms.
     pub fn from_url(
         url: Url,
-        platforms: Option<impl Into<SmallVec<[Platform; 2]>>>,
+        platforms: Option<SmallVec<[Platform; 2]>>,
         _config: &ChannelConfig,
     ) -> Self {
         // Get the path part of the URL but trim the directory suffix
@@ -117,7 +117,7 @@ impl Channel {
             // Case 7: Fallback
             let name = path.trim_start_matches('/');
             Self {
-                platforms: platforms.map(Into::into),
+                platforms: platforms,
                 name: (!name.is_empty()).then_some(name).map(str::to_owned),
                 base_url,
             }
@@ -128,7 +128,7 @@ impl Channel {
                 .map(|(_, path_part)| path_part)
                 .unwrap_or_else(|| base_url.path());
             Self {
-                platforms: platforms.map(Into::into),
+                platforms: platforms,
                 name: (!name.is_empty()).then_some(name).map(str::to_owned),
                 base_url,
             }

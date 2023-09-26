@@ -63,5 +63,5 @@ pub mod fetch;
 #[cfg(feature = "sparse")]
 pub mod sparse;
 
-pub(crate) mod utils;
 mod gateway;
+pub(crate) mod utils;

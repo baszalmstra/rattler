@@ -1,16 +1,33 @@
-use crate::sparse::SparseRepoData;
+mod sparse;
+
 use rattler_conda_types::{Channel, Platform};
 use rattler_networking::AuthenticatedClient;
-use std::any::Any;
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::task::JoinError;
 use url::Url;
 
+pub use sparse::SparseRepoDataSource;
+
 pub enum SubdirSource {
     // LocalSparseIndex(local::LocalSparseIndex),
     // RemoteSparseIndex(remote::RemoteSparseIndex),
-    SparseRepoData(SparseRepoData),
+    SparseRepoData(SparseRepoDataSource),
+}
+
+impl From<SparseRepoDataSource> for SubdirSource {
+    fn from(value: SparseRepoDataSource) -> Self {
+        SubdirSource::SparseRepoData(value)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NotFound {
+    #[error(transparent)]
+    HttpRequest(reqwest::Error),
+
+    #[error("'{0}' not found ")]
+    FileNotFound(PathBuf),
 }
 
 #[derive(Debug, Error)]
@@ -23,6 +40,9 @@ pub enum SubdirSourceError {
 
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+
+    #[error(transparent)]
+    NotFound(#[from] NotFound),
 
     #[error("'{0}' does not contain any repodata")]
     PathDoesNotContainRepoData(PathBuf),
@@ -55,7 +75,7 @@ impl SubdirSource {
             let root = platform_url
                 .to_file_path()
                 .map_err(|_| SubdirSourceError::InvalidPath(platform_url))?;
-            return Ok(Self::from_path(root, channel, platform));
+            return Self::from_path(root, channel, platform).await;
         }
 
         // Http based scheme?
@@ -69,10 +89,6 @@ impl SubdirSource {
     /// This asynchronous function creates a new instance. The function acts differently based on
     /// whether the provided path is a file or a directory.
     ///
-    /// If the `path` refers to a directory, the function checks if the directory contains a file
-    /// called "repodata.json". If it does not, it triggers a
-    /// `SubdirSourceError::PathDoesNotContainRepoData` error.
-    ///
     /// If the path refers to a file containing a "repodata.json", the function sparsely reads the
     /// contents of the repodata file which can be used to quickly answer specific queries about the
     /// data.
@@ -84,21 +100,19 @@ impl SubdirSource {
         // If the path refers to a directory make sure it contains repodata.
         let repodata_path = if path.is_dir() {
             let repodata_path = path.join("repodata.json");
-            if !repodata_path.is_file() {
-                return Err(SubdirSourceError::PathDoesNotContainRepoData(path));
-            } else {
-                repodata_path
-            }
+            repodata_path
         } else {
             path
         };
 
-        // Sparsely read the contents of the repodata.
-        let sparse_repo_data = tokio::task::spawn_blocking(move || {
-            SparseRepoData::new(channel, platform, repodata_path, None)
-        })
-        .await??;
+        // Detect if the file exists or not
+        if !repodata_path.is_file() {
+            return Err(NotFound::FileNotFound(repodata_path).into());
+        }
 
-        Ok(SubdirSource::SparseRepoData(sparse_repo_data))
+        // Sparsely read the contents of the repodata.
+        SparseRepoDataSource::new(channel, platform, repodata_path)
+            .await
+            .map(Into::into)
     }
 }
