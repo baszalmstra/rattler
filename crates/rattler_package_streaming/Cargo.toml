@@ -28,6 +28,11 @@ zip = { version = "0.6.6", default-features = false, features = ["deflate", "tim
 zstd = { version = "0.12.4", default-features = false }
 rattler_networking = { version = "0.11.0", path = "../rattler_networking", default-features = false }
 
+cacache = "12.0.0"
+serde_with = "3.4.0"
+tempfile = "3.8.0"
+rkyv = { version = "0.7.42", features = ["validation"] }
+
 [features]
 default = ["native-tls", "blocking"]
 tokio = ["dep:tokio", "bzip2/tokio", "tokio/fs", "tokio-util/io", "tokio-util/io-util", "reqwest?/stream", "futures-util"]
@@ -37,8 +42,11 @@ blocking = ["rattler_networking/blocking"]
 wasm = ["zstd/wasm"]
 
 [dev-dependencies]
-tempfile = "3.8.0"
+insta = { version = "1.34.0", features = ["yaml"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 walkdir = "2.4.0"
 rstest = "0.18.2"
 rstest_reuse = "0.6.0"
+hex-literal = "0.4.1"
+assert_matches = "1.5.0"
+serde = "1.0.190"

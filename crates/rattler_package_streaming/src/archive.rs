@@ -1,0 +1,509 @@
+use crate::ProvenanceIntegrity;
+use cacache::{Integrity, WriteOpts};
+use rattler_conda_types::package::ArchiveType;
+use std::io::BufReader;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    ffi::OsStr,
+    io::{self, Error, Read, Seek, Write},
+    path::{Component, Path, PathBuf},
+};
+use tempfile::SpooledTempFile;
+use thiserror::Error;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    task::JoinError,
+};
+use zip::result::ZipError;
+
+#[derive(Debug, Error)]
+pub enum ExtractError {
+    /// Failed to extract a tarball while doing a certain IO operation.
+    #[error("failed to extract archive while {2}{}", if let Some(path) = .1 {
+    format!(" (file: {})", path.to_string_lossy())
+    } else {
+    "".to_string()
+    })]
+    IoError(#[source] io::Error, Option<PathBuf>, String),
+
+    /// Failed to extract an archive to the cache.
+    #[error("failed to extract archive to cache. {0}{}", if let Some(path) = .1 {
+    format!(" (file: {})", path.to_string_lossy())
+    } else {
+    "".to_string()
+    })]
+    CacheError(#[source] cacache::Error, Option<PathBuf>),
+
+    #[error("failed to extract archive to cache. {0}{}", if let Some(path) = .1 {
+    format!(" (file: {})", path.to_string_lossy())
+    } else {
+    "".to_string()
+    })]
+    ZipError(#[source] ZipError, Option<PathBuf>),
+
+    #[error("the operation was cancelled")]
+    Cancelled,
+}
+
+impl ExtractError {
+    /// Constructs a new error from a zip error and the file that was involved. If the error
+    /// represents a problem reading the underlying datastructure this will be converted to an IO
+    /// error.
+    pub fn zip_error(err: ZipError, path: Option<PathBuf>) -> Self {
+        match err {
+            ZipError::Io(err) => Self::IoError(err, path, "reading zip archive".into()),
+            _ => Self::ZipError(err, path),
+        }
+    }
+}
+
+/// Represents a stream of data that is either coming in asynchronously from a remote source or from
+/// a synchronous location (like the filesystem).
+pub enum StreamingOrLocal {
+    Streaming(Box<dyn AsyncRead + Unpin + Send>),
+    Local(Box<dyn Read + Send>),
+}
+
+impl StreamingOrLocal {
+    /// Stream in the contents of the stream and make sure we have a fast locally accessible stream.
+    ///
+    /// If the stream is already local this will simply return that stream. If however the file is
+    /// remote it will first be read to a temporary spooled file.
+    pub async fn into_local(self) -> io::Result<Box<dyn Read + Send>> {
+        match self {
+            StreamingOrLocal::Streaming(mut stream) => {
+                // Create a [`SpooledTempFile`] which is a blob of memory that is kept in memory if
+                // it does not grow beyond 5MB, otherwise it is written to disk.
+                let mut local_file = SpooledTempFile::new(5 * 1024 * 1024);
+
+                // Stream in the bytes and copy them to the temporary file.
+                let mut buf = [0u8; 1024 * 8];
+                loop {
+                    let bytes_read = stream.read(&mut buf).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    local_file.write_all(&buf)?;
+                }
+
+                // Restart the file from the start so we can start reading from it.
+                local_file.rewind()?;
+
+                Ok(Box::new(local_file))
+            }
+            StreamingOrLocal::Local(stream) => Ok(stream),
+        }
+    }
+}
+
+/// Represents the data of a package archive.
+///
+/// This data can be read and extracted to a cache directory using the
+/// [`RawArchive::extract_to_cache`] and [`RawArchive::extract_to_cache_sync`] functions.
+///
+/// Since reading, decompressing and extracting at the same time can cause some significant
+/// back-pressure this struct ingests a synchronous read stream instead. Using an async stream would
+/// most likely not yield any benefit in terms of asynchronicity. It is likely more performant to
+/// first read the contents of an async stream into memory (or to disk) followed by extracting the
+/// contents while concurrently downloading additional archives. This will be faster because it will
+/// saturate the network-io, CPU, and disk-io instead of just one of those being the bottleneck. See
+/// [`StreamingOrLocal`] to help with that.
+pub struct RawArchive {
+    data: Box<dyn Read + Send>,
+    archive_type: ArchiveType,
+}
+
+impl RawArchive {
+    /// Construct a new [`RawArchive`] from the data and the type of archive.
+    pub fn new(data: Box<dyn Read + Send>, archive_type: ArchiveType) -> Self {
+        Self { data, archive_type }
+    }
+
+    /// Extract the contents of the archive into a cache.
+    ///
+    /// Extraction of the archive will happen in a background task which can be awaited. The task
+    /// itself is non-cancellable, so dropping the future returned by this function will not cancel
+    /// the extraction.
+    ///
+    /// This function consumes the instance as it will consume the data.
+    ///
+    /// The function returns an [`ArchiveIndex`] which enables retrieving the contents of the
+    /// archive back from the cache.
+    pub async fn extract_to_cache(self, cache_path: &Path) -> Result<ArchiveIndex, ExtractError> {
+        let cache_path = cache_path.to_path_buf();
+        match tokio::task::spawn_blocking(move || self.extract_to_cache_sync(&cache_path))
+            .await
+            .map_err(JoinError::try_into_panic)
+        {
+            Ok(result) => result,
+            Err(Ok(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => Err(ExtractError::Cancelled),
+        }
+    }
+
+    /// Extract the contents of the archive into a cache.
+    ///
+    /// This function consumes the instance as it will consume the data.
+    ///
+    /// The function returns an [`ArchiveIndex`] which enables retrieving the contents of the
+    /// archive back from the cache.
+    pub fn extract_to_cache_sync(
+        mut self,
+        cache_path: &Path,
+    ) -> Result<ArchiveIndex, ExtractError> {
+        Ok(match self.archive_type {
+            ArchiveType::TarBz2 => extract_tar_bz2_to_cache(&mut self.data, cache_path)?,
+            ArchiveType::Conda => extract_conda_to_cache(&mut self.data, cache_path)?,
+        })
+    }
+}
+
+/// Extracts a conda archive to a cache directory and returns an [`ArchiveIndex`] to be able to
+/// find the entries from the archive in the cache.
+fn extract_conda_to_cache<'r, R: Read + 'r>(
+    mut data: R,
+    cache_path: &Path,
+) -> Result<ArchiveIndex, ExtractError> {
+    let mut index = ArchiveIndex::default();
+    while let Some(entry) = zip::read::read_zipfile_from_stream(&mut data)
+        .map_err(|err| ExtractError::zip_error(err, None))?
+    {
+        // Determine the filename of the zip entry
+        let manged_named = entry.mangled_name();
+        let file_name = manged_named
+            .file_name()
+            .map(OsStr::to_string_lossy)
+            .ok_or_else(|| {
+                ExtractError::IoError(
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "file name is missing from zip archive",
+                    ),
+                    None,
+                    "while reading conda archive".into(),
+                )
+            })?;
+
+        // If this is a data file, extract it to the cache.
+        if file_name.ends_with(".tar.zst") {
+            // Extract the internal tarball to the cache
+            let index_part = extract_tar_zst_to_cache(entry, cache_path, Some(manged_named))?;
+
+            // Merge the archive index with the rest of the data
+            index.append(index_part);
+        }
+    }
+
+    Ok(index)
+}
+
+/// Extracts a zstd compressed tar archive to a cache directory and returns an [`ArchiveIndex`] to
+/// be able to read the extracted content back from the cache.
+fn extract_tar_zst_to_cache<'r, R: Read + 'r>(
+    data: R,
+    cache_path: &Path,
+    archive_path: Option<PathBuf>,
+) -> Result<ArchiveIndex, ExtractError> {
+    let decompressed_tar = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| ExtractError::IoError(e, archive_path, "while reading zstd stream".into()))?;
+    extract_tar_to_cache(decompressed_tar, cache_path)
+}
+
+/// Extracts an bz2 compressed tar archive to a cache directory and returns an [`ArchiveIndex`] to
+/// be able to read the extracted content back from the cache.
+fn extract_tar_bz2_to_cache<'r, R: Read + 'r>(
+    data: R,
+    cache_path: &Path,
+) -> Result<ArchiveIndex, ExtractError> {
+    let decompressed_tar = bzip2::read::BzDecoder::new(BufReader::new(data));
+    extract_tar_to_cache(decompressed_tar, cache_path)
+}
+
+/// Extracts an archive to a cache directory and returns an [`ArchiveIndex`] to be able to read the
+/// extracted content back from the cache.
+fn extract_tar_to_cache<'r, R: Read + 'r>(
+    data: R,
+    cache_path: &Path,
+) -> Result<ArchiveIndex, ExtractError> {
+    let mut index = ArchiveIndex::default();
+    let mut archive = tar::Archive::new(data);
+    let entries = archive.entries().map_err(|err| {
+        ExtractError::IoError(err, None, "reading path from entry header.".into())
+    })?;
+    let mut drain_buffer = [0u8; 1024 * 8];
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|e| ExtractError::IoError(e, None, "reading entry from tarball".into()))?;
+        let header = entry.header();
+        let mode = header.mode().unwrap_or(0o644) | 0o600;
+        let entry_type = header.entry_type();
+
+        // Skip invalid paths
+        let entry_path = header.path().map_err(|e| {
+            ExtractError::IoError(e, None, "reading path from entry header.".into())
+        })?;
+        let Some(entry_path) = strip_prefix(&entry_path) else { continue };
+
+        match entry_type {
+            tar::EntryType::Regular => {
+                // Open a writer to write a file to cache
+                let mut writer = WriteOpts::new()
+                    .algorithm(cacache::Algorithm::Xxh3)
+                    .open_hash_sync(&cache_path)
+                    .map_err(|e| ExtractError::CacheError(e, Some(entry_path.to_path_buf())))?;
+
+                // Copy the content from the tarball directly into the cache.
+                std::io::copy(&mut entry, &mut writer).map_err(|e| {
+                    ExtractError::IoError(
+                        e,
+                        Some(entry_path.to_path_buf()),
+                        "copying to cacache".into(),
+                    )
+                })?;
+
+                // Finish writing the file to the cache and constructing a hash
+                let sri = writer
+                    .commit()
+                    .map_err(|e| ExtractError::CacheError(e, Some(entry_path.to_path_buf())))?;
+
+                // Store a record in the index so we can retrieve the file later.
+                index.files.insert(
+                    entry_path.to_string_lossy().replace('\\', "/"),
+                    (sri.to_string(), mode),
+                );
+            }
+            tar::EntryType::Symlink | tar::EntryType::Link => {
+                // Read the link name from archive
+                let link_name = read_link_name(&mut entry).map_err(|e| {
+                    ExtractError::IoError(
+                        e,
+                        Some(entry_path.to_path_buf()),
+                        "while reading link".into(),
+                    )
+                })?;
+
+                // Make sure the link doesnt point outside of the archive.
+                if is_target_outside_of_path(&entry_path, &link_name) {
+                    return Err(ExtractError::IoError(
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            "link destination is outside of the archive",
+                        ),
+                        Some(entry_path.to_path_buf()),
+                        "while reading link".into(),
+                    ));
+                }
+
+                // Store the record in the index so we can create it later.
+                index.links.insert(
+                    entry_path.to_string_lossy().replace('\\', "/"),
+                    (
+                        link_name.to_string_lossy().to_string(),
+                        if entry_type.is_hard_link() {
+                            LinkType::Hard
+                        } else {
+                            LinkType::Soft
+                        },
+                    ),
+                );
+            }
+            // Otherwise skip the entry by reading its content.
+            _ => loop {
+                let bytes_read = entry.read(&mut drain_buffer).map_err(|e| {
+                    ExtractError::IoError(e, Some(entry_path.to_path_buf()), "reading entry".into())
+                })?;
+                if bytes_read == 0 {
+                    break;
+                }
+            },
+        }
+    }
+
+    Ok(index)
+}
+
+/// Reads a link name from a tar entry and produces a sensible error message if the name is missing
+/// or invalid.
+fn read_link_name<'e, 'r, R: Read + 'r>(
+    entry: &'e mut tar::Entry<R>,
+) -> Result<Cow<'e, Path>, Error> {
+    match entry.link_name() {
+        Ok(Some(link_name)) if link_name.iter().next().is_some() => Ok(link_name),
+        Ok(Some(_)) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "link destination is empty",
+        )),
+        Ok(None) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "link destination is missing",
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+/// Ensure that the specified path is a valid path in an archive.
+fn strip_prefix(path: &Path) -> Option<PathBuf> {
+    let mut dest = PathBuf::new();
+    for part in path.components() {
+        match part {
+            // Leading '/' characters, root paths, and '.'
+            // components are just ignored and treated as "empty
+            // components"
+            Component::Prefix(..) | Component::RootDir | Component::CurDir => continue,
+
+            // If any part of the filename is '..', then skip over
+            // unpacking the file to prevent directory traversal
+            // security issues.  See, e.g.: CVE-2001-1267,
+            // CVE-2002-0399, CVE-2005-1918, CVE-2007-4131
+            Component::ParentDir => return None,
+
+            Component::Normal(part) => dest.push(part),
+        }
+    }
+    Some(dest)
+}
+
+/// Checks whether a given `target` path is located outside of the `path`.
+///
+/// This function determines if the `target` path is located outside of the `path` by iterating
+/// through the components of the `target` path and comparing them with the `path`. If any
+/// component of the `target` path references an absolute path, a root directory, or goes
+/// above the parent directory of the `path`, the function returns `true`. Otherwise, it returns
+/// `false`.
+fn is_target_outside_of_path(path: &Path, target: &Path) -> bool {
+    if path == target {
+        return false;
+    }
+
+    let mut current = path.to_path_buf();
+
+    for target_components in target.components() {
+        match target_components {
+            Component::CurDir => continue, // Skip current directory component
+            Component::ParentDir => match current.parent() {
+                Some(parent) => current = parent.to_path_buf(),
+                None => return true, // Target tries to go above the parent directory, so it's outside
+            },
+            Component::Normal(path) => current.push(path),
+            c @ Component::Prefix(prefix) => match current.components().next() {
+                Some(Component::Prefix(p)) if p == prefix => {
+                    current = AsRef::<Path>::as_ref(&c).to_path_buf()
+                }
+                _ => return true,
+            },
+            c @ Component::RootDir => match current.components().next() {
+                Some(Component::RootDir) => current = AsRef::<Path>::as_ref(&c).to_path_buf(),
+                _ => return true,
+            },
+        }
+    }
+
+    false
+}
+
+/// Represents the result of extracting an archive to the cache.
+///
+/// This struct records for each file in the archive the hash of the file and some additional
+/// metadata (like file permissions). This can then be used to retrieve the file from the cache and
+/// extract it to a destination folder.
+///
+/// An [`ArchiveIndex`] can be created by extracting a [`RawArchive`] using the
+/// [`RawArchive::extract_to_cache`] or [`RawArchive::extract_to_cache_sync`] functions.
+#[derive(rkyv::Archive, rkyv::Serialize, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[archive(check_bytes)]
+pub struct ArchiveIndex {
+    pub files: HashMap<String, (String, u32)>,
+    pub links: HashMap<String, (String, LinkType)>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum LinkType {
+    Hard,
+    Soft,
+}
+
+impl ArchiveIndex {
+    /// Appends the entries from another index to this index.
+    pub fn append(&mut self, other: Self) {
+        self.files.extend(other.files.into_iter());
+        self.links.extend(other.links.into_iter());
+    }
+}
+
+/// Returns a cache key for the specified provenance based on the integrity of the archive.
+pub fn archive_cache_key(integrity: &ProvenanceIntegrity) -> String {
+    format!("rattler::package::{integrity}")
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rattler_conda_types::package::ArchiveIdentifier;
+    use rstest::*;
+    use std::fs::File;
+    use tempfile::tempdir;
+
+    #[rstest]
+    #[case("", "a", true)]
+    #[case("", "..", false)]
+    #[case("a", "..", true)]
+    #[case("a", "../..", false)]
+    #[case("", "/", false)]
+    #[case("/", "/", true)]
+    #[case("/", "/..", false)]
+    #[case("/a/b/c", "/a/b/c", true)]
+    #[case("/a/b/c", "/a/b/c/d", true)]
+    #[case("/a/b/c/d", "/a/b/c", true)]
+    #[case("/", "/a", true)]
+    #[case("/a", "/", true)]
+    #[case("/a/b", "/a/b/c/../d", true)]
+    #[case("/a/b", "/a/b/../c/../d", true)]
+    #[case("/a/b", "/a/b/c/../../d", true)]
+    #[case("/a/b/c", "/a/b/../x/y/z", true)]
+    #[case("/a/b/c", "x/y/z", true)]
+    #[case("/a/b/c", "../../a/b/c", true)]
+    #[case("", "a/b", true)]
+    #[case("a/b", "", true)]
+    fn test_is_target_outside_of_path(
+        #[case] path: PathBuf,
+        #[case] target: PathBuf,
+        #[case] inside: bool,
+    ) {
+        assert_eq!(
+            is_target_outside_of_path(&path, &target),
+            !inside,
+            "'{}' should {}be rooted in '{}'",
+            target.display(),
+            if inside { "" } else { "NOT " },
+            path.display(),
+        );
+    }
+
+    #[rstest]
+    #[case::mock_tar_bz("mock-2.0.0-py37_1000.tar.bz2")]
+    #[case::mock_conda("mock-2.0.0-py37_1000.conda")]
+    #[case::mock_libzlib_symlink("with-symlinks/libzlib-1.2.13-hfd90126_4.tar.bz2")]
+    fn test_extract_archive_to_cache(#[case] archive_name: &str) {
+        let cache_dir = tempdir().unwrap();
+
+        let archive_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data")
+            .join(archive_name);
+
+        let identifier = ArchiveIdentifier::try_from_path(&archive_path).unwrap();
+
+        let file = File::open(archive_path).unwrap();
+
+        let index = RawArchive::new(Box::new(file), identifier.archive_type)
+            .extract_to_cache_sync(cache_dir.path())
+            .unwrap();
+
+        insta::with_settings!({sort_maps => true}, {
+            insta::assert_yaml_snapshot!(archive_name, index);
+        });
+    }
+}

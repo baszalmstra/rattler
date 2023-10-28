@@ -1,0 +1,70 @@
+---
+source: crates/rattler_package_streaming/src/archive.rs
+expression: index
+---
+files:
+  info/about.json:
+    - xxh3-CCZt6aVRapqF0b1QPGZGtw==
+    - 420
+  info/files:
+    - xxh3-rWE4H3xIDwCq2R3fKvRIQQ==
+    - 420
+  info/git:
+    - xxh3-maoG0wFHmNhgAcMkRo1Jfw==
+    - 420
+  info/hash_input.json:
+    - xxh3-/klUBF1imYYh1uhdE5WkLg==
+    - 420
+  info/index.json:
+    - xxh3-RPNDIMr+qNkENVH/d/JMcg==
+    - 420
+  info/licenses/license.txt:
+    - xxh3-cCVX2OFbFJRU/Ws/SilSZg==
+    - 420
+  info/paths.json:
+    - xxh3-t4XE6e7vSvfYPOe1DNwjhQ==
+    - 420
+  info/recipe/conda_build_config.yaml:
+    - xxh3-LDkphfo8I3AqJVXs0LDn4w==
+    - 420
+  info/recipe/meta.yaml:
+    - xxh3-RXRcauDjqQCXziwVTWO7yg==
+    - 420
+  info/recipe/parent/bld.bat:
+    - xxh3-LqU7q3EiAgWsMwASkS1+bA==
+    - 420
+  info/recipe/parent/build.sh:
+    - xxh3-MGZC2Ws/ueuq/9NZwQAnew==
+    - 420
+  info/recipe/parent/conda_build_config.yaml:
+    - xxh3-E2EONJwRFT5Mudd07PenPA==
+    - 420
+  info/recipe/parent/license.txt:
+    - xxh3-cCVX2OFbFJRU/Ws/SilSZg==
+    - 420
+  info/recipe/parent/meta.yaml:
+    - xxh3-SjZojfG7RR94t4cIQfwUrA==
+    - 420
+  info/recipe/parent/recipe-scripts-license.txt:
+    - xxh3-AXeeOXwAIwyeUw39S/4ARQ==
+    - 420
+  info/recipe/parent/test_compile_flags.bat:
+    - xxh3-pEQHycONdFo46XjMp9LnLg==
+    - 420
+  info/recipe/parent/test_compile_flags.c:
+    - xxh3-Gvr2ZYiuvK04BnOS87YZcg==
+    - 420
+  info/run_exports.json:
+    - xxh3-oGyRCkSRgpAylcQ60U9phg==
+    - 420
+  info/test/run_test.sh:
+    - xxh3-rRgFnJ9hDadPcDl5P7zWQw==
+    - 420
+  lib/libz.1.2.13.dylib:
+    - xxh3-wuoSr4DXKpoWVFEVgLPLUw==
+    - 509
+links:
+  lib/libz.1.dylib:
+    - libz.1.2.13.dylib
+    - Soft
+

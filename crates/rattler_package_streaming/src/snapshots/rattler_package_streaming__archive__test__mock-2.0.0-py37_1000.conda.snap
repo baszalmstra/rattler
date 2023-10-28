@@ -1,0 +1,136 @@
+---
+source: crates/rattler_package_streaming/src/archive.rs
+expression: index
+---
+files:
+  info/LICENSE.txt:
+    - xxh3-2DOb3peMd2wd08N0zMAtvA==
+    - 436
+  info/about.json:
+    - xxh3-0Q1ymVGOarL+ewArcHvm5A==
+    - 420
+  info/files:
+    - xxh3-tn9nkMHPKA+W8nU22SD6Mw==
+    - 420
+  info/git:
+    - xxh3-maoG0wFHmNhgAcMkRo1Jfw==
+    - 420
+  info/hash_input.json:
+    - xxh3-3HBI+Ph0f1YTSc3hJ3BcFg==
+    - 420
+  info/index.json:
+    - xxh3-v4wbhH/D6qaI7+BcF178Zw==
+    - 420
+  info/paths.json:
+    - xxh3-AIee+mrhowQ9lzCXsJvZRw==
+    - 420
+  info/recipe/conda_build_config.yaml:
+    - xxh3-+Wi8OPGtPA47lYNBznsfqQ==
+    - 420
+  info/recipe/meta.yaml:
+    - xxh3-HkqhtGJrBGypH+dtwLpn7A==
+    - 420
+  info/recipe/meta.yaml.template:
+    - xxh3-4E06sahFT7kl8AjVRLObHQ==
+    - 420
+  info/test/run_test.py:
+    - xxh3-BnvccQQmyHBeLk0mDZeItg==
+    - 420
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/PKG-INFO:
+    - xxh3-khaSUHyJ3YTMKzx+bDF/MA==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/SOURCES.txt:
+    - xxh3-XweTtqi+HVPeGs0D6pRK3w==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/dependency_links.txt:
+    - xxh3-eFjvAR6gutE4SGj7oMIf3A==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/installed-files.txt:
+    - xxh3-ePtZYiOzmSji/yUnMqTb/Q==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/not-zip-safe:
+    - xxh3-eFjvAR6gutE4SGj7oMIf3A==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/pbr.json:
+    - xxh3-qjYXKdGHKUEQ4Wi8IFtD+w==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/requires.txt:
+    - xxh3-UG0/mAE+VFs93geHp7AZFw==
+    - 436
+  lib/python3.7/site-packages/mock-2.0.0-py3.7.egg-info/top_level.txt:
+    - xxh3-OX7klfiLn/v2xcw/CBQ0Uw==
+    - 436
+  lib/python3.7/site-packages/mock/__init__.py:
+    - xxh3-rPgN9mlLimdhTmfduoer0g==
+    - 436
+  lib/python3.7/site-packages/mock/__pycache__/__init__.cpython-37.pyc:
+    - xxh3-X1NQaIGE9bhpA0t9TDLeMw==
+    - 436
+  lib/python3.7/site-packages/mock/__pycache__/mock.cpython-37.pyc:
+    - xxh3-hRUc/Nqlc2Ll2GewvsaX9Q==
+    - 436
+  lib/python3.7/site-packages/mock/mock.py:
+    - xxh3-AA6+D71i7W5t9f+kNulJ3w==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__init__.py:
+    - xxh3-RmOKjvGT4NFppLoWl1G3vQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__main__.py:
+    - xxh3-Nwuhl/GdFDqefq/cuxC6wQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/__init__.cpython-37.pyc:
+    - xxh3-Z3+0t7e/t99ErE2murMoaQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/__main__.cpython-37.pyc:
+    - xxh3-9CXvj5S+vSXZAR41fg9eWA==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/support.cpython-37.pyc:
+    - xxh3-WMT7cPXcrFHsHFhx1o7Ppg==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testcallable.cpython-37.pyc:
+    - xxh3-c++1AEA7Zk+jo7LGzUBi1g==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testhelpers.cpython-37.pyc:
+    - xxh3-3RQ9clLhxrSULLO2UgW9YQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testmagicmethods.cpython-37.pyc:
+    - xxh3-mHxzbTZoUax/jMpdYfuPUQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testmock.cpython-37.pyc:
+    - xxh3-rFd85KGJPdkbSgBkqq46Kw==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testpatch.cpython-37.pyc:
+    - xxh3-mwj+lu1I4aOZUE5jMNbqpg==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testsentinel.cpython-37.pyc:
+    - xxh3-iXCJ0EB2nGt4vlrp5Hr9aA==
+    - 436
+  lib/python3.7/site-packages/mock/tests/__pycache__/testwith.cpython-37.pyc:
+    - xxh3-PXh3X3Of0G++karfljyDlw==
+    - 436
+  lib/python3.7/site-packages/mock/tests/support.py:
+    - xxh3-sXXSKb8VbCvmF7nygiqZJg==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testcallable.py:
+    - xxh3-hMMdORbC4a1X6iAWytOlVw==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testhelpers.py:
+    - xxh3-X+t5SHmXr2DvCTJErDX/CA==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testmagicmethods.py:
+    - xxh3-juSdVz1GYH2MjdpyIfi/kA==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testmock.py:
+    - xxh3-hpNtW3ql3GfYDR/vDXy3VQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testpatch.py:
+    - xxh3-VGyki2N1NllBZ2EFxoPzgQ==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testsentinel.py:
+    - xxh3-OAUeW3DBwI+KRIALjjQs9Q==
+    - 436
+  lib/python3.7/site-packages/mock/tests/testwith.py:
+    - xxh3-5KBdBz5bXW9iTAIU4QwByw==
+    - 436
+links: {}
+

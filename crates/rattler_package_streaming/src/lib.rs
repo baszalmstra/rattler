@@ -4,12 +4,15 @@
 
 use rattler_digest::{Md5Hash, Sha256Hash};
 
+mod provenance;
 pub mod read;
 pub mod seek;
+pub use provenance::{Hash, PackageProvenance, ProvenanceIntegrity};
 
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
 
+mod archive;
 pub mod fs;
 #[cfg(feature = "tokio")]
 pub mod tokio;
