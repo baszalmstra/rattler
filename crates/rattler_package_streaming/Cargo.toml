@@ -28,7 +28,7 @@ zip = { version = "0.6.6", default-features = false, features = ["deflate", "tim
 zstd = { version = "0.12.4", default-features = false }
 rattler_networking = { version = "0.11.0", path = "../rattler_networking", default-features = false }
 
-cacache = "12.0.0"
+cacache = { version = "12.0.0", default-features = false, features = ["mmap", "tokio-runtime"] }
 serde_with = "3.4.0"
 tempfile = "3.8.0"
 rkyv = { version = "0.7.42", features = ["validation"] }

@@ -2,6 +2,7 @@ use itertools::Itertools;
 use rattler_conda_types::{package::ArchiveIdentifier, RepoDataRecord};
 use rattler_digest::{parse_digest_from_hex, Md5, Md5Hash, Sha256, Sha256Hash};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fmt, ops::Deref};
 use thiserror::Error;
@@ -27,12 +28,18 @@ pub struct PackageProvenance {
 impl PackageProvenance {
     /// Returns true if this provenance refers to a package on disk.
     pub fn is_local(&self) -> bool {
-        self.url.scheme() == "file"
+        self.local_path().is_some()
     }
 
     /// Returns true if this provenance refers to a package on a remote server.
     pub fn is_remote(&self) -> bool {
         self.url.scheme().starts_with("http")
+    }
+
+    /// Returns the local path to which this provenance refers or `None` if this provenance does not
+    /// refer a local package.
+    pub fn local_path(&self) -> Option<PathBuf> {
+        self.url.to_file_path().ok()
     }
 }
 
@@ -50,6 +57,36 @@ impl ProvenanceIntegrity {
 impl FromIterator<Hash> for ProvenanceIntegrity {
     fn from_iter<T: IntoIterator<Item = Hash>>(iter: T) -> Self {
         Self(iter.into_iter().sorted().collect())
+    }
+}
+
+impl<'a> From<&'a RepoDataRecord> for ProvenanceIntegrity {
+    fn from(record: &'a RepoDataRecord) -> Self {
+        let sha256 = record.package_record.sha256.map(|x| Hash::Sha256(x));
+        let md5 = record.package_record.md5.map(|x| Hash::Md5(x));
+        Self::from_iter(sha256.into_iter().chain(md5.into_iter()))
+    }
+}
+
+impl Deref for ProvenanceIntegrity {
+    type Target = Vec<Hash>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProvenanceIntegrity {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.iter().format(", "))
+    }
+}
+
+impl FromStr for ProvenanceIntegrity {
+    type Err = ParseHashError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.split(',').map(str::trim).map(Hash::from_str).collect()
     }
 }
 
@@ -107,28 +144,6 @@ impl FromStr for Hash {
             )?)),
             _ => Err(ParseHashError::UnsupportedAlgorithm(s.to_string())),
         }
-    }
-}
-
-impl<'a> From<&'a RepoDataRecord> for ProvenanceIntegrity {
-    fn from(record: &'a RepoDataRecord) -> Self {
-        let sha256 = record.package_record.sha256.map(|x| Hash::Sha256(x));
-        let md5 = record.package_record.md5.map(|x| Hash::Md5(x));
-        Self::from_iter(sha256.into_iter().chain(md5.into_iter()))
-    }
-}
-
-impl Deref for ProvenanceIntegrity {
-    type Target = Vec<Hash>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for ProvenanceIntegrity {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.iter().format(", "))
     }
 }
 

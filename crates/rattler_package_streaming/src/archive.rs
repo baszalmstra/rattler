@@ -1,11 +1,16 @@
-use crate::ProvenanceIntegrity;
+use crate::{Hash, ProvenanceIntegrity};
 use cacache::{Integrity, WriteOpts};
 use rattler_conda_types::package::ArchiveType;
-use std::io::BufReader;
+use rattler_digest::{
+    digest::{Digest, Output},
+    HashingReader, Md5, Sha256,
+};
 use std::{
     borrow::Cow,
     collections::HashMap,
     ffi::OsStr,
+    fmt::LowerHex,
+    io::BufReader,
     io::{self, Error, Read, Seek, Write},
     path::{Component, Path, PathBuf},
 };
@@ -42,6 +47,17 @@ pub enum ExtractError {
     })]
     ZipError(#[source] ZipError, Option<PathBuf>),
 
+    #[error("the integrity of the archive is compromised, expected '{0}' got '{1}'")]
+    IntegrityMismatch(String, String),
+
+    /// An error occurred while serializing archive metadata to cache.
+    #[error("failed to serialize archive metadata to cache: {0}")]
+    SerializeCacheError(String),
+
+    /// An error happened while deserializing cache metadata.
+    #[error("failed to deserialize cache metadata: {0}")]
+    DeserializeCacheError(String),
+
     #[error("the operation was cancelled")]
     Cancelled,
 }
@@ -66,6 +82,16 @@ pub enum StreamingOrLocal {
 }
 
 impl StreamingOrLocal {
+    /// Constructs a new [`StreamingOrLocal`] from a asynchronous source.
+    pub fn from_streaming<R: AsyncRead + Unpin + Send + 'static>(data: impl Into<Box<R>>) -> Self {
+        Self::Streaming(data.into())
+    }
+
+    /// Constructs a new [`StreamingOrLocal`] from a synchronous source.
+    pub fn from_local<R: Read + Send + 'static>(data: impl Into<Box<R>>) -> Self {
+        Self::Local(data.into())
+    }
+
     /// Stream in the contents of the stream and make sure we have a fast locally accessible stream.
     ///
     /// If the stream is already local this will simply return that stream. If however the file is
@@ -102,6 +128,10 @@ impl StreamingOrLocal {
 /// This data can be read and extracted to a cache directory using the
 /// [`RawArchive::extract_to_cache`] and [`RawArchive::extract_to_cache_sync`] functions.
 ///
+/// The archive is accompanied by a [`ProvenanceIntegrity`] which is used to determine the archive
+/// integrity. If the archive has no associated integrity the archive's individual files will be
+/// stored in the cache but the archive index itself will not be stored in the cache.
+///
 /// Since reading, decompressing and extracting at the same time can cause some significant
 /// back-pressure this struct ingests a synchronous read stream instead. Using an async stream would
 /// most likely not yield any benefit in terms of asynchronicity. It is likely more performant to
@@ -112,15 +142,29 @@ impl StreamingOrLocal {
 pub struct RawArchive {
     data: Box<dyn Read + Send>,
     archive_type: ArchiveType,
+    integrity: ProvenanceIntegrity,
 }
 
 impl RawArchive {
     /// Construct a new [`RawArchive`] from the data and the type of archive.
-    pub fn new(data: Box<dyn Read + Send>, archive_type: ArchiveType) -> Self {
-        Self { data, archive_type }
+    pub fn new(
+        data: Box<dyn Read + Send>,
+        archive_type: ArchiveType,
+        integrity: ProvenanceIntegrity,
+    ) -> Self {
+        Self {
+            data,
+            archive_type,
+            integrity,
+        }
     }
 
     /// Extract the contents of the archive into a cache.
+    ///
+    /// If the archive has an associated integrity the integrity will be checked after the archive
+    /// has been extracted. It will also write the returned [`ArchiveIndex`] to the cache alongside
+    /// the individual files. This alllows the archive to be retrieved from the cache later using
+    /// only the integrity.
     ///
     /// Extraction of the archive will happen in a background task which can be awaited. The task
     /// itself is non-cancellable, so dropping the future returned by this function will not cancel
@@ -130,6 +174,8 @@ impl RawArchive {
     ///
     /// The function returns an [`ArchiveIndex`] which enables retrieving the contents of the
     /// archive back from the cache.
+    ///
+    /// For an synchronous version of this function see [`Self::extract_to_cache_sync`].
     pub async fn extract_to_cache(self, cache_path: &Path) -> Result<ArchiveIndex, ExtractError> {
         let cache_path = cache_path.to_path_buf();
         match tokio::task::spawn_blocking(move || self.extract_to_cache_sync(&cache_path))
@@ -144,18 +190,88 @@ impl RawArchive {
 
     /// Extract the contents of the archive into a cache.
     ///
+    /// If the archive has an associated integrity the integrity will be checked after the archive
+    /// has been extracted. It will also write the returned [`ArchiveIndex`] to the cache alongside
+    /// the individual files. This alllows the archive to be retrieved from the cache later using
+    /// only the integrity.
+    ///
     /// This function consumes the instance as it will consume the data.
     ///
     /// The function returns an [`ArchiveIndex`] which enables retrieving the contents of the
     /// archive back from the cache.
-    pub fn extract_to_cache_sync(
-        mut self,
-        cache_path: &Path,
-    ) -> Result<ArchiveIndex, ExtractError> {
-        Ok(match self.archive_type {
-            ArchiveType::TarBz2 => extract_tar_bz2_to_cache(&mut self.data, cache_path)?,
-            ArchiveType::Conda => extract_conda_to_cache(&mut self.data, cache_path)?,
-        })
+    ///
+    /// For an asynchronous version of this function see [`Self::extract_to_cache`].
+    pub fn extract_to_cache_sync(self, cache_path: &Path) -> Result<ArchiveIndex, ExtractError> {
+        // A helper function to write the archive index to the cache without checking the integrity
+        // of the archive.
+        fn extract_unchecked<R: Read>(
+            data: R,
+            archive_type: ArchiveType,
+            cache_path: &Path,
+        ) -> Result<ArchiveIndex, ExtractError> {
+            Ok(match archive_type {
+                ArchiveType::TarBz2 => extract_tar_bz2_to_cache(data, cache_path)?,
+                ArchiveType::Conda => extract_conda_to_cache(data, cache_path)?,
+            })
+        }
+
+        // A helper function to write the archive index to the cache and check the integrity of the
+        // archive at the same time.
+        fn extract_checked<R: Read, D: Digest + Default>(
+            data: R,
+            archive_type: ArchiveType,
+            cache_path: &Path,
+            expected_hash: &Output<D>,
+        ) -> Result<ArchiveIndex, ExtractError>
+        where
+            Output<D>: LowerHex,
+        {
+            // Construct a hashing reader and extract using that reader
+            let mut reader = HashingReader::<R, D>::new(data);
+            let index = extract_unchecked(&mut reader, archive_type, cache_path)?;
+
+            // Drain the rest of the bytes so we can compute the integrity of the archive. We have
+            // to drain bytes because there might be so unread bytes at the end of the archive.
+            let mut drain_buf = [0u8; 8 * 1024];
+            loop {
+                let bytes_read = reader.read(&mut drain_buf).map_err(|e| {
+                    ExtractError::IoError(e, None, "flushing the rest of the archive".into())
+                })?;
+                if bytes_read == 0 {
+                    break;
+                }
+            }
+
+            // Check if the resulting hash is the same as the expected hash.
+            let (_, actual_hash) = reader.finalize();
+            if &actual_hash != expected_hash {
+                return Err(ExtractError::IntegrityMismatch(
+                    format!("{actual_hash:x}"),
+                    format!("{expected_hash:x}"),
+                ));
+            }
+
+            Ok(index)
+        }
+
+        // Determine the best hash that is associated with the integrity. It is also possible that
+        // the archive has no associated integrity in which case we just extract the archive to the
+        // cache but we dont really insert a cache entry for the archive itself.
+        let best_hash = self.integrity.get_best_hash();
+        let archive_index = match best_hash {
+            None => return extract_unchecked(self.data, self.archive_type, cache_path),
+            Some(Hash::Sha256(hash)) => {
+                extract_checked::<_, Sha256>(self.data, self.archive_type, cache_path, hash)?
+            }
+            Some(Hash::Md5(hash)) => {
+                extract_checked::<_, Md5>(self.data, self.archive_type, cache_path, hash)?
+            }
+        };
+
+        // Write the archive index to the cache using the provenance
+        archive_index.write_to_cache(cache_path, &self.integrity)?;
+
+        Ok(archive_index)
     }
 }
 
@@ -432,6 +548,29 @@ impl ArchiveIndex {
         self.files.extend(other.files.into_iter());
         self.links.extend(other.links.into_iter());
     }
+
+    /// Write the archive index to a cache directory
+    pub fn write_to_cache(
+        &self,
+        cache_path: &Path,
+        provenance_integrity: &ProvenanceIntegrity,
+    ) -> Result<(), ExtractError> {
+        cacache::index::insert(
+            cache_path,
+            &archive_cache_key(&provenance_integrity),
+            WriteOpts::new()
+                // This is just so the index entry is loadable.
+                .integrity("xxh3-deadbeef".parse().unwrap())
+                .raw_metadata(
+                    rkyv::util::to_bytes::<_, 1024>(self)
+                        .map_err(|e| ExtractError::SerializeCacheError(format!("{e}")))?
+                        .into_vec(),
+                ),
+        )
+        .map_err(|e| ExtractError::CacheError(e, None))?;
+
+        Ok(())
+    }
 }
 
 /// Returns a cache key for the specified provenance based on the integrity of the archive.
@@ -445,6 +584,7 @@ mod test {
     use rattler_conda_types::package::ArchiveIdentifier;
     use rstest::*;
     use std::fs::File;
+    use std::str::FromStr;
     use tempfile::tempdir;
 
     #[rstest]
@@ -484,21 +624,28 @@ mod test {
     }
 
     #[rstest]
-    #[case::mock_tar_bz("mock-2.0.0-py37_1000.tar.bz2")]
-    #[case::mock_conda("mock-2.0.0-py37_1000.conda")]
-    #[case::mock_libzlib_symlink("with-symlinks/libzlib-1.2.13-hfd90126_4.tar.bz2")]
-    fn test_extract_archive_to_cache(#[case] archive_name: &str) {
+    #[case::mock_tar_bz("mock-2.0.0-py37_1000.tar.bz2", "md5-0f9cce120a73803a70abb14bd4d4900b")]
+    #[case::mock_conda(
+        "mock-2.0.0-py37_1000.conda",
+        "md5-23c226430e35a3bd994db6c36b9ac8ae,sha256-181ec44eb7b06ebb833eae845bcc466ad96474be1f33ee55cab7ac1b0fdbbfa3"
+    )]
+    #[case::mock_libzlib_symlink(
+        "with-symlinks/libzlib-1.2.13-hfd90126_4.tar.bz2",
+        "sha256-0d954350222cc12666a1f4852dbc9bcf4904d8e467d29505f2b04ded6518f890"
+    )]
+    fn test_extract_archive_to_cache(#[case] archive_name: &str, #[case] integrity: &str) {
         let cache_dir = tempdir().unwrap();
 
         let archive_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-data")
             .join(archive_name);
 
+        let integrity = ProvenanceIntegrity::from_str(integrity).unwrap();
         let identifier = ArchiveIdentifier::try_from_path(&archive_path).unwrap();
 
         let file = File::open(archive_path).unwrap();
 
-        let index = RawArchive::new(Box::new(file), identifier.archive_type)
+        let index = RawArchive::new(Box::new(file), identifier.archive_type, integrity)
             .extract_to_cache_sync(cache_dir.path())
             .unwrap();
 
