@@ -1,10 +1,14 @@
+//! This module defines the [`PackageProvenance`]. This struct describes the origin of a package as
+//! well as the hashes of the package archive to be able verify its integrity.
+//!
+//! The module furthermore provides helper functions to extract a provenance from other types such
+//! as a [`RepoDataRecord`] as well as functions to convert to a from strings.
+
 use itertools::Itertools;
 use rattler_conda_types::{package::ArchiveIdentifier, RepoDataRecord};
 use rattler_digest::{parse_digest_from_hex, Md5, Md5Hash, Sha256, Sha256Hash};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::{fmt, ops::Deref};
+use std::{fmt, ops::Deref, path::PathBuf, str::FromStr};
 use thiserror::Error;
 use url::Url;
 
@@ -62,8 +66,8 @@ impl FromIterator<Hash> for ProvenanceIntegrity {
 
 impl<'a> From<&'a RepoDataRecord> for ProvenanceIntegrity {
     fn from(record: &'a RepoDataRecord) -> Self {
-        let sha256 = record.package_record.sha256.map(|x| Hash::Sha256(x));
-        let md5 = record.package_record.md5.map(|x| Hash::Md5(x));
+        let sha256 = record.package_record.sha256.map(Hash::Sha256);
+        let md5 = record.package_record.md5.map(Hash::Md5);
         Self::from_iter(sha256.into_iter().chain(md5.into_iter()))
     }
 }
@@ -113,14 +117,18 @@ impl fmt::Display for Hash {
     }
 }
 
+/// An error that can occur when parsing a [`Hash`] from a string.
 #[derive(Debug, Error)]
 pub enum ParseHashError {
+    /// The hash is not a valid hash for the given algorithm.
     #[error("{0} is not a valid {1} hash")]
     InvalidHash(String, String),
 
+    /// The hash algorithm is not supported.
     #[error("unsupported hash algorithm in {0}")]
     UnsupportedAlgorithm(String),
 
+    /// The hash algorithm is missing.
     #[error("missing hash algorithm in {0}")]
     MissingAlgorithm(String),
 }
@@ -147,11 +155,14 @@ impl FromStr for Hash {
     }
 }
 
+/// An error that can occur when extracting a [`PackageProvenance`] from another type.
 #[derive(Debug, Error)]
 pub enum ProvenanceError {
+    /// The url does not contain a valid archive identifier.
     #[error("invalid archive identifier in url")]
     InvalidIdentifier,
 
+    /// The package record does not contain any hashes.
     #[error("no hashes found in package record")]
     MissingHash,
 }

@@ -1,5 +1,8 @@
-use crate::{Hash, ProvenanceIntegrity};
-use cacache::{Integrity, WriteOpts};
+//! This module provides structs and functions to efficiently extract conda package archives to a
+//! cache, and retrieve files from it.
+
+use crate::provenance::{Hash, ProvenanceIntegrity};
+use cacache::WriteOpts;
 use rattler_conda_types::package::ArchiveType;
 use rattler_digest::{
     digest::{Digest, Output},
@@ -10,118 +13,18 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     fmt::LowerHex,
-    io::BufReader,
-    io::{self, Error, Read, Seek, Write},
+    io::{self, BufReader, Error, Read},
     path::{Component, Path, PathBuf},
 };
-use tempfile::SpooledTempFile;
-use thiserror::Error;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    task::JoinError,
-};
-use zip::result::ZipError;
 
-#[derive(Debug, Error)]
-pub enum ExtractError {
-    /// Failed to extract a tarball while doing a certain IO operation.
-    #[error("failed to extract archive while {2}{}", if let Some(path) = .1 {
-    format!(" (file: {})", path.to_string_lossy())
-    } else {
-    "".to_string()
-    })]
-    IoError(#[source] io::Error, Option<PathBuf>, String),
+mod error;
+#[cfg(feature = "tokio")]
+mod streaming_or_local;
 
-    /// Failed to extract an archive to the cache.
-    #[error("failed to extract archive to cache. {0}{}", if let Some(path) = .1 {
-    format!(" (file: {})", path.to_string_lossy())
-    } else {
-    "".to_string()
-    })]
-    CacheError(#[source] cacache::Error, Option<PathBuf>),
+#[cfg(feature = "tokio")]
+pub use streaming_or_local::StreamingOrLocal;
 
-    #[error("failed to extract archive to cache. {0}{}", if let Some(path) = .1 {
-    format!(" (file: {})", path.to_string_lossy())
-    } else {
-    "".to_string()
-    })]
-    ZipError(#[source] ZipError, Option<PathBuf>),
-
-    #[error("the integrity of the archive is compromised, expected '{0}' got '{1}'")]
-    IntegrityMismatch(String, String),
-
-    /// An error occurred while serializing archive metadata to cache.
-    #[error("failed to serialize archive metadata to cache: {0}")]
-    SerializeCacheError(String),
-
-    /// An error happened while deserializing cache metadata.
-    #[error("failed to deserialize cache metadata: {0}")]
-    DeserializeCacheError(String),
-
-    #[error("the operation was cancelled")]
-    Cancelled,
-}
-
-impl ExtractError {
-    /// Constructs a new error from a zip error and the file that was involved. If the error
-    /// represents a problem reading the underlying datastructure this will be converted to an IO
-    /// error.
-    pub fn zip_error(err: ZipError, path: Option<PathBuf>) -> Self {
-        match err {
-            ZipError::Io(err) => Self::IoError(err, path, "reading zip archive".into()),
-            _ => Self::ZipError(err, path),
-        }
-    }
-}
-
-/// Represents a stream of data that is either coming in asynchronously from a remote source or from
-/// a synchronous location (like the filesystem).
-pub enum StreamingOrLocal {
-    Streaming(Box<dyn AsyncRead + Unpin + Send>),
-    Local(Box<dyn Read + Send>),
-}
-
-impl StreamingOrLocal {
-    /// Constructs a new [`StreamingOrLocal`] from a asynchronous source.
-    pub fn from_streaming<R: AsyncRead + Unpin + Send + 'static>(data: impl Into<Box<R>>) -> Self {
-        Self::Streaming(data.into())
-    }
-
-    /// Constructs a new [`StreamingOrLocal`] from a synchronous source.
-    pub fn from_local<R: Read + Send + 'static>(data: impl Into<Box<R>>) -> Self {
-        Self::Local(data.into())
-    }
-
-    /// Stream in the contents of the stream and make sure we have a fast locally accessible stream.
-    ///
-    /// If the stream is already local this will simply return that stream. If however the file is
-    /// remote it will first be read to a temporary spooled file.
-    pub async fn into_local(self) -> io::Result<Box<dyn Read + Send>> {
-        match self {
-            StreamingOrLocal::Streaming(mut stream) => {
-                // Create a [`SpooledTempFile`] which is a blob of memory that is kept in memory if
-                // it does not grow beyond 5MB, otherwise it is written to disk.
-                let mut local_file = SpooledTempFile::new(5 * 1024 * 1024);
-
-                // Stream in the bytes and copy them to the temporary file.
-                let mut buf = [0u8; 1024 * 8];
-                loop {
-                    let bytes_read = stream.read(&mut buf).await?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                    local_file.write_all(&buf)?;
-                }
-
-                // Restart the file from the start so we can start reading from it.
-                local_file.rewind()?;
-
-                Ok(Box::new(local_file))
-            }
-            StreamingOrLocal::Local(stream) => Ok(stream),
-        }
-    }
-}
+pub use error::ExtractError;
 
 /// Represents the data of a package archive.
 ///
@@ -133,12 +36,12 @@ impl StreamingOrLocal {
 /// stored in the cache but the archive index itself will not be stored in the cache.
 ///
 /// Since reading, decompressing and extracting at the same time can cause some significant
-/// back-pressure this struct ingests a synchronous read stream instead. Using an async stream would
-/// most likely not yield any benefit in terms of asynchronicity. It is likely more performant to
-/// first read the contents of an async stream into memory (or to disk) followed by extracting the
-/// contents while concurrently downloading additional archives. This will be faster because it will
-/// saturate the network-io, CPU, and disk-io instead of just one of those being the bottleneck. See
-/// [`StreamingOrLocal`] to help with that.
+/// back-pressure this struct expects to be able to quickly read new data from the input stream.
+/// Using an async stream would most likely not yield any benefit in terms of asynchronicity. It is
+/// likely more performant to first read the contents of an async stream into memory (or to disk)
+/// followed by extracting the contents while concurrently downloading additional archives. This
+/// will be faster because it will saturate the network-io, CPU, and disk-io instead of just one of
+/// those being the bottleneck. See [`StreamingOrLocal`] to help with that.
 pub struct RawArchive {
     data: Box<dyn Read + Send>,
     archive_type: ArchiveType,
@@ -176,11 +79,12 @@ impl RawArchive {
     /// archive back from the cache.
     ///
     /// For an synchronous version of this function see [`Self::extract_to_cache_sync`].
+    #[cfg(feature = "tokio")]
     pub async fn extract_to_cache(self, cache_path: &Path) -> Result<ArchiveIndex, ExtractError> {
         let cache_path = cache_path.to_path_buf();
         match tokio::task::spawn_blocking(move || self.extract_to_cache_sync(&cache_path))
             .await
-            .map_err(JoinError::try_into_panic)
+            .map_err(tokio::task::JoinError::try_into_panic)
         {
             Ok(result) => result,
             Err(Ok(panic)) => std::panic::resume_unwind(panic),
@@ -367,7 +271,7 @@ fn extract_tar_to_cache<'r, R: Read + 'r>(
                 // Open a writer to write a file to cache
                 let mut writer = WriteOpts::new()
                     .algorithm(cacache::Algorithm::Xxh3)
-                    .open_hash_sync(&cache_path)
+                    .open_hash_sync(cache_path)
                     .map_err(|e| ExtractError::CacheError(e, Some(entry_path.to_path_buf())))?;
 
                 // Copy the content from the tarball directly into the cache.
@@ -519,7 +423,7 @@ fn is_target_outside_of_path(path: &Path, target: &Path) -> bool {
     false
 }
 
-/// Represents the result of extracting an archive to the cache.
+/// Represents the result of extracting an archive to a cache.
 ///
 /// This struct records for each file in the archive the hash of the file and some additional
 /// metadata (like file permissions). This can then be used to retrieve the file from the cache and
@@ -531,25 +435,32 @@ fn is_target_outside_of_path(path: &Path, target: &Path) -> bool {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[archive(check_bytes)]
 pub struct ArchiveIndex {
+    /// A map of file names to the hash of the file and some file permissions.
     pub files: HashMap<String, (String, u32)>,
+
+    /// A map of fileystem links to the target of the link and the type of link.
     pub links: HashMap<String, (String, LinkType)>,
 }
 
+/// Describes a type of filesystem link.
 #[derive(rkyv::Archive, rkyv::Serialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum LinkType {
+    /// A hardlink or junction
     Hard,
+
+    /// A soft or symbolic link
     Soft,
 }
 
 impl ArchiveIndex {
     /// Appends the entries from another index to this index.
-    pub fn append(&mut self, other: Self) {
+    pub(crate) fn append(&mut self, other: Self) {
         self.files.extend(other.files.into_iter());
         self.links.extend(other.links.into_iter());
     }
 
-    /// Write the archive index to a cache directory
+    /// Write the archive index to a cache directory.
     pub fn write_to_cache(
         &self,
         cache_path: &Path,
@@ -557,7 +468,7 @@ impl ArchiveIndex {
     ) -> Result<(), ExtractError> {
         cacache::index::insert(
             cache_path,
-            &archive_cache_key(&provenance_integrity),
+            &archive_cache_key(provenance_integrity),
             WriteOpts::new()
                 // This is just so the index entry is loadable.
                 .integrity("xxh3-deadbeef".parse().unwrap())
