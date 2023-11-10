@@ -192,6 +192,7 @@ impl Gateway {
 #[cfg(test)]
 mod test {
     use crate::gateway::Gateway;
+    use crate::sparse::load_repo_data_recursively;
     use itertools::Itertools;
     use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform};
     use rattler_networking::AuthenticatedClient;
@@ -229,6 +230,43 @@ mod test {
                     .map(|r| format!("{}/{}", r.package_record.subdir, r.file_name))
             })
             .sorted();
+
+        println!("Records {}", records.len());
+
+        insta::assert_snapshot!(records.into_iter().join("\n"));
+    }
+
+    #[tokio::test]
+    async fn test_sparse() {
+        let channel = conda_forge_channel();
+        let records = load_repo_data_recursively(
+            [
+                (
+                    channel.clone(),
+                    "noarch",
+                    test_dir().join("channels/conda-forge/noarch/repodata.json"),
+                ),
+                (
+                    channel.clone(),
+                    "linux-64",
+                    test_dir().join("channels/conda-forge/linux-64/repodata.json"),
+                ),
+            ],
+            ["python".parse().unwrap()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let records = records
+            .into_iter()
+            .flat_map(|r| {
+                r.into_iter()
+                    .map(|r| format!("{}/{}", r.package_record.subdir, r.file_name))
+            })
+            .sorted();
+
+        println!("Records {}", records.len());
 
         insta::assert_snapshot!(records.into_iter().join("\n"));
     }

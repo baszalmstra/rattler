@@ -1,6 +1,5 @@
 ---
 source: crates/rattler_repodata_gateway/src/gateway/mod.rs
-assertion_line: 235
 expression: "records.into_iter().join(\"\\n\")"
 ---
 linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
