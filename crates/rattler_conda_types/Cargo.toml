@@ -45,6 +45,7 @@ hex-literal = "0.4.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 pathdiff = "0.2.1"
 dunce = "1.0.4"
+tools = { path = "../tools" }
 
 [[bench]]
 name = "parse"
