@@ -303,7 +303,7 @@ where
 #[cfg(test)]
 mod test {
     use super::PackageCache;
-    use crate::{get_test_data_dir, validation::validate_package_directory};
+    use crate::validation::validate_package_directory;
     use assert_matches::assert_matches;
     use axum::{
         extract::State,
@@ -327,10 +327,13 @@ mod test {
 
     #[tokio::test]
     pub async fn test_package_cache() {
-        let tar_archive_path =
-            get_test_data_dir().join("ros-noetic-rosbridge-suite-0.11.14-py39h6fdeb60_14.tar.bz2");
-
-
+        let tar_archive_path = tools::download_and_cache_file_async(
+            "https://conda.anaconda.org/conda-forge/linux-64/ros-noetic-rosbridge-suite-0.11.14-py39h6fdeb60_14.tar.bz2"
+                .parse()
+                .unwrap(),
+            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
+        ).await
+        .unwrap();
 
         // Read the paths.json file straight from the tar file.
         let paths = {
@@ -392,7 +395,13 @@ mod test {
 
     #[tokio::test]
     pub async fn test_flaky_package_cache() {
-        let static_dir = get_test_data_dir();
+        let static_dir = tools::download_and_cache_file_async(
+            "https://conda.anaconda.org/conda-forge/linux-64/ros-noetic-rosbridge-suite-0.11.14-py39h6fdeb60_14.tar.bz2"
+                .parse()
+                .unwrap(),
+            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
+        ).await
+        .unwrap().parent().unwrap().to_owned();
 
         // Construct a service that serves raw files from the test directory
         let service = get_service(ServeDir::new(static_dir));
