@@ -91,8 +91,7 @@ use reqwest::{
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::iter::Iterator;
 use std::path::Path;
 use std::str;
@@ -103,6 +102,7 @@ use tokio::task::JoinError;
 use url::Url;
 
 pub use crate::fetch::cache::{JLAPFooter, JLAPState, RepoDataState};
+use crate::fetch::{Progress, ProgressUnit};
 
 /// File suffix for JLAP file
 pub const JLAP_FILE_SUFFIX: &str = "jlap";
@@ -308,6 +308,7 @@ impl<'a> JLAPResponse<'a> {
         &self,
         repo_data_json_path: &Path,
         hash: Output<Blake2b256>,
+        progress: Option<Arc<dyn Progress>>,
     ) -> Result<Blake2b256Hash, JLAPError> {
         // We use the current hash to find which patches we need to apply
         let current_idx = self.patches.iter().position(|patch| patch.from == hash);
@@ -320,7 +321,7 @@ impl<'a> JLAPResponse<'a> {
         let patches = self.patches.clone();
         let repo_data_json_path = repo_data_json_path.to_path_buf();
         match tokio::task::spawn_blocking(move || {
-            apply_jlap_patches(patches, idx, &repo_data_json_path)
+            apply_jlap_patches(patches, idx, &repo_data_json_path, progress)
         })
         .await
         .map_err(JoinError::try_into_panic)
@@ -414,7 +415,17 @@ pub async fn patch_repo_data(
     subdir_url: Url,
     repo_data_state: RepoDataState,
     repo_data_json_path: &Path,
+    progress: Option<Arc<dyn Progress>>,
 ) -> Result<(JLAPState, Blake2b256Hash), JLAPError> {
+    if let Some(progress) = progress.as_ref() {
+        progress.update(
+            0,
+            None,
+            ProgressUnit::Unknown,
+            Some("fetching JLAP patches".into()),
+        );
+    }
+
     // Determine what we should use as our starting state
     let mut jlap_state = get_jlap_state(repo_data_state.jlap);
 
@@ -449,7 +460,7 @@ pub async fn patch_repo_data(
     }
 
     // Applies patches and returns early if an error is encountered
-    let hash = jlap.apply(repo_data_json_path, hash).await?;
+    let hash = jlap.apply(repo_data_json_path, hash, progress).await?;
 
     // Patches were applied successfully, so we need to update the position
     Ok((jlap.get_state(jlap.new_position, new_iv), hash))
@@ -506,40 +517,6 @@ async fn fetch_jlap_with_retry(
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct OrderedRepoData {
-    info: Option<HashMap<String, String>>,
-
-    #[serde(serialize_with = "ordered_map")]
-    packages: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
-
-    #[serde(serialize_with = "ordered_map", rename = "packages.conda")]
-    packages_conda: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
-
-    removed: Option<Vec<String>>,
-
-    repodata_version: Option<u64>,
-}
-
-fn ordered_map<S>(
-    value: &Option<HashMap<String, HashMap<String, serde_json::Value>>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        Some(value) => {
-            let ordered: BTreeMap<_, _> = value
-                .iter()
-                .map(|(key, packages)| (key, packages.iter().collect::<BTreeMap<_, _>>()))
-                .collect();
-            ordered.serialize(serializer)
-        }
-        None => serializer.serialize_none(),
-    }
-}
-
 /// Applies JLAP patches to a `repodata.json` file
 ///
 /// This is a multi-step process that involves:
@@ -552,7 +529,17 @@ fn apply_jlap_patches(
     patches: Arc<[Patch]>,
     start_index: usize,
     repo_data_path: &Path,
+    progress: Option<Arc<dyn Progress>>,
 ) -> Result<Blake2b256Hash, JLAPError> {
+    if let Some(progress) = &progress {
+        progress.update(
+            0,
+            None,
+            ProgressUnit::Unknown,
+            Some("parsing cached repodata".into()),
+        );
+    }
+
     // Read the contents of the current repodata to a string
     let repo_data_contents =
         std::fs::read_to_string(repo_data_path).map_err(JLAPError::FileSystem)?;
@@ -567,18 +554,35 @@ fn apply_jlap_patches(
         start_index + 1,
         patches.len()
     );
-    for patch in patches[start_index..].iter() {
+    let total_patches = patches.len() - start_index;
+    for (idx, patch) in patches[start_index..].iter().enumerate() {
+        if let Some(progress) = &progress {
+            progress.update(
+                idx as u64,
+                Some(total_patches as u64),
+                ProgressUnit::Unknown,
+                Some("applying JLAP patches".into()),
+            );
+        }
         if let Err(error) = json_patch::patch_unsafe(&mut doc, &patch.patch) {
             return Err(JLAPError::JSONPatch(error));
         }
     }
 
+    if let Some(progress) = &progress {
+        progress.update(
+            0,
+            None,
+            ProgressUnit::Unknown,
+            Some("writing patched repodata".into()),
+        );
+    }
+
     // Order the json
     tracing::info!("converting patched JSON back to repodata");
-    let ordered_doc: OrderedRepoData = serde_json::from_value(doc).map_err(JLAPError::JSONParse)?;
 
     // Convert the json to bytes, but we don't really care about formatting.
-    let mut updated_json = serde_json::to_string(&ordered_doc).map_err(JLAPError::JSONParse)?;
+    let mut updated_json = serde_json::to_string(&doc).map_err(JLAPError::JSONParse)?;
 
     // We need to add an extra newline character to the end of our string so the hashes match
     updated_json.insert(updated_json.len(), '\n');
@@ -591,12 +595,19 @@ fn apply_jlap_patches(
             .expect("the repodata.json file must reside in a directory"),
     )
     .map_err(JLAPError::FileSystem)
+    .map(|file| BufWriter::with_capacity(1024 * 1024, file))
     .map(rattler_digest::HashingWriter::<_, Blake2b256>::new)?;
     hashing_writer
         .write_all(&updated_json.into_bytes())
         .map_err(JLAPError::FileSystem)?;
+
+    // Finish writing, finalize the hash computation
     let (file, hash) = hashing_writer.finalize();
-    file.persist(repo_data_path)
+
+    // Persist the file to the final location
+    file.into_inner()
+        .map_err(|e| JLAPError::FileSystem(e.into_error()))?
+        .persist(repo_data_path)
         .map_err(|e| JLAPError::FileSystem(e.error))?;
 
     Ok(hash)
@@ -955,6 +966,7 @@ mod test {
             test_env.server_url,
             test_env.repo_data_state,
             &test_env.cache_repo_data,
+            None,
         )
         .await
         .unwrap();

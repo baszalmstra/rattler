@@ -13,9 +13,11 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
     Response, StatusCode,
 };
+use std::borrow::Cow;
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 use tempfile::NamedTempFile;
@@ -26,8 +28,44 @@ use url::Url;
 mod cache;
 pub mod jlap;
 
-/// Type alias for function to report progress while downloading repodata
-pub type ProgressFunc = Box<dyn FnMut(DownloadProgress) + Send + Sync>;
+/// The unit of progress that is being reported by [`Progress`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ProgressUnit {
+    /// The unit is not specified
+    Unknown,
+
+    /// The unit of the progress and total represents bytes
+    Bytes,
+}
+
+/// Trait for progress bars
+pub trait Progress: Send + Sync + 'static {
+    /// Called to update the progress
+    fn update(
+        &self,
+        progress: u64,
+        total: Option<u64>,
+        unit: ProgressUnit,
+        message: Option<Cow<'static, str>>,
+    );
+}
+
+/// Wraps a function to implement the [`Progress`] trait.
+pub struct ProgressFunc<F>(F);
+
+impl<F: Fn(u64, Option<u64>, ProgressUnit, Option<Cow<'static, str>>) + Send + Sync + 'static>
+    Progress for ProgressFunc<F>
+{
+    fn update(
+        &self,
+        progress: u64,
+        total: Option<u64>,
+        unit: ProgressUnit,
+        message: Option<Cow<'static, str>>,
+    ) {
+        self.0(progress, total, unit, message)
+    }
+}
 
 /// `RepoData` could not be found for given channel and platform
 #[derive(Debug, thiserror::Error)]
@@ -305,13 +343,13 @@ async fn repodata_from_file(
 ///
 /// The checks to see if a `.zst` and/or `.bz2` file exist are performed by doing a HEAD request to
 /// the respective URLs. The result of these are cached.
-#[instrument(err, skip_all, fields(subdir_url, cache_path = %cache_path.display()))]
+#[instrument(err, skip_all, fields(subdir_url, cache_path = % cache_path.display()))]
 pub async fn fetch_repo_data(
     subdir_url: Url,
     client: reqwest_middleware::ClientWithMiddleware,
     cache_path: PathBuf,
     options: FetchRepoDataOptions,
-    progress: Option<ProgressFunc>,
+    mut progress: Option<Arc<dyn Progress>>,
 ) -> Result<CachedRepoData, FetchRepoDataError> {
     let subdir_url = normalize_subdir_url(subdir_url);
 
@@ -351,6 +389,16 @@ pub async fn fetch_repo_data(
         let owned_subdir_url = subdir_url.clone();
         let owned_cache_path = cache_path.clone();
         let owned_cache_key = cache_key.clone();
+
+        if let Some(progress) = progress.as_mut() {
+            progress.update(
+                0,
+                None,
+                ProgressUnit::Unknown,
+                Some("validating cache".into()),
+            );
+        }
+
         let cache_state = tokio::task::spawn_blocking(move || {
             validate_cached_state(&owned_cache_path, &owned_subdir_url, &owned_cache_key)
         })
@@ -395,6 +443,15 @@ pub async fn fetch_repo_data(
         }
     };
 
+    if let Some(progress) = progress.as_mut() {
+        progress.update(
+            0,
+            None,
+            ProgressUnit::Unknown,
+            Some("checking variant availability".into()),
+        );
+    }
+
     // Determine the availability of variants based on the cache or by querying the remote.
     let variant_availability = check_variant_availability(
         &client,
@@ -419,6 +476,7 @@ pub async fn fetch_repo_data(
             subdir_url.clone(),
             repo_data_state.clone(),
             &repo_data_json_path,
+            progress.clone(),
         )
         .await
         {
@@ -431,7 +489,7 @@ pub async fn fetch_repo_data(
                     has_bz2: variant_availability.has_bz2,
                     has_jlap: variant_availability.has_jlap,
                     jlap: Some(state),
-                    .. cache_state.expect("we must have had a cache, otherwise we wouldn't know the previous state of the cache")
+                    ..cache_state.expect("we must have had a cache, otherwise we wouldn't know the previous state of the cache")
                 };
 
                 let cache_state = tokio::task::spawn_blocking(move || {
@@ -518,7 +576,7 @@ pub async fn fetch_repo_data(
             has_bz2: variant_availability.has_bz2,
             has_jlap: variant_availability.has_jlap,
             jlap: jlap_state,
-            .. cache_state.expect("we must have had a cache, otherwise we wouldn't know the previous state of the cache")
+            ..cache_state.expect("we must have had a cache, otherwise we wouldn't know the previous state of the cache")
         };
 
         let cache_state = tokio::task::spawn_blocking(move || {
@@ -615,17 +673,17 @@ async fn stream_and_decode_to_file(
     response: Response,
     content_encoding: Encoding,
     temp_dir: &Path,
-    mut progress_func: Option<ProgressFunc>,
+    progress: Option<Arc<dyn Progress>>,
 ) -> Result<(NamedTempFile, blake2::digest::Output<Blake2b256>), FetchRepoDataError> {
     // Determine the length of the response in bytes and notify the listener that a download is
     // starting. The response may be compressed. Decompression happens below.
     let content_size = response.content_length();
-    if let Some(progress_func) = progress_func.as_mut() {
-        progress_func(DownloadProgress {
-            bytes: 0,
-            total: content_size,
-        });
+    if let Some(progress_func) = &progress {
+        progress_func.update(0, content_size, ProgressUnit::Bytes, None);
     }
+
+    // Determine the filename of the thing we're downloading.
+    let file_name = url.path_segments().and_then(|s| s.last());
 
     // Determine the encoding of the response
     let transfer_encoding = Encoding::from(&response);
@@ -642,11 +700,13 @@ async fn stream_and_decode_to_file(
     let total_bytes_mut = &mut total_bytes;
     let bytes_stream = bytes_stream.inspect_ok(move |bytes| {
         *total_bytes_mut += bytes.len() as u64;
-        if let Some(progress_func) = progress_func.as_mut() {
-            progress_func(DownloadProgress {
-                bytes: *total_bytes_mut,
-                total: content_size,
-            });
+        if let Some(progress) = &progress {
+            progress.update(
+                *total_bytes_mut,
+                content_size,
+                ProgressUnit::Bytes,
+                file_name.map(|file_name| format!("downloading {file_name}").into()),
+            );
         }
     });
 
@@ -1034,7 +1094,8 @@ fn validate_cached_state(
 #[cfg(test)]
 mod test {
     use super::{
-        fetch_repo_data, CacheResult, CachedRepoData, DownloadProgress, FetchRepoDataOptions,
+        fetch_repo_data, CacheResult, CachedRepoData, FetchRepoDataOptions, ProgressFunc,
+        ProgressUnit,
     };
     use crate::fetch::{FetchRepoDataError, RepoDataNotFoundError};
     use crate::utils::simple_channel_server::SimpleChannelServer;
@@ -1044,6 +1105,7 @@ mod test {
     use rattler_networking::AuthenticationMiddleware;
     use reqwest::Client;
     use reqwest_middleware::ClientWithMiddleware;
+    use std::borrow::Cow;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1402,10 +1464,14 @@ mod test {
 
         let last_download_progress = Arc::new(AtomicU64::new(0));
         let last_download_progress_captured = last_download_progress.clone();
-        let download_progress = move |progress: DownloadProgress| {
-            last_download_progress_captured.store(progress.bytes, Ordering::SeqCst);
-            assert_eq!(progress.total, Some(1110));
-        };
+        let download_progress =
+            move |progress: u64,
+                  total: Option<u64>,
+                  _: ProgressUnit,
+                  _: Option<Cow<'static, str>>| {
+                last_download_progress_captured.store(progress, Ordering::SeqCst);
+                assert_eq!(total, Some(1110));
+            };
 
         // Download the data from the channel with an empty cache.
         let cache_dir = TempDir::new().unwrap();
@@ -1414,7 +1480,7 @@ mod test {
             ClientWithMiddleware::from(Client::new()),
             cache_dir.into_path(),
             FetchRepoDataOptions::default(),
-            Some(Box::new(download_progress)),
+            Some(Arc::new(ProgressFunc(download_progress))),
         )
         .await
         .unwrap();

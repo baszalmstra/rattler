@@ -18,7 +18,7 @@ use rattler_networking::{
     retry_policies::default_retry_policy, AuthenticationMiddleware, AuthenticationStorage,
 };
 use rattler_repodata_gateway::fetch::{
-    CacheResult, DownloadProgress, FetchRepoDataError, FetchRepoDataOptions,
+    CacheResult, FetchRepoDataError, FetchRepoDataOptions, ProgressUnit,
 };
 use rattler_repodata_gateway::sparse::SparseRepoData;
 use rattler_solve::{
@@ -553,6 +553,67 @@ fn wrap_in_progress<T, F: FnOnce() -> T>(msg: impl Into<Cow<'static, str>>, func
     result
 }
 
+struct RepodataProgressBar {
+    progress_bar: ProgressBar,
+}
+
+impl RepodataProgressBar {
+    pub fn new(progress_bar: ProgressBar, channel: Channel, platform: Platform) -> Self {
+        // Apply styles to the passed in progress bar.
+        let progress_bar = progress_bar
+            .with_finish(indicatif::ProgressFinish::AndLeave)
+            .with_prefix(format!("{}/{platform}", friendly_channel_name(&channel)))
+            .with_style(default_unprogress_style());
+
+        // Update at 10hz
+        progress_bar.enable_steady_tick(Duration::from_millis(100));
+
+        Self { progress_bar }
+    }
+
+    pub fn finish_not_found(&self) {
+        self.progress_bar.set_style(finished_progress_style());
+        self.progress_bar.finish_with_message("Not Found");
+    }
+
+    pub fn finish_with_error(&self) {
+        self.progress_bar.set_style(errored_progress_style());
+        self.progress_bar.finish_with_message("Error");
+    }
+
+    pub fn deserializing(&self) {
+        self.progress_bar.set_style(deserializing_progress_style());
+        self.progress_bar.set_message("Deserializing..");
+    }
+
+    pub fn finish(&self, message: impl Into<Cow<'static, str>>) {
+        self.progress_bar.set_style(finished_progress_style());
+        self.progress_bar.finish_with_message(message);
+    }
+}
+
+impl rattler_repodata_gateway::fetch::Progress for RepodataProgressBar {
+    fn update(
+        &self,
+        progress: u64,
+        total: Option<u64>,
+        unit: ProgressUnit,
+        message: Option<Cow<'static, str>>,
+    ) {
+        match unit {
+            ProgressUnit::Unknown => self.progress_bar.set_style(default_unprogress_style()),
+            ProgressUnit::Bytes => self.progress_bar.set_style(default_bytes_style()),
+        }
+
+        if let Some(total) = total {
+            self.progress_bar.set_length(total);
+            self.progress_bar.set_position(progress);
+        }
+
+        self.progress_bar.set_message(message.unwrap_or_default());
+    }
+}
+
 /// Given a channel and platform, download and cache the `repodata.json` for it. This function
 /// reports its progress via a CLI progressbar.
 async fn fetch_repo_data_records_with_progress(
@@ -563,25 +624,19 @@ async fn fetch_repo_data_records_with_progress(
     multi_progress: indicatif::MultiProgress,
 ) -> Result<Option<SparseRepoData>, anyhow::Error> {
     // Create a progress bar
-    let progress_bar = multi_progress.add(
-        indicatif::ProgressBar::new(1)
-            .with_finish(indicatif::ProgressFinish::AndLeave)
-            .with_prefix(format!("{}/{platform}", friendly_channel_name(&channel)))
-            .with_style(default_bytes_style()),
-    );
-    progress_bar.enable_steady_tick(Duration::from_millis(100));
+    let progress_bar = Arc::new(RepodataProgressBar::new(
+        multi_progress.add(indicatif::ProgressBar::new(1)),
+        channel.clone(),
+        platform,
+    ));
 
     // Download the repodata.json
-    let download_progress_progress_bar = progress_bar.clone();
     let result = rattler_repodata_gateway::fetch::fetch_repo_data(
         channel.platform_url(platform),
         client,
         repodata_cache.to_path_buf(),
         FetchRepoDataOptions::default(),
-        Some(Box::new(move |DownloadProgress { total, bytes }| {
-            download_progress_progress_bar.set_length(total.unwrap_or(bytes));
-            download_progress_progress_bar.set_position(bytes);
-        })),
+        Some(progress_bar.clone()),
     )
     .await;
 
@@ -590,21 +645,18 @@ async fn fetch_repo_data_records_with_progress(
         Err(e) => {
             let not_found = matches!(&e, FetchRepoDataError::NotFound(_));
             if not_found && platform != Platform::NoArch {
-                progress_bar.set_style(finished_progress_style());
-                progress_bar.finish_with_message("Not Found");
+                progress_bar.finish_not_found();
                 return Ok(None);
             }
 
-            progress_bar.set_style(errored_progress_style());
-            progress_bar.finish_with_message("Error");
+            progress_bar.finish_with_error();
             return Err(e.into());
         }
         Ok(result) => result,
     };
 
     // Notify that we are deserializing
-    progress_bar.set_style(deserializing_progress_style());
-    progress_bar.set_message("Deserializing..");
+    progress_bar.deserializing();
 
     // Deserialize the data. This is a hefty blocking operation so we spawn it as a tokio blocking
     // task.
@@ -624,25 +676,22 @@ async fn fetch_repo_data_records_with_progress(
     .await
     {
         Ok(Ok(repodata)) => {
-            progress_bar.set_style(finished_progress_style());
             let is_cache_hit = matches!(
                 result.cache_result,
                 CacheResult::CacheHit | CacheResult::CacheHitAfterFetch
             );
-            progress_bar.finish_with_message(if is_cache_hit { "Using cache" } else { "Done" });
+            progress_bar.finish(if is_cache_hit { "Using cache" } else { "Done" });
             Ok(Some(repodata))
         }
         Ok(Err(err)) => {
-            progress_bar.set_style(errored_progress_style());
-            progress_bar.finish_with_message("Error");
+            progress_bar.finish_with_error();
             Err(err.into())
         }
         Err(err) => {
             if let Ok(panic) = err.try_into_panic() {
                 std::panic::resume_unwind(panic);
             } else {
-                progress_bar.set_style(errored_progress_style());
-                progress_bar.finish_with_message("Cancelled..");
+                progress_bar.finish_with_error();
                 // Since the task was cancelled most likely the whole async stack is being cancelled.
                 Err(anyhow::anyhow!("cancelled"))
             }
@@ -677,14 +726,22 @@ fn default_bytes_style() -> indicatif::ProgressStyle {
 /// Returns the style to use for a progressbar that is currently in progress.
 fn default_progress_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::default_bar()
-        .template("{spinner:.green} {prefix:20!} [{elapsed_precise}] [{bar:40!.bright.yellow/dim.white}] {pos:>7}/{len:7}").unwrap()
+        .template("{spinner:.green} {prefix:20!} [{elapsed_precise}] [{bar:40!.bright.yellow/dim.white}] {pos:>7}/{len:7} {wide_msg:.dim}").unwrap()
+        .progress_chars("━━╾─")
+}
+
+/// Returns the style to use for a progressbar that is currently not in progress.
+fn default_unprogress_style() -> indicatif::ProgressStyle {
+    indicatif::ProgressStyle::default_bar()
+        .template("{spinner:.green} {prefix:20!} [{elapsed_precise}] {wide_msg:.dim}")
+        .unwrap()
         .progress_chars("━━╾─")
 }
 
 /// Returns the style to use for a progressbar that is in Deserializing state.
 fn deserializing_progress_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::default_bar()
-        .template("{spinner:.green} {prefix:20!} [{elapsed_precise}] {wide_msg}")
+        .template("{spinner:.green} {prefix:20!} [{elapsed_precise}] {wide_msg:.dim}")
         .unwrap()
         .progress_chars("━━╾─")
 }
