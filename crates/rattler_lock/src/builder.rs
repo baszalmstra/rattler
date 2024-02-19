@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
 };
+use uv_normalize::ExtraName;
 
 /// A struct to incrementally build a lock-file.
 #[derive(Default)]
@@ -186,7 +187,7 @@ impl LockFileBuilder {
 /// Similar to [`PypiPackageEnvironmentData`] but hashable.
 #[derive(Hash, PartialEq, Eq)]
 struct HashablePypiPackageEnvironmentData {
-    extras: BTreeSet<String>,
+    extras: BTreeSet<ExtraName>,
 }
 
 impl From<HashablePypiPackageEnvironmentData> for PypiPackageEnvironmentData {

@@ -12,6 +12,7 @@ use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use url::Url;
+use uv_normalize::ExtraName;
 
 #[derive(Deserialize)]
 struct DeserializableLockFile<'d> {
@@ -48,7 +49,7 @@ enum DeserializablePackageSelector {
 #[derive(Hash, Deserialize, Eq, PartialEq)]
 struct DeserializablePypiPackageEnvironmentData {
     #[serde(default)]
-    extras: BTreeSet<String>,
+    extras: BTreeSet<ExtraName>,
 }
 
 impl From<DeserializablePypiPackageEnvironmentData> for PypiPackageEnvironmentData {

@@ -4,11 +4,14 @@ use crate::{Channel, EnvironmentPackageData, LockFile, PypiPackageData};
 use itertools::Itertools;
 use rattler_conda_types::Platform;
 use serde::{Serialize, Serializer};
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashSet},
 };
 use url::Url;
+use uv_normalize::ExtraName;
 
 #[derive(Serialize)]
 struct SerializableLockFile<'a> {
@@ -39,8 +42,8 @@ enum SerializablePackageSelector<'a> {
     },
     Pypi {
         pypi: &'a Url,
-        #[serde(skip_serializing_if = "HashSet::is_empty")]
-        extras: &'a HashSet<String>,
+        #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+        extras: &'a BTreeSet<ExtraName>,
     },
 }
 
@@ -54,10 +57,10 @@ impl<'a> SerializablePackageSelector<'a> {
 }
 
 impl<'a> SerializablePackageData<'a> {
-    fn name(&self) -> &str {
+    fn name(&self) -> Cow<'_, str> {
         match self {
-            SerializablePackageData::Conda(p) => p.name.as_normalized(),
-            SerializablePackageData::Pypi(p) => &p.name,
+            SerializablePackageData::Conda(p) => p.name.as_normalized().into(),
+            SerializablePackageData::Pypi(p) => p.name.as_dist_info_name(),
         }
     }
 
@@ -80,7 +83,7 @@ impl Ord for SerializablePackageData<'_> {
         use SerializablePackageData::{Conda, Pypi};
         // First sort by name, then by package type specific attributes
         self.name()
-            .cmp(other.name())
+            .cmp(&other.name())
             .then_with(|| match (self, other) {
                 (Conda(a), Conda(b)) => a.cmp(b),
                 (Pypi(a), Pypi(b)) => a.cmp(b),

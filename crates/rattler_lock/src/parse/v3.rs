@@ -10,12 +10,13 @@ use indexmap::IndexSet;
 use pep440_rs::VersionSpecifiers;
 use pep508_rs::Requirement;
 use rattler_conda_types::{
-    NoArchType, PackageName, PackageRecord, PackageUrl, Platform, VersionWithSource,
+    NoArchType, PackageRecord, PackageUrl, Platform, VersionWithSource,
 };
 use serde::Deserialize;
 use serde_with::{serde_as, skip_serializing_none, OneOrMany};
 use std::{collections::BTreeSet, sync::Arc};
 use url::Url;
+use uv_normalize::{ExtraName};
 
 #[derive(Deserialize)]
 struct LockFileV3 {
@@ -52,7 +53,7 @@ enum LockedPackageKindV3 {
 #[skip_serializing_none]
 #[derive(Deserialize, Eq, PartialEq, Clone, Debug)]
 struct PypiLockedPackageV3 {
-    pub name: String,
+    pub name: uv_normalize::PackageName,
     pub version: pep440_rs::Version,
     #[serde(default, alias = "dependencies", skip_serializing_if = "Vec::is_empty")]
     #[serde_as(deserialize_as = "crate::utils::serde::Pep440MapOrVec")]
@@ -70,7 +71,7 @@ struct PypiLockedPackageV3 {
 #[derive(Clone, Debug, Deserialize, Hash, Eq, PartialEq)]
 pub struct PypiPackageEnvironmentDataV3 {
     #[serde(default)]
-    pub extras: BTreeSet<String>,
+    pub extras: BTreeSet<ExtraName>,
 }
 
 impl From<PypiPackageEnvironmentDataV3> for PypiPackageEnvironmentData {
@@ -156,7 +157,7 @@ pub fn parse_v3_or_lower(document: serde_yaml::Value) -> Result<LockFile, ParseC
                             license: value.license,
                             license_family: value.license_family,
                             md5,
-                            name: PackageName::new_unchecked(value.name),
+                            name: rattler_conda_types::PackageName::new_unchecked(value.name),
                             noarch: value.noarch,
                             platform: platform.only_platform().map(ToString::to_string),
                             sha256,

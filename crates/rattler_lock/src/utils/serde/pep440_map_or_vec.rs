@@ -3,6 +3,7 @@ use indexmap::IndexMap;
 use pep508_rs::{Requirement, VersionOrUrl};
 use serde::{Deserialize, Deserializer};
 use serde_with::{serde_as, DeserializeAs, DisplayFromStr};
+use uv_normalize::PackageName;
 
 pub(crate) struct Pep440MapOrVec;
 
@@ -18,7 +19,7 @@ impl<'de> DeserializeAs<'de, Vec<Requirement>> for Pep440MapOrVec {
             Vec(Vec<Requirement>),
             Map(
                 #[serde_as(as = "IndexMap<_, DisplayFromStr, FxBuildHasher>")]
-                IndexMap<String, pep440_rs::VersionSpecifiers, FxBuildHasher>,
+                IndexMap<PackageName, pep440_rs::VersionSpecifiers, FxBuildHasher>,
             ),
         }
 
@@ -28,7 +29,7 @@ impl<'de> DeserializeAs<'de, Vec<Requirement>> for Pep440MapOrVec {
                 .into_iter()
                 .map(|(name, spec)| pep508_rs::Requirement {
                     name,
-                    extras: None,
+                    extras: vec![],
                     version_or_url: if spec.is_empty() {
                         None
                     } else {
