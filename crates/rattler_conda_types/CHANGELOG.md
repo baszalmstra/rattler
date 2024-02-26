@@ -1,0 +1,178 @@
+# Changelog
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.19.0](https://github.com/baszalmstra/rattler/compare/rattler_conda_types-v0.18.0...rattler_conda_types-v0.19.0) - 2024-02-26
+
+### Added
+- use resolvo 0.4.0 ([#523](https://github.com/baszalmstra/rattler/pull/523))
+- add name() to channel ([#495](https://github.com/baszalmstra/rattler/pull/495))
+- allow using `str` in `HashMap`s with a `PackageName` key ([#468](https://github.com/baszalmstra/rattler/pull/468))
+- implement Clone for AboutJson ([#467](https://github.com/baszalmstra/rattler/pull/467))
+- refactor `Version.bump()` to accept bumping `major/minor/patch/last` ([#452](https://github.com/baszalmstra/rattler/pull/452))
+- add purls to PackageRecord and lockfile ([#414](https://github.com/baszalmstra/rattler/pull/414))
+- display merged candidates ([#326](https://github.com/baszalmstra/rattler/pull/326))
+- implement base_url cep ([#322](https://github.com/baszalmstra/rattler/pull/322))
+- rattler_solve now uses nameless matchspec instead of matchspec
+- add everything needed for activation to py-rattler ([#298](https://github.com/baszalmstra/rattler/pull/298))
+- splits up operator further
+- migrate strict version for version ranges
+- expose ParseMatchSpecError in rattler_conda_types ([#286](https://github.com/baszalmstra/rattler/pull/286))
+- add From<VersionWithSource> for Version ([#246](https://github.com/baszalmstra/rattler/pull/246))
+- add methods to manipulate a version ([#229](https://github.com/baszalmstra/rattler/pull/229))
+- added experimental fields to conda lock ([#221](https://github.com/baszalmstra/rattler/pull/221))
+- better parse error message ([#222](https://github.com/baszalmstra/rattler/pull/222))
+- topological sort of PackageRecords ([#218](https://github.com/baszalmstra/rattler/pull/218))
+- more derives for conda lock ([#213](https://github.com/baszalmstra/rattler/pull/213))
+- make it possible to deserialize virtual packages ([#198](https://github.com/baszalmstra/rattler/pull/198))
+- nameless match spec
+- extract python json formatter ([#177](https://github.com/baszalmstra/rattler/pull/177))
+- use chrono timestamps ([#155](https://github.com/baszalmstra/rattler/pull/155))
+- use digest in repodata ([#153](https://github.com/baszalmstra/rattler/pull/153))
+- add documentation
+- now determines subdir ([#145](https://github.com/baszalmstra/rattler/pull/145))
+- construction methods for NoArchType ([#130](https://github.com/baszalmstra/rattler/pull/130))
+- prepare for release ([#119](https://github.com/baszalmstra/rattler/pull/119))
+- add datastructures for repodata patches ([#114](https://github.com/baszalmstra/rattler/pull/114))
+- add some missing fields ([#108](https://github.com/baszalmstra/rattler/pull/108))
+- allow caching repodata.json as .solv file ([#85](https://github.com/baszalmstra/rattler/pull/85))
+- add win-arm64 as a known platform ([#93](https://github.com/baszalmstra/rattler/pull/93))
+- install python entry points ([#83](https://github.com/baszalmstra/rattler/pull/83))
+- add riscv ([#84](https://github.com/baszalmstra/rattler/pull/84))
+- create command ([#72](https://github.com/baszalmstra/rattler/pull/72))
+- support installed (virtual) packages in libsolv ([#51](https://github.com/baszalmstra/rattler/pull/51))
+- add ArchiveIdentifier type ([#65](https://github.com/baszalmstra/rattler/pull/65))
+- add PrefixRecord and RepoDataRecord ([#56](https://github.com/baszalmstra/rattler/pull/56))
+- rustdoc ([#59](https://github.com/baszalmstra/rattler/pull/59))
+- adds the PackageFile trait for consistency ([#58](https://github.com/baszalmstra/rattler/pull/58))
+- install individual packages ([#48](https://github.com/baszalmstra/rattler/pull/48))
+- parsing of explicit environments ([#45](https://github.com/baszalmstra/rattler/pull/45))
+- validate package content ([#39](https://github.com/baszalmstra/rattler/pull/39))
+- detect virtual packages ([#34](https://github.com/baszalmstra/rattler/pull/34))
+- iterate over platform enum ([#32](https://github.com/baszalmstra/rattler/pull/32))
+- move all conda types to seperate crate
+
+### Fixed
+- channel name display ([#531](https://github.com/baszalmstra/rattler/pull/531))
+- remove dependency on native-tls ([#522](https://github.com/baszalmstra/rattler/pull/522))
+- dev-dependencies should use path deps
+- consistent clobbering & removal of `__pycache__` ([#437](https://github.com/baszalmstra/rattler/pull/437))
+- clippy lints ([#470](https://github.com/baszalmstra/rattler/pull/470))
+- set a serde default ([#443](https://github.com/baszalmstra/rattler/pull/443))
+- always write paths normalized ([#416](https://github.com/baszalmstra/rattler/pull/416))
+- support channel names with slashes ([#413](https://github.com/baszalmstra/rattler/pull/413))
+- avoid use of \ in doctest strings, for ide integration ([#387](https://github.com/baszalmstra/rattler/pull/387))
+- construct placeholder string at runtime ([#371](https://github.com/baszalmstra/rattler/pull/371))
+- emscripten is a unix variant ([#339](https://github.com/baszalmstra/rattler/pull/339))
+- bring back the changes to move to repodata.json version 2
+- also export strict version ([#312](https://github.com/baszalmstra/rattler/pull/312))
+- fmt
+- clippy fixes
+- pr changes
+- formatting
+- local version parsing in constraint ([#281](https://github.com/baszalmstra/rattler/pull/281))
+- superfluous quotes in lockfile
+- use short platform in repodata record ([#255](https://github.com/baszalmstra/rattler/pull/255))
+- parse `>2.10*` as `>=2.10` (issue [#235](https://github.com/baszalmstra/rattler/pull/235)) ([#237](https://github.com/baszalmstra/rattler/pull/237))
+- issue with reconstructing channel and filename from local channel
+- >=1!164.3095,<1!165 ([#220](https://github.com/baszalmstra/rattler/pull/220))
+- edge cases for matchspec parsing ([#217](https://github.com/baszalmstra/rattler/pull/217))
+- clippy warnings
+- small issues I encountered ([#184](https://github.com/baszalmstra/rattler/pull/184))
+- add missin spec types ([#183](https://github.com/baszalmstra/rattler/pull/183))
+- allow matchspec key value without quotes ([#156](https://github.com/baszalmstra/rattler/pull/156))
+- expose error to outside crates
+- couple file_mode and prefix_placeholder ([#136](https://github.com/baszalmstra/rattler/pull/136))
+- null values are still values ([#115](https://github.com/baszalmstra/rattler/pull/115))
+- cargo fmt
+- move match spec string generation to Display
+- windows build issues ([#60](https://github.com/baszalmstra/rattler/pull/60))
+- change urls from baszalmstra to mamba-org
+- tests and clippy
+- formatting
+
+### Other
+- Fix arch for osx-arm64 and win-arm64 ([#528](https://github.com/baszalmstra/rattler/pull/528))
+- move all dependencies to workspace ([#501](https://github.com/baszalmstra/rattler/pull/501))
+- lock-file v4 ([#484](https://github.com/baszalmstra/rattler/pull/484))
+- Release
+- Release
+- Add `read_package_file` function ([#472](https://github.com/baszalmstra/rattler/pull/472))
+- Release
+- more clippy lint ([#462](https://github.com/baszalmstra/rattler/pull/462))
+- Default value for conda_packages in repodata.json ([#441](https://github.com/baszalmstra/rattler/pull/441))
+- add ParseMatchSpecError and ParseMatchSpecError tests ([#434](https://github.com/baszalmstra/rattler/pull/434))
+- Release
+- Release
+- Release
+- expose `StringMatcherParseError` ([#410](https://github.com/baszalmstra/rattler/pull/410))
+- Release
+- Release
+- Release
+- make the channel in the matchspec struct an actual channel ([#401](https://github.com/baszalmstra/rattler/pull/401))
+- make builds deterministic ([#392](https://github.com/baszalmstra/rattler/pull/392))
+- Release
+- split lockfile implementation and add pip ([#378](https://github.com/baszalmstra/rattler/pull/378))
+- all dependencies ([#366](https://github.com/baszalmstra/rattler/pull/366))
+- Release
+- Release
+- implement build number spec for match spec, addresses [#96](https://github.com/baszalmstra/rattler/pull/96) ([#346](https://github.com/baszalmstra/rattler/pull/346))
+- add build_spec module, not yet used in match_spec ([#340](https://github.com/baszalmstra/rattler/pull/340))
+- hide implementation detail, version_spec::Constraint ([#341](https://github.com/baszalmstra/rattler/pull/341))
+- get dependencies from provider ([#335](https://github.com/baszalmstra/rattler/pull/335))
+- use emscripten-wasm32 and wasi-wasm32 ([#333](https://github.com/baszalmstra/rattler/pull/333))
+- Merge branch 'main' into test/test-collapsing-error
+- Merge remote-tracking branch 'upstream/main' into feat/generic-pool
+- Update all dependencies and fix chrono deprecation ([#302](https://github.com/baszalmstra/rattler/pull/302))
+- Updates to `NamelessMatchSpec` to allow deserializing ([#299](https://github.com/baszalmstra/rattler/pull/299))
+- Merge branch 'main' into feat/migrate-to-strict-version
+- Release
+- Release
+- call codesign binary instead of using codesign crate ([#259](https://github.com/baszalmstra/rattler/pull/259))
+- parsing of version constraints ([#254](https://github.com/baszalmstra/rattler/pull/254))
+- propose a repodata patch function to be able to add `pip` to the `pyt… ([#238](https://github.com/baszalmstra/rattler/pull/238))
+- version parsing ([#240](https://github.com/baszalmstra/rattler/pull/240))
+- Add support for sha256 and md5 field in matchspec ([#241](https://github.com/baszalmstra/rattler/pull/241))
+- Release
+- Release
+- version implementation ([#227](https://github.com/baszalmstra/rattler/pull/227))
+- Release
+- improve version parse error msg ([#211](https://github.com/baszalmstra/rattler/pull/211))
+- update all dependencies ([#208](https://github.com/baszalmstra/rattler/pull/208))
+- version tree parsing with nom ([#206](https://github.com/baszalmstra/rattler/pull/206))
+- ignore trailing .0 in version comparison ([#196](https://github.com/baszalmstra/rattler/pull/196))
+- Small fixes for link.json parsing, and making entry point template public ([#189](https://github.com/baszalmstra/rattler/pull/189))
+- add native-tls/rustls-tls features to rattler & more dependencies ([#181](https://github.com/baszalmstra/rattler/pull/181))
+- Add "sorted" macro to JSON data types ([#180](https://github.com/baszalmstra/rattler/pull/180))
+- Add .arch function ([#166](https://github.com/baszalmstra/rattler/pull/166))
+- make ParseError public and reuse ArchiveType ([#167](https://github.com/baszalmstra/rattler/pull/167))
+- make RunExportsJson cloneable ([#169](https://github.com/baszalmstra/rattler/pull/169))
+- update hex-literal requirement from 0.3.4 to 0.4.0 ([#149](https://github.com/baszalmstra/rattler/pull/149))
+- Sort paths json deterministically when serializing ([#147](https://github.com/baszalmstra/rattler/pull/147))
+- add Clone to repodata ([#138](https://github.com/baszalmstra/rattler/pull/138))
+- re-export hash types from rattler_digest and use them more ([#137](https://github.com/baszalmstra/rattler/pull/137))
+- add more targets to target detection ([#135](https://github.com/baszalmstra/rattler/pull/135))
+- Release
+- inherit workspace properties for crates
+- add package writing functions ([#112](https://github.com/baszalmstra/rattler/pull/112))
+- add more tests and evict removed packages from repodata ([#128](https://github.com/baszalmstra/rattler/pull/128))
+- add functions to apply patches to repodata ([#127](https://github.com/baszalmstra/rattler/pull/127))
+- add function to create package record from index.json + size and hashes
+- add serialization for repodata and initial test ([#124](https://github.com/baszalmstra/rattler/pull/124))
+- update rstest requirement from 0.16.0 to 0.17.0 ([#121](https://github.com/baszalmstra/rattler/pull/121))
+- Feat/write conda lock ([#87](https://github.com/baszalmstra/rattler/pull/87))
+- get rid of some more usize -> u64 ([#105](https://github.com/baszalmstra/rattler/pull/105))
+- add features and track_features to index.json ([#104](https://github.com/baszalmstra/rattler/pull/104))
+- Matchspec impl ([#91](https://github.com/baszalmstra/rattler/pull/91))
+- matchspec & version docs ([#82](https://github.com/baszalmstra/rattler/pull/82))
+- docs for all the conda types in crate ([#79](https://github.com/baszalmstra/rattler/pull/79))
+- add link.json and python entry points parsing ([#78](https://github.com/baszalmstra/rattler/pull/78))
+- Merge branch 'main' into libsolv-cleanup
+- add about.json parsing like others ([#57](https://github.com/baszalmstra/rattler/pull/57))
+- Run exports ([#53](https://github.com/baszalmstra/rattler/pull/53))
+- move index to its own file, add helper functions and simple test ([#52](https://github.com/baszalmstra/rattler/pull/52))
+- add licenses ([#37](https://github.com/baszalmstra/rattler/pull/37))
