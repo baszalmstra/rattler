@@ -6,4 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1](https://github.com/baszalmstra/rattler/compare/rattler_lock-v0.19.0...rattler_lock-v0.19.1) - 2024-02-26
+
+### Added
+- sort extras by name and urls by filename ([#540](https://github.com/baszalmstra/rattler/pull/540))
+
 ## [0.19.0](https://github.com/baszalmstra/rattler/compare/rattler_lock-v0.18.0...rattler_lock-v0.19.0) - 2024-02-26
