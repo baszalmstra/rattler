@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1](https://github.com/baszalmstra/rattler/compare/rattler_index-v0.19.0...rattler_index-v0.19.1) - 2024-02-29
+
+### Fixed
+- dont use workspace dependencies for local crates ([#546](https://github.com/baszalmstra/rattler/pull/546))
+
 ## [0.19.0](https://github.com/baszalmstra/rattler/compare/rattler_index-v0.18.0...rattler_index-v0.19.0) - 2024-02-26
 
 ### Fixed
