@@ -26,16 +26,21 @@ pub enum MenuMode {
 
 #[derive(thiserror::Error, Debug)]
 pub enum MenuInstError {
-    #[error("IO error: {0}")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
+
     #[error("Deserialization error: {0}")]
     SerdeError(#[from] serde_json::Error),
 
     #[error("Failed to install menu item: {0}")]
     InstallError(String),
 
+    #[error("could not find {}")]
+    DirectoryNotFound(String),
+
     #[error("Failed to create plist: {0}")]
     PlistError(#[from] plist::Error),
+
     #[error("Failed to sign plist: {0}")]
     SigningFailed(String),
 }
@@ -81,7 +86,14 @@ pub fn install_menuitems(
             #[cfg(target_os = "windows")]
             if let Some(windows_item) = item.platforms.win {
                 let command = item.command.merge(windows_item.base);
-                windows::install_menu_item(prefix, windows_item.specific, command, menu_mode)?;
+                windows::install_menu_item(
+                    prefix,
+                    &menu_inst.menu_name,
+                    windows_item.specific,
+                    command,
+                    &placeholders,
+                    MenuMode::System,
+                )?;
             }
         }
     }
