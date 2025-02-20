@@ -196,6 +196,13 @@ export class Version {
         return Version.fromNative(this.native.with_alpha());
     }
 
+    /**
+     * Compare 2 versions.
+     * Returns:
+     *  -1 if self<other
+     *  0 if self == other
+     *  1 if self > other
+     */
     public compare(other: Version): number {
         return this.native.compare(other.native);
     }
