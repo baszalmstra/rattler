@@ -198,10 +198,8 @@ export class Version {
 
     /**
      * Compare 2 versions.
-     * Returns:
-     *  -1 if self<other
-     *  0 if self == other
-     *  1 if self > other
+     *
+     * Returns `-1` if self<other, `0` if self == other, `1` if self > other
      */
     public compare(other: Version): number {
         return this.native.compare(other.native);
