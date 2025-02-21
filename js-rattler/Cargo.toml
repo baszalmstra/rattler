@@ -31,6 +31,9 @@ wee_alloc = { version = "0.4.5", optional = true }
 thiserror = "2.0.3"
 
 rattler_conda_types = { path = "../crates/rattler_conda_types" }
+rattler_repodata_gateway = { path = "../crates/rattler_repodata_gateway" }
+
+bzip2 = { version = "0.5.1", features = ["libbz2-rs-sys"]}
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.45"
@@ -39,6 +42,11 @@ wasm-bindgen-test = "0.3.45"
 # Tell `rustc` to optimize for small code size.
 opt-level = "s"
 lto = true
+
+[patch.crates-io]
+# We want to use version 0.4.19 but its not released yet.
+# https://github.com/Nullus157/async-compression/pull/319
+async-compression = { git = "https://github.com/Nullus157/async-compression.git" }
 
 # Prevent package from thinking it's in the workspace
 [workspace]
