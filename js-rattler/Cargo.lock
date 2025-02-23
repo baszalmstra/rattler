@@ -358,8 +358,7 @@ checksum = "f61dac84819c6588b558454b194026eb1f09c293b9036ae9b159e74e73ab6cf9"
 [[package]]
 name = "bzip2"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b89e7c29231c673a61a46e722602bcd138298f6b9e81e71119693534585f5c"
+source = "git+https://github.com/baszalmstra/bzip2-rs.git?branch=fix%2Fwasm#4fcca87c2688a4a53e83f417022d9fe2eb292bf0"
 dependencies = [
  "bzip2-sys",
  "libbz2-rs-sys",
@@ -368,8 +367,7 @@ dependencies = [
 [[package]]
 name = "bzip2-sys"
 version = "0.1.12+1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72ebc2f1a417f01e1da30ef264ee86ae31d2dcd2d603ea283d3c244a883ca2a9"
+source = "git+https://github.com/baszalmstra/bzip2-rs.git?branch=fix%2Fwasm#4fcca87c2688a4a53e83f417022d9fe2eb292bf0"
 dependencies = [
  "cc",
  "libc",
@@ -2486,8 +2484,7 @@ dependencies = [
 [[package]]
 name = "reqwest-middleware"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1ccd3b55e711f91a9885a2fa6fbbb2e39db1776420b062efc058c6410f7e5e3"
+source = "git+https://github.com/TrueLayer/reqwest-middleware.git#9fdba406c124c567e2302f1aec63483ed7db63b1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3917,9 +3914,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-sys"
-version = "2.0.13+zstd.1.5.6"
+version = "2.0.14+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38ff0f21cfee8f97d94cef41359e0c89aa6113028ab0291aa8ca0038995a95aa"
+checksum = "8fb060d4926e4ac3a3ad15d864e99ceb5f343c6b34f5bd6d81ae6ed417311be5"
 dependencies = [
  "cc",
  "pkg-config",
