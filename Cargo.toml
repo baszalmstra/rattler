@@ -168,6 +168,7 @@ typed-path = { version = "0.10.0" }
 url = { version = "2.5.4" }
 uuid = { version = "1.13.1", default-features = false }
 walkdir = "2.5.0"
+wasmtimer = "0.4.1"
 windows-sys = { version = "0.59.0", default-features = false }
 winver = { version = "1.0.0" }
 zip = { version = "2.2.2", default-features = false }
