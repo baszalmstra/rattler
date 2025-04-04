@@ -151,14 +151,17 @@ fn needs_quotes(s: &str) -> bool {
     if s.contains(": ") {
         return true;
     }
+    if s.starts_with(">") {
+        return true;
+    }
     false
 }
 
 fn write_quoted<W: Write>(writer: &mut W, s: &str) -> std::io::Result<()> {
     if needs_quotes(s) {
-        write!(writer, "\"{}\"", s)
+        write!(writer, "\"{s}\"")
     } else {
-        write!(writer, "{}", s)
+        write!(writer, "{s}")
     }
 }
 
@@ -215,7 +218,7 @@ impl<'a, W: Write> YamlTable<'a, W> {
         self.indent()?;
         write_quoted(&mut self.writer, key)?;
         write!(self.writer, ": ")?;
-        write!(self.writer, "{}", value)?;
+        write!(self.writer, "{value}")?;
         writeln!(self.writer)?;
         Ok(())
     }
@@ -233,7 +236,7 @@ impl<'a, W: Write> YamlTable<'a, W> {
     pub fn boolean(&mut self, key: &str, value: bool) -> std::io::Result<()> {
         self.indent()?;
         write_quoted(&mut self.writer, key)?;
-        write!(self.writer, ": {}", value)?;
+        write!(self.writer, ": {value}")?;
         writeln!(self.writer)?;
         Ok(())
     }
@@ -266,7 +269,7 @@ impl<'a, W: Write> YamlTable<'a, W> {
     /// A result indicating success or an I/O error
     pub fn comment(&mut self, comment: &str) -> std::io::Result<()> {
         self.indent()?;
-        write!(self.writer, "# {}", comment)?;
+        write!(self.writer, "# {comment}")?;
         writeln!(self.writer)?;
         Ok(())
     }
@@ -349,6 +352,7 @@ impl<'a, W: Write> YamlTable<'a, W> {
         writeln!(self.writer, ":")?;
         let mut seq = YamlSequence {
             writer: self.writer,
+            indent: self.indent.clone(),
         };
         f(&mut seq)?;
         Ok(())
@@ -378,7 +382,10 @@ impl<'a, W: Write> YamlTable<'a, W> {
             first_item: true,
         };
         f(&mut inline_seq)?;
-        writeln!(self.writer, " ]")?;
+        if !inline_seq.first_item {
+            write!(self.writer, " ")?;
+        }
+        writeln!(self.writer, "]")?;
         Ok(())
     }
 }
@@ -394,11 +401,11 @@ pub struct YamlInlineTable<'a, W: Write> {
 
 impl<'a, W: Write> YamlInlineTable<'a, W> {
     fn seperator(&mut self) -> std::io::Result<()> {
-        if !self.first_pair {
-            write!(self.writer, ", ")?;
-        } else {
+        if self.first_pair {
             write!(self.writer, " ")?;
             self.first_pair = false;
+        } else {
+            write!(self.writer, ", ")?;
         }
         Ok(())
     }
@@ -435,7 +442,7 @@ impl<'a, W: Write> YamlInlineTable<'a, W> {
         self.seperator()?;
         write_quoted(&mut self.writer, key)?;
         write!(self.writer, ": ")?;
-        write!(self.writer, "{}", value)?;
+        write!(self.writer, "{value}")?;
         Ok(())
     }
 
@@ -452,7 +459,7 @@ impl<'a, W: Write> YamlInlineTable<'a, W> {
     pub fn boolean(&mut self, key: &str, value: bool) -> std::io::Result<()> {
         self.seperator()?;
         write_quoted(&mut self.writer, key)?;
-        write!(self.writer, ": {}", value)?;
+        write!(self.writer, ": {value}")?;
         Ok(())
     }
 
@@ -505,6 +512,7 @@ impl<'a, W: Write> YamlInlineTable<'a, W> {
 /// where each item is on a new line and preceded by a dash.
 pub struct YamlSequence<'a, W: Write> {
     writer: &'a mut W,
+    indent: String,
 }
 
 impl<'a, W: Write> YamlSequence<'a, W> {
@@ -518,7 +526,7 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     ///
     /// A result indicating success or an I/O error
     pub fn string(&mut self, item: &str) -> std::io::Result<()> {
-        write!(self.writer, "  - ")?;
+        write!(self.writer, "{}- ", self.indent)?;
         write_quoted(&mut self.writer, item)?;
         writeln!(self.writer)?;
         Ok(())
@@ -534,7 +542,7 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     ///
     /// A result indicating success or an I/O error
     pub fn number(&mut self, item: f64) -> std::io::Result<()> {
-        writeln!(self.writer, "  - {}", item)?;
+        writeln!(self.writer, "{}- {}", self.indent, item)?;
         Ok(())
     }
 
@@ -548,7 +556,7 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     ///
     /// A result indicating success or an I/O error
     pub fn boolean(&mut self, value: bool) -> std::io::Result<()> {
-        writeln!(self.writer, "  - {}", value)?;
+        writeln!(self.writer, "{}- {}", self.indent, value)?;
         Ok(())
     }
 
@@ -558,7 +566,7 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     ///
     /// A result indicating success or an I/O error
     pub fn null(&mut self) -> std::io::Result<()> {
-        writeln!(self.writer, "  - null")?;
+        writeln!(self.writer, "{}- null", self.indent)?;
         Ok(())
     }
 
@@ -572,7 +580,7 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     ///
     /// A result indicating success or an I/O error
     pub fn comment(&mut self, comment: &str) -> std::io::Result<()> {
-        writeln!(self.writer, "  # {}", comment)?;
+        writeln!(self.writer, "{}# {}", self.indent, comment)?;
         Ok(())
     }
 
@@ -589,7 +597,7 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     where
         F: FnOnce(&mut YamlInlineTable<'_, W>) -> std::io::Result<()>,
     {
-        write!(self.writer, "  - {{")?;
+        write!(self.writer, "{}- {{", self.indent)?;
         let mut table = YamlInlineTable {
             writer: self.writer,
             first_pair: true,
@@ -612,10 +620,11 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     where
         F: FnOnce(&mut YamlTable<'_, W>) -> std::io::Result<()>,
     {
-        write!(self.writer, "  - ")?;
+        write!(self.writer, "{}- ", self.indent)?;
+        let indent_level = format!("{}  ", self.indent);
         let mut obj = YamlTable {
             writer: self.writer,
-            indent: "    ".to_string(),
+            indent: indent_level,
             first_key: FirstKeyState::Inline,
         };
         f(&mut obj)?;
@@ -635,13 +644,16 @@ impl<'a, W: Write> YamlSequence<'a, W> {
     where
         F: FnOnce(&mut YamlInlineSequence<'_, W>) -> std::io::Result<()>,
     {
-        write!(self.writer, "  - [")?;
+        write!(self.writer, "{}- [", self.indent)?;
         let mut inline_seq = YamlInlineSequence {
             writer: self.writer,
             first_item: true,
         };
         f(&mut inline_seq)?;
-        writeln!(self.writer, " ]")?;
+        if !inline_seq.first_item {
+            write!(self.writer, " ")?;
+        }
+        writeln!(self.writer, "]")?;
         Ok(())
     }
 }
@@ -657,11 +669,11 @@ pub struct YamlInlineSequence<'a, W: Write> {
 
 impl<'a, W: Write> YamlInlineSequence<'a, W> {
     fn seperator(&mut self) -> std::io::Result<()> {
-        if !self.first_item {
-            write!(self.writer, ", ")?;
-        } else {
+        if self.first_item {
             write!(self.writer, " ")?;
             self.first_item = false;
+        } else {
+            write!(self.writer, ", ")?;
         }
         Ok(())
     }
@@ -677,7 +689,7 @@ impl<'a, W: Write> YamlInlineSequence<'a, W> {
     /// A result indicating success or an I/O error
     pub fn string(&mut self, value: &str) -> std::io::Result<()> {
         self.seperator()?;
-        write_quoted(&mut self.writer, value)?;
+        write!(&mut self.writer, "\"{value}\"")?;
         Ok(())
     }
 
@@ -692,7 +704,7 @@ impl<'a, W: Write> YamlInlineSequence<'a, W> {
     /// A result indicating success or an I/O error
     pub fn number(&mut self, value: f64) -> std::io::Result<()> {
         self.seperator()?;
-        write!(self.writer, "{}", value)?;
+        write!(self.writer, "{value}")?;
         Ok(())
     }
 
@@ -707,7 +719,7 @@ impl<'a, W: Write> YamlInlineSequence<'a, W> {
     /// A result indicating success or an I/O error
     pub fn boolean(&mut self, value: bool) -> std::io::Result<()> {
         self.seperator()?;
-        write!(self.writer, "{}", value)?;
+        write!(self.writer, "{value}")?;
         Ok(())
     }
 
