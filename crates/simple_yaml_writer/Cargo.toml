@@ -1,0 +1,15 @@
+[package]
+name = "simple_yaml_writer"
+version = "0.1.0"
+description = "Write formatted YAML files quickly"
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+readme.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+insta = { workspace = true }
