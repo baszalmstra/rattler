@@ -22,6 +22,7 @@ pub mod version_spec;
 pub mod compression_level;
 mod environment_yaml;
 mod generic_virtual_package;
+pub mod history;
 pub mod package;
 mod package_name;
 pub mod prefix;
@@ -39,6 +40,10 @@ pub use explicit_environment_spec::{
     ParseExplicitEnvironmentSpecError, ParsePackageArchiveHashError,
 };
 pub use generic_virtual_package::GenericVirtualPackage;
+pub use history::{
+    CreateOperation, CustomOperation, EnvironmentState, History, HistoryError, InstallOperation, 
+    PackageChange, PackageOperation, RemoveOperation, Revision, UpdateOperation, UserRequest
+};
 pub use match_spec::{
     matcher::{StringMatcher, StringMatcherParseError},
     parse::ParseMatchSpecError,
