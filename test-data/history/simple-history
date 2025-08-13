@@ -1,0 +1,33 @@
+==> 2024-01-15 10:30:00 <==
+# cmd: /home/user/miniconda3/bin/conda create -n test_env python=3.9
+# conda version: 23.7.4
++defaults::python-3.9.18-h955ad1f_0
++defaults::ca-certificates-2023.08.22-haa95532_0
++defaults::openssl-3.0.11-h2bbff1b_2
++defaults::pip-23.3.1-py39haa95532_0
++defaults::setuptools-68.2.2-py39haa95532_0
++defaults::sqlite-3.41.2-h2bbff1b_0
++defaults::tk-8.6.12-h2bbff1b_0
++defaults::wheel-0.41.2-py39haa95532_0
++defaults::xz-5.4.5-h8cc25b3_0
++defaults::zlib-1.2.13-h8cc25b3_0
+# create specs: ['python=3.9']
+
+==> 2024-01-16 14:22:30 <==
+# cmd: /home/user/miniconda3/envs/test_env/bin/conda install numpy pandas
+# conda version: 23.7.4
++defaults::numpy-1.26.3-py39h055cbcc_0
++defaults::pandas-2.1.4-py39h4671533_0
++defaults::python-dateutil-2.8.2-pyhd3eb1b0_0
++defaults::pytz-2023.3.post1-py39haa95532_0
++defaults::six-1.16.0-pyhd3eb1b0_1
+# update specs: ['numpy', 'pandas']
+
+==> 2024-01-17 09:15:45 <==
+# cmd: /home/user/miniconda3/envs/test_env/bin/conda remove pandas
+# conda version: 23.7.4
+-defaults::pandas-2.1.4-py39h4671533_0
+-defaults::python-dateutil-2.8.2-pyhd3eb1b0_0
+-defaults::pytz-2023.3.post1-py39haa95532_0
+-defaults::six-1.16.0-pyhd3eb1b0_1
+# remove specs: ['pandas']

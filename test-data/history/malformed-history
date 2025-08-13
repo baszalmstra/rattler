@@ -1,0 +1,40 @@
+# This is a comment that should be ignored
+# Comments before the first timestamp are allowed
+
+==> 2024-02-01 10:00:00 <==
+# cmd: conda create -n test python=3.11
+# conda version: 23.7.4
++defaults::python-3.11.5-h1234567_0
+# create specs: ['python=3.11']
+
+==> 2024-02-02 11:00:00 <==
+# cmd: conda install numpy
+# Missing conda version line
++numpy-1.25.0-py311_0
+# update specs: ['numpy']
+
+==> 2024-02-03 12:00:00 <==
+# cmd: conda install scipy
+# conda version: 23.7.4
+# Missing channel prefix
++scipy-1.11.0-py311_0
++defaults::libgfortran-5.0.0-13_2_0_h97931a8_3
+# update specs: ['scipy']
+
+==> 2024-02-04 13:00:00 <==
+# cmd: conda install pandas
+# conda version: 23.7.4
++defaults::pandas-2.0.3-py311_0
+# Malformed specs list (missing quotes)
+# update specs: [pandas]
+
+==> 2024-02-05 14:00:00 <==
+# cmd: conda update numpy
+# conda version: 23.7.4
+# Package with unusual version format
+-numpy-1.25.0-py311_0
++defaults::numpy-1.26.0.dev0+git20240205.abcdef-py311_0
+# update specs: ['numpy']
+
+# Trailing comments should also be handled
+# This tests edge cases in parsing
