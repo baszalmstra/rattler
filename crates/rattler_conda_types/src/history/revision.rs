@@ -36,8 +36,8 @@ pub struct CreateOperation {
 /// Custom operation specification
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CustomOperation {
-    /// Description of the custom operation
-    pub description: String,
+    /// The custom operation
+    pub operation: String,
 }
 
 /// Represents a user request that triggered a conda operation.
@@ -196,7 +196,7 @@ impl fmt::Display for Revision {
                 writeln!(f, "# create specs: [{}]", specs_str)?;
             },
             UserRequest::Custom(op) => {
-                writeln!(f, "# custom specs: [{}]", op.description)?;
+                writeln!(f, "# {}", op.operation)?;
             },
         }
         writeln!(f)?;
@@ -215,7 +215,7 @@ mod tests {
     fn test_user_request_variants() {
         let install_op = InstallOperation { specs: vec![] };
         let remove_op = RemoveOperation { names: vec![] };
-        let custom_op = CustomOperation { description: "pip".to_string() };
+        let custom_op = CustomOperation { operation: "pip".to_string() };
         
         assert_eq!(UserRequest::Install(install_op.clone()), UserRequest::Install(install_op));
         assert_eq!(UserRequest::Custom(custom_op.clone()), UserRequest::Custom(custom_op));
@@ -325,7 +325,7 @@ mod tests {
         let user_request: UserRequest = create_op.into();
         assert!(matches!(user_request, UserRequest::Create(_)));
         
-        let custom_op = CustomOperation { description: "test".to_string() };
+        let custom_op = CustomOperation { operation: "test".to_string() };
         let user_request: UserRequest = custom_op.into();
         assert!(matches!(user_request, UserRequest::Custom(_)));
     }
