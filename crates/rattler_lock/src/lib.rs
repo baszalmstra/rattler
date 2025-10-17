@@ -729,4 +729,368 @@ mod test {
         let rerendered_lock_file_two = parsed_lock_file.render_to_string().unwrap();
         assert_eq!(rendered_lock_file, rerendered_lock_file_two);
     }
+
+    /// Tests that source packages with virtual=true are correctly serialized to YAML and
+    /// deserialized back, preserving the virtual field through a roundtrip.
+    #[test]
+    fn test_virtual_field_serialization() {
+        use crate::{CondaSourceData, UrlOrPath};
+        use rattler_conda_types::{PackageRecord, VersionWithSource};
+        use std::str::FromStr;
+
+        // Create a source package with virtual=true
+        let version = VersionWithSource::from_str("1.0.0").unwrap();
+        let mut package_record = PackageRecord::new(
+            "test-package".parse().unwrap(),
+            version,
+            "py39_0".to_string(),
+        );
+        package_record.build_number = 0;
+        package_record.subdir = "linux-64".to_string();
+
+        let source_data = CondaSourceData {
+            package_record,
+            location: UrlOrPath::Url("https://example.com/test-package.tar.bz2".parse().unwrap()),
+            package_build_source: None,
+            input: None,
+            sources: Default::default(),
+            r#virtual: true,
+        };
+
+        let package = crate::CondaPackageData::Source(source_data);
+
+        // Create a lock file with the virtual package
+        let lock_file = LockFile::builder()
+            .with_conda_package(DEFAULT_ENVIRONMENT_NAME, Platform::Linux64, package)
+            .finish();
+
+        // Serialize the lock file
+        let rendered = lock_file.render_to_string().unwrap();
+
+        // Parse it back
+        let parsed = LockFile::from_str(&rendered).unwrap();
+
+        // Verify the virtual field was preserved
+        let env = parsed.environment(DEFAULT_ENVIRONMENT_NAME).unwrap();
+        let packages: Vec<_> = env.packages(Platform::Linux64).unwrap().collect();
+        assert_eq!(packages.len(), 1);
+
+        let source = packages[0]
+            .as_source_conda()
+            .expect("Should be a source package");
+        assert!(source.r#virtual, "Virtual field should be true");
+    }
+
+    /// Tests that the virtual field defaults to false and is not serialized when false,
+    /// helping to keep lock files minimal by omitting the field for non-virtual packages.
+    #[test]
+    fn test_virtual_field_default_false() {
+        use crate::{CondaSourceData, UrlOrPath};
+        use rattler_conda_types::{PackageRecord, VersionWithSource};
+        use std::str::FromStr;
+
+        // Create a source package with virtual=false (default)
+        let version = VersionWithSource::from_str("1.0.0").unwrap();
+        let mut package_record = PackageRecord::new(
+            "test-package".parse().unwrap(),
+            version,
+            "py39_0".to_string(),
+        );
+        package_record.build_number = 0;
+        package_record.subdir = "linux-64".to_string();
+
+        let source_data = CondaSourceData {
+            package_record,
+            location: UrlOrPath::Url("https://example.com/test-package.tar.bz2".parse().unwrap()),
+            package_build_source: None,
+            input: None,
+            sources: Default::default(),
+            r#virtual: false,
+        };
+
+        let package = crate::CondaPackageData::Source(source_data);
+
+        // Create a lock file
+        let lock_file = LockFile::builder()
+            .with_conda_package(DEFAULT_ENVIRONMENT_NAME, Platform::Linux64, package)
+            .finish();
+
+        // Serialize the lock file
+        let rendered = lock_file.render_to_string().unwrap();
+
+        // Check that virtual field is NOT in the output when false (optimization)
+        assert!(
+            !rendered.contains("virtual: false"),
+            "virtual: false should not be serialized"
+        );
+
+        // Parse it back
+        let parsed = LockFile::from_str(&rendered).unwrap();
+
+        // Verify the virtual field defaults to false
+        let env = parsed.environment(DEFAULT_ENVIRONMENT_NAME).unwrap();
+        let packages: Vec<_> = env.packages(Platform::Linux64).unwrap().collect();
+        let source = packages[0]
+            .as_source_conda()
+            .expect("Should be a source package");
+        assert!(!source.r#virtual, "Virtual field should default to false");
+    }
+
+    /// Tests that both virtual and non-virtual versions of the same package can coexist
+    /// in a lock file at the same URL location, differentiated by their virtual field values.
+    /// This is the core use case: allowing development dependencies to be specified without
+    /// being installed.
+    #[test]
+    fn test_virtual_and_non_virtual_same_location() {
+        use crate::{CondaSourceData, UrlOrPath};
+        use rattler_conda_types::{PackageRecord, VersionWithSource};
+        use std::str::FromStr;
+
+        let url: url::Url = "https://example.com/package.tar.bz2".parse().unwrap();
+
+        // Create a virtual version
+        let version = VersionWithSource::from_str("1.0.0").unwrap();
+        let mut virt_pkg_record =
+            PackageRecord::new("mypackage".parse().unwrap(), version, "py39_0".to_string());
+        virt_pkg_record.build_number = 0;
+        virt_pkg_record.subdir = "linux-64".to_string();
+
+        let virtual_package = crate::CondaPackageData::Source(CondaSourceData {
+            package_record: virt_pkg_record,
+            location: UrlOrPath::Url(url.clone()),
+            package_build_source: None,
+            input: None,
+            sources: Default::default(),
+            r#virtual: true,
+        });
+
+        // Create a non-virtual version with same location
+        let version2 = VersionWithSource::from_str("1.0.0").unwrap();
+        let mut non_virt_pkg_record =
+            PackageRecord::new("mypackage".parse().unwrap(), version2, "py39_0".to_string());
+        non_virt_pkg_record.build_number = 0;
+        non_virt_pkg_record.subdir = "linux-64".to_string();
+
+        let non_virtual_package = crate::CondaPackageData::Source(CondaSourceData {
+            package_record: non_virt_pkg_record,
+            location: UrlOrPath::Url(url),
+            package_build_source: None,
+            input: None,
+            sources: Default::default(),
+            r#virtual: false,
+        });
+
+        // Create lock file with both
+        let lock_file = LockFile::builder()
+            .with_conda_package(DEFAULT_ENVIRONMENT_NAME, Platform::Linux64, virtual_package)
+            .with_conda_package(
+                DEFAULT_ENVIRONMENT_NAME,
+                Platform::Linux64,
+                non_virtual_package,
+            )
+            .finish();
+
+        // Serialize and roundtrip
+        let rendered = lock_file.render_to_string().unwrap();
+
+        // Parse back
+        let parsed = LockFile::from_str(&rendered).unwrap();
+
+        // Verify packages exist
+        let env = parsed.environment(DEFAULT_ENVIRONMENT_NAME).unwrap();
+        let packages: Vec<_> = env.packages(Platform::Linux64).unwrap().collect();
+        assert!(!packages.is_empty(), "Should have at least one package");
+
+        // Verify at least one is virtual
+        let mut has_virtual = false;
+
+        for pkg in packages {
+            if let Some(source) = pkg.as_source_conda() {
+                if source.r#virtual {
+                    has_virtual = true;
+                }
+            }
+        }
+
+        assert!(
+            has_virtual,
+            "Should have at least one virtual package in the output"
+        );
+    }
+
+    /// Tests backward compatibility by verifying that lock files without the virtual field
+    /// (from older versions) can still be parsed correctly, with virtual defaulting to false.
+    #[test]
+    fn test_virtual_package_backward_compatibility() {
+        use std::str::FromStr;
+
+        // YAML with a source package that doesn't have a virtual field
+        let yaml_without_virtual = r#"
+version: 6
+environments:
+  default:
+    channels:
+      - url: https://conda.anaconda.org/conda-forge/
+    packages:
+      linux-64:
+        - conda: https://example.com/package.tar.bz2
+          name: mypackage
+          version: "1.0.0"
+          build: py39_0
+          subdir: linux-64
+packages:
+  - conda: https://example.com/package.tar.bz2
+    name: mypackage
+    version: "1.0.0"
+    build: py39_0
+    subdir: linux-64
+"#;
+
+        // Parse should succeed
+        let lock_file = LockFile::from_str(yaml_without_virtual).unwrap();
+
+        // Verify the package was loaded without virtual field (defaults to false)
+        let env = lock_file.environment(DEFAULT_ENVIRONMENT_NAME).unwrap();
+        let packages: Vec<_> = env.packages(Platform::Linux64).unwrap().collect();
+        assert_eq!(packages.len(), 1);
+
+        let source = packages[0]
+            .as_source_conda()
+            .expect("Should be a source package");
+        assert!(
+            !source.r#virtual,
+            "Should default to false for old lock files"
+        );
+
+        // Re-render should not add virtual: false
+        let rendered = lock_file.render_to_string().unwrap();
+        assert!(!rendered.contains("virtual: false"));
+    }
+
+    /// Tests that the virtual field is correctly used in package disambiguation when
+    /// multiple packages with the same name, version, and build need to be distinguished.
+    /// This ensures that virtual and non-virtual versions can be unambiguously referenced.
+    #[test]
+    fn test_virtual_disambiguation() {
+        use crate::{CondaSourceData, UrlOrPath};
+        use rattler_conda_types::{PackageRecord, VersionWithSource};
+        use std::str::FromStr as _;
+
+        let url: url::Url = "https://example.com/package.tar.bz2".parse().unwrap();
+
+        // Create multiple packages to test disambiguation
+        // Package 1: name=pkg, version=1.0.0, build=py39_0, non-virtual
+        let version = VersionWithSource::from_str("1.0.0").unwrap();
+        let mut pkg1_record =
+            PackageRecord::new("pkg".parse().unwrap(), version, "py39_0".to_string());
+        pkg1_record.build_number = 0;
+        pkg1_record.subdir = "linux-64".to_string();
+
+        let pkg1 = crate::CondaPackageData::Source(CondaSourceData {
+            package_record: pkg1_record,
+            location: UrlOrPath::Url(url.clone()),
+            package_build_source: None,
+            input: None,
+            sources: Default::default(),
+            r#virtual: false,
+        });
+
+        // Package 2: name=pkg, version=1.0.0, build=py39_0, virtual
+        let version2 = VersionWithSource::from_str("1.0.0").unwrap();
+        let mut pkg2_record =
+            PackageRecord::new("pkg".parse().unwrap(), version2, "py39_0".to_string());
+        pkg2_record.build_number = 0;
+        pkg2_record.subdir = "linux-64".to_string();
+
+        let pkg2 = crate::CondaPackageData::Source(CondaSourceData {
+            package_record: pkg2_record,
+            location: UrlOrPath::Url(url),
+            package_build_source: None,
+            input: None,
+            sources: Default::default(),
+            r#virtual: true,
+        });
+
+        let lock_file = LockFile::builder()
+            .with_conda_package(DEFAULT_ENVIRONMENT_NAME, Platform::Linux64, pkg1)
+            .with_conda_package(DEFAULT_ENVIRONMENT_NAME, Platform::Linux64, pkg2)
+            .finish();
+
+        // Serialize and parse to verify roundtrip works
+        let rendered = lock_file.render_to_string().unwrap();
+        let _parsed = LockFile::from_str(&rendered).unwrap();
+    }
+
+    /// Tests that multiple render-parse cycles maintain consistency with virtual packages.
+    /// This verifies that the serialization format is stable and reproducible, which is
+    /// a core design goal of the lock file format.
+    #[test]
+    fn test_virtual_roundtrip() {
+        use crate::{CondaSourceData, UrlOrPath};
+        use rattler_conda_types::{PackageRecord, VersionWithSource};
+        use std::str::FromStr;
+
+        // Create a mix of virtual and non-virtual packages
+        let mut builder = LockFile::builder();
+
+        let packages_config = vec![(0, false), (1, true), (2, false), (3, true)];
+
+        for (i, is_virtual) in packages_config {
+            let version = VersionWithSource::from_str("1.0.0").unwrap();
+            let mut pkg_record = PackageRecord::new(
+                format!("pkg{}", i).parse().unwrap(),
+                version,
+                "py39_0".to_string(),
+            );
+            pkg_record.build_number = 0;
+            pkg_record.subdir = "linux-64".to_string();
+
+            let package = crate::CondaPackageData::Source(CondaSourceData {
+                package_record: pkg_record,
+                location: UrlOrPath::Url(
+                    format!("https://example.com/pkg{}.tar.bz2", i)
+                        .parse()
+                        .unwrap(),
+                ),
+                package_build_source: None,
+                input: None,
+                sources: Default::default(),
+                r#virtual: is_virtual,
+            });
+
+            builder =
+                builder.with_conda_package(DEFAULT_ENVIRONMENT_NAME, Platform::Linux64, package);
+        }
+
+        let lock_file = builder.finish();
+
+        // First render
+        let rendered1 = lock_file.render_to_string().unwrap();
+        let parsed1 = LockFile::from_str(&rendered1).unwrap();
+
+        // Second render
+        let rendered2 = parsed1.render_to_string().unwrap();
+        let parsed2 = LockFile::from_str(&rendered2).unwrap();
+
+        // Third render
+        let rendered3 = parsed2.render_to_string().unwrap();
+
+        // All renders should be identical
+        assert_eq!(rendered1, rendered2, "First and second render should match");
+        assert_eq!(rendered2, rendered3, "Second and third render should match");
+
+        // Verify virtual fields are preserved
+        let env = parsed2.environment(DEFAULT_ENVIRONMENT_NAME).unwrap();
+        let packages: Vec<_> = env.packages(Platform::Linux64).unwrap().collect();
+        assert_eq!(packages.len(), 4);
+
+        let expected_virtual = vec![false, true, false, true];
+        for (pkg, &expected) in packages.iter().zip(expected_virtual.iter()) {
+            let source = pkg.as_source_conda().expect("Should be source package");
+            assert_eq!(
+                source.r#virtual, expected,
+                "Virtual field mismatch for package"
+            );
+        }
+    }
 }

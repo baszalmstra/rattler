@@ -123,6 +123,14 @@ pub(crate) struct CondaPackageDataModel<'a> {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_site_packages_path: Cow<'a, Option<String>>,
+
+    #[serde(default, skip_serializing_if = "is_false", rename = "virtual")]
+    pub r#virtual: bool,
+}
+
+/// Helper function for serde to skip serializing false boolean values
+fn is_false(val: &bool) -> bool {
+    !*val
 }
 
 #[serde_as]
@@ -234,6 +242,7 @@ impl<'a> TryFrom<CondaPackageDataModel<'a>> for CondaPackageData {
                     globs: input.globs.into_owned(),
                 }),
                 sources: value.sources,
+                r#virtual: value.r#virtual,
             }))
         }
     }
@@ -259,6 +268,7 @@ impl<'a> From<&'a CondaPackageData> for CondaPackageDataModel<'a> {
         let sources = value
             .as_source()
             .map_or_else(BTreeMap::new, |source| source.sources.clone());
+        let virtual_value = value.as_source().map_or(false, |source| source.r#virtual);
 
         let normalized_channel = channel
             .map(|channel| strip_trailing_slash(channel.as_ref()))
@@ -306,6 +316,7 @@ impl<'a> From<&'a CondaPackageData> for CondaPackageDataModel<'a> {
             }),
             package_build_source: package_build_source.cloned(),
             sources,
+            r#virtual: virtual_value,
         }
     }
 }

@@ -221,6 +221,11 @@ pub struct CondaSourceData {
     /// Information about packages that should be built from source instead of binary.
     /// This maps from a normalized package name to location of the source.
     pub sources: BTreeMap<String, SourceLocation>,
+
+    /// If true, only the dependencies of this package will be installed, not the package itself.
+    /// This is useful for development dependencies where you want the dependencies but not the
+    /// package (e.g., because you're building it locally).
+    pub r#virtual: bool,
 }
 
 impl From<CondaSourceData> for CondaPackageData {
@@ -244,6 +249,7 @@ impl CondaSourceData {
                 return Cow::Owned(Self {
                     package_record: package_record_merge.into_owned(),
                     package_build_source: package_build_source_merge.into_owned(),
+                    r#virtual: self.r#virtual, // Preserve the virtual field
                     ..self.clone()
                 });
             }

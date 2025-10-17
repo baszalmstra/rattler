@@ -133,6 +133,7 @@ struct UniqueCondaIdentifier {
     version: Version,
     build: String,
     subdir: String,
+    r#virtual: bool,
 }
 
 impl<'a> From<&'a CondaPackageData> for UniqueCondaIdentifier {
@@ -143,6 +144,7 @@ impl<'a> From<&'a CondaPackageData> for UniqueCondaIdentifier {
             version: value.record().version.version().clone(),
             build: value.record().build.clone(),
             subdir: value.record().subdir.clone(),
+            r#virtual: value.as_source().map_or(false, |s| s.r#virtual),
         }
     }
 }

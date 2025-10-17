@@ -63,6 +63,7 @@ impl<'a> SerializableEnvironment<'a> {
                                 SerializablePackageSelector::from_lock_file(
                                     inner,
                                     package_data,
+                                    *platform,
                                     used_conda_packages,
                                     used_pypi_packages,
                                 )
@@ -106,6 +107,8 @@ enum SerializablePackageSelector<'a> {
         build: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         subdir: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "virtual")]
+        virtual_field: Option<bool>,
     },
     Pypi {
         pypi: &'a UrlOrPath,
@@ -120,11 +123,18 @@ enum CondaDisambiguityFilter {
     Version,
     Build,
     Subdir,
+    Virtual,
 }
 
 impl CondaDisambiguityFilter {
-    fn all() -> [CondaDisambiguityFilter; 4] {
-        [Self::Name, Self::Version, Self::Build, Self::Subdir]
+    fn all() -> [CondaDisambiguityFilter; 5] {
+        [
+            Self::Name,
+            Self::Version,
+            Self::Build,
+            Self::Subdir,
+            Self::Virtual,
+        ]
     }
 
     fn filter(&self, package: &CondaPackageData, other: &CondaPackageData) -> bool {
@@ -133,6 +143,11 @@ impl CondaDisambiguityFilter {
             Self::Version => package.record().version == other.record().version,
             Self::Build => package.record().build == other.record().build,
             Self::Subdir => package.record().subdir == other.record().subdir,
+            Self::Virtual => {
+                let pkg_virtual = package.as_source().map_or(false, |s| s.r#virtual);
+                let other_virtual = other.as_source().map_or(false, |s| s.r#virtual);
+                pkg_virtual == other_virtual
+            }
         }
     }
 }
@@ -141,13 +156,17 @@ impl<'a> SerializablePackageSelector<'a> {
     fn from_lock_file(
         inner: &'a LockFileInner,
         package: EnvironmentPackageData,
+        platform: Platform,
         used_conda_packages: &HashSet<usize>,
         used_pypi_packages: &HashSet<usize>,
     ) -> Self {
         match package {
-            EnvironmentPackageData::Conda(idx) => {
-                Self::from_conda(inner, &inner.conda_packages[idx], used_conda_packages)
-            }
+            EnvironmentPackageData::Conda(idx) => Self::from_conda(
+                inner,
+                &inner.conda_packages[idx],
+                platform,
+                used_conda_packages,
+            ),
             EnvironmentPackageData::Pypi(pkg_data_idx, env_data_idx) => Self::from_pypi(
                 inner,
                 &inner.pypi_packages[pkg_data_idx],
@@ -160,6 +179,7 @@ impl<'a> SerializablePackageSelector<'a> {
     fn from_conda(
         inner: &'a LockFileInner,
         package: &'a CondaPackageData,
+        platform: Platform,
         used_conda_packages: &HashSet<usize>,
     ) -> Self {
         // Find all packages that share the same location
@@ -177,6 +197,7 @@ impl<'a> SerializablePackageSelector<'a> {
         let mut version = None;
         let mut build = None;
         let mut subdir = None;
+        let mut virtual_field = None;
         while similar_packages.len() > 1 {
             let (filter, similar) = CondaDisambiguityFilter::all()
                 .into_iter()
@@ -212,6 +233,12 @@ impl<'a> SerializablePackageSelector<'a> {
                 CondaDisambiguityFilter::Subdir => {
                     subdir = Some(package.record().subdir.as_str());
                 }
+                CondaDisambiguityFilter::Virtual => {
+                    let is_virtual = package.as_source().map_or(false, |s| s.r#virtual);
+                    if is_virtual {
+                        virtual_field = Some(true);
+                    }
+                }
             }
         }
 
@@ -221,6 +248,7 @@ impl<'a> SerializablePackageSelector<'a> {
             version,
             build,
             subdir,
+            virtual_field,
         }
     }
 
@@ -267,6 +295,7 @@ impl Ord for SerializablePackageSelector<'_> {
                     build: build_a,
                     version: version_a,
                     subdir: subdir_a,
+                    virtual_field: virtual_a,
                 },
                 SerializablePackageSelector::Conda {
                     conda: b,
@@ -274,12 +303,14 @@ impl Ord for SerializablePackageSelector<'_> {
                     build: build_b,
                     version: version_b,
                     subdir: subdir_b,
+                    virtual_field: virtual_b,
                 },
             ) => compare_url_by_location(a, b)
                 .then_with(|| name_a.cmp(name_b))
                 .then_with(|| version_a.cmp(version_b))
                 .then_with(|| build_a.cmp(build_b))
-                .then_with(|| subdir_a.cmp(subdir_b)),
+                .then_with(|| subdir_a.cmp(subdir_b))
+                .then_with(|| virtual_a.cmp(virtual_b)),
             (
                 SerializablePackageSelector::Pypi { pypi: a, .. },
                 SerializablePackageSelector::Pypi { pypi: b, .. },
