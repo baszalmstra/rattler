@@ -38,6 +38,31 @@ mod cache_key;
 mod cache_lock;
 mod reporter;
 
+/// The prefix used for temporary extraction directories.
+/// This prefix is chosen to be unlikely to conflict with normal package names
+/// while being clearly identifiable as a temporary directory.
+const TEMP_DIR_PREFIX: &str = "~";
+
+/// Generates the path for a temporary extraction directory.
+///
+/// Given a destination path like `/cache/python-3.11.0-hcf16a7b_0_cpython/`,
+/// this returns `/cache/~python-3.11.0-hcf16a7b_0_cpython/`.
+///
+/// The temporary directory is placed in the same parent directory as the
+/// destination to ensure that the rename operation can be atomic (same filesystem).
+fn get_temp_dir_path(destination: &Path) -> PathBuf {
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    let file_name = destination
+        .file_name()
+        .map(|name| {
+            let mut temp_name = std::ffi::OsString::from(TEMP_DIR_PREFIX);
+            temp_name.push(name);
+            temp_name
+        })
+        .unwrap_or_else(|| std::ffi::OsString::from(TEMP_DIR_PREFIX));
+    parent.join(file_name)
+}
+
 /// A [`PackageCache`] manages a cache of extracted Conda packages on disk.
 ///
 /// The store does not provide an implementation to get the data into the store.
@@ -693,20 +718,75 @@ where
             .write_revision_and_sha(new_revision, given_sha)
             .await?;
 
-        // Fetch the package.
-        fetch_fn(path.clone())
-            .await
-            .map_err(|e| PackageCacheLayerError::FetchError(Arc::new(e)))?;
+        // Generate a temporary directory path for safe extraction.
+        // We extract to a temp directory first, then rename it to the final
+        // destination on success. This ensures that if extraction fails partway
+        // through, we don't end up with a partially extracted package.
+        let temp_dir = get_temp_dir_path(&path);
 
-        // After fetching, return the cache metadata with the new revision.
-        // We don't need to re-validate since we just fetched it.
-        Ok(CacheMetadata {
-            revision: new_revision,
-            sha256: given_sha.copied(),
-            path,
-            index_json: None,
-            paths_json: None,
-        })
+        // Clean up any existing temp directory from a previous failed extraction
+        if temp_dir.exists() {
+            tokio_fs::remove_dir_all(&temp_dir).await.map_err(|e| {
+                PackageCacheLayerError::LockError(
+                    format!(
+                        "failed to remove existing temp directory: '{}'",
+                        temp_dir.display()
+                    ),
+                    e,
+                )
+            })?;
+        }
+
+        // Fetch the package to the temporary directory.
+        let fetch_result = fetch_fn(temp_dir.clone()).await;
+
+        match fetch_result {
+            Ok(()) => {
+                // Remove the destination directory if it exists
+                if path.exists() {
+                    tokio_fs::remove_dir_all(&path).await.map_err(|e| {
+                        // Clean up temp directory on failure
+                        let _ = std::fs::remove_dir_all(&temp_dir);
+                        PackageCacheLayerError::LockError(
+                            format!(
+                                "failed to remove existing destination directory: '{}'",
+                                path.display()
+                            ),
+                            e,
+                        )
+                    })?;
+                }
+
+                // Atomically rename the temp directory to the final destination
+                tokio_fs::rename(&temp_dir, &path).await.map_err(|e| {
+                    // Clean up temp directory on failure
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    PackageCacheLayerError::LockError(
+                        format!(
+                            "failed to rename temp directory '{}' to destination '{}'",
+                            temp_dir.display(),
+                            path.display()
+                        ),
+                        e,
+                    )
+                })?;
+
+                // After fetching, return the cache metadata with the new revision.
+                // We don't need to re-validate since we just fetched it.
+                Ok(CacheMetadata {
+                    revision: new_revision,
+                    sha256: given_sha.copied(),
+                    path,
+                    index_json: None,
+                    paths_json: None,
+                })
+            }
+            Err(e) => {
+                // Clean up the temp directory on failure
+                let _ = tokio_fs::remove_dir_all(&temp_dir).await;
+                Err(PackageCacheLayerError::FetchError(Arc::new(e)))
+            }
+        }
     } else {
         Err(PackageCacheLayerError::InvalidPackage)
     }
