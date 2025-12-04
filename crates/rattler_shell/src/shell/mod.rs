@@ -1290,4 +1290,260 @@ mod tests {
 
         assert_eq!(parsed_env, expected_env);
     }
+
+    /// Test demonstrating the double-escaping issue reported in
+    /// https://github.com/prefix-dev/pixi/issues/5054
+    ///
+    /// When a JSON string with escaped quotes like `{"a": "b\"c"}` is passed
+    /// through shell escaping twice, the backslashes get doubled incorrectly.
+    #[test]
+    fn test_backslash_double_escaping_issue() {
+        // This is the JSON string from the bug report: {"a": "b\"c"}
+        // It contains a backslash-quote sequence that needs proper escaping
+        let json_with_escaped_quote = r#"{"a": "b\"c"}"#;
+
+        // Verify the input has exactly 1 backslash
+        assert_eq!(
+            json_with_escaped_quote.chars().filter(|&c| c == '\\').count(),
+            1,
+            "Input should have exactly 1 backslash"
+        );
+
+        // When we set this as an environment variable, shlex::try_quote is used
+        let mut script = ShellScript::new(Bash, Platform::Linux64);
+        script.set_env_var("JSON_VAR", json_with_escaped_quote).unwrap();
+
+        // The generated script should have the value properly escaped for shell
+        // shlex::try_quote produces: "{\"a\": \"b\\\"c\"}"
+        // This is correct - when bash interprets this, it produces the original string
+        let contents = &script.contents;
+        assert!(
+            contents.contains(r#""{\"a\": \"b\\\"c\"}""#),
+            "Script should contain properly escaped JSON. Got: {}",
+            contents
+        );
+
+        // Now demonstrate what happens with DOUBLE escaping (the bug)
+        // If someone were to take the shlex output and escape it again...
+        let first_escape = shlex::try_quote(json_with_escaped_quote).unwrap();
+        let double_escaped = shlex::try_quote(&first_escape).unwrap();
+
+        // Count backslashes to show the doubling effect
+        let first_escape_backslashes = first_escape.chars().filter(|&c| c == '\\').count();
+        let double_escaped_backslashes = double_escaped.chars().filter(|&c| c == '\\').count();
+
+        // First escape: 1 backslash becomes multiple (for shell escaping) - this is correct
+        // Double escape: backslashes are escaped again, roughly tripling
+        assert!(
+            double_escaped_backslashes > first_escape_backslashes,
+            "Double escaping should increase backslash count. First: {}, Double: {}",
+            first_escape_backslashes,
+            double_escaped_backslashes
+        );
+
+        // The bug manifests when the double-escaped value is used
+        // Instead of {"a": "b\"c"}, the shell would see {"a": "b\\"c"} (extra backslash)
+        println!("Original:       {}", json_with_escaped_quote);
+        println!("First escape:   {}", first_escape);
+        println!("Double escaped: {}", double_escaped);
+    }
+
+    /// Test that verifies the actual shell behavior with escaped JSON
+    /// This test requires bash to be available
+    #[test]
+    #[cfg(unix)]
+    fn test_json_escaping_actual_shell_execution() {
+        use std::process::Command;
+
+        // The JSON string: {"a": "b\"c"}
+        let json_input = r#"{"a": "b\"c"}"#;
+
+        // Create a script that sets the env var and echoes it back
+        let mut script = ShellScript::new(Bash, Platform::Linux64);
+        script.set_env_var("TEST_JSON", json_input).unwrap();
+
+        // Add a command to print the value
+        let script_content = format!(
+            "{}\nprintf '%s' \"$TEST_JSON\"",
+            script.contents().unwrap()
+        );
+
+        // Execute the script and capture output
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&script_content)
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            // The output should exactly match the original input
+            assert_eq!(
+                stdout, json_input,
+                "Shell should preserve the original JSON string.\nExpected: {}\nGot: {}",
+                json_input, stdout
+            );
+        } else {
+            // Skip test if bash is not available
+            println!("Skipping test: bash not available");
+        }
+    }
+
+    /// Test showing the difference between values with and without $ (different code paths)
+    #[test]
+    fn test_dollar_sign_affects_escaping_path() {
+        // Value WITHOUT $ - uses shlex::try_quote (escapes backslashes)
+        let value_no_dollar = r#"a\b"#;
+        let mut script1 = ShellScript::new(Bash, Platform::Linux64);
+        script1.set_env_var("NO_DOLLAR", value_no_dollar).unwrap();
+
+        // Value WITH $ - uses double quotes and only escapes quotes (NOT backslashes)
+        let value_with_dollar = r#"$HOME\path"#;
+        let mut script2 = ShellScript::new(Bash, Platform::Linux64);
+        script2.set_env_var("WITH_DOLLAR", value_with_dollar).unwrap();
+
+        // The no-dollar path uses shlex quoting
+        assert!(
+            script1.contents.contains(r#""a\\b""#),
+            "Value without $ should have escaped backslash via shlex. Got: {}",
+            script1.contents
+        );
+
+        // The with-dollar path preserves $ for expansion but doesn't escape backslashes
+        assert!(
+            script2.contents.contains(r#""$HOME\path""#),
+            "Value with $ should preserve backslash for variable expansion. Got: {}",
+            script2.contents
+        );
+    }
+
+    /// Test simulating the pixi run scenario using run_command.
+    ///
+    /// run_command doesn't escape arguments - it just joins them with spaces.
+    /// This means the caller is responsible for proper quoting.
+    ///
+    /// Related to: https://github.com/prefix-dev/pixi/issues/5054
+    #[test]
+    #[cfg(unix)]
+    fn test_run_command_with_special_characters() {
+        use std::process::Command;
+
+        // The JSON argument that a user might pass: {"a": "b\"c"}
+        let json_arg = r#"{"a": "b\"c"}"#;
+
+        // Test 1: run_command without any quoting (BROKEN - shell will misparse)
+        let mut script1 = ShellScript::new(Bash, Platform::Linux64);
+        Bash.run_command(
+            &mut script1.contents,
+            ["python3", "-c", "import sys; print(sys.argv[1])", json_arg],
+        )
+        .unwrap();
+
+        println!("=== Script without quoting ===");
+        println!("{}", script1.contents);
+        // This script won't work correctly because the JSON contains special chars
+
+        // Test 2: run_command with ALL arguments properly quoted (CORRECT)
+        let quoted_arg = shlex::try_quote(json_arg).unwrap();
+        let quoted_code = shlex::try_quote("import sys; print(sys.argv[1])").unwrap();
+        let mut script2 = ShellScript::new(Bash, Platform::Linux64);
+        Bash.run_command(
+            &mut script2.contents,
+            ["python3", "-c", &quoted_code, &quoted_arg],
+        )
+        .unwrap();
+
+        println!("=== Script with proper quoting ===");
+        println!("{}", script2.contents);
+
+        // Execute the properly quoted script
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&script2.contents)
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert_eq!(
+                stdout, json_arg,
+                "run_command with pre-quoted args should work.\nScript:\n{}",
+                script2.contents
+            );
+        }
+
+        // Test 3: If someone quotes the JSON argument TWICE (BUG scenario)
+        let double_quoted = shlex::try_quote(&quoted_arg).unwrap();
+        let mut script3 = ShellScript::new(Bash, Platform::Linux64);
+        Bash.run_command(
+            &mut script3.contents,
+            ["python3", "-c", &quoted_code, &double_quoted],
+        )
+        .unwrap();
+
+        println!("=== Script with DOUBLE quoting (BUG) ===");
+        println!("{}", script3.contents);
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&script3.contents)
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Double quoting causes the wrong value to be received
+            assert_ne!(
+                stdout, json_arg,
+                "Double quoting should produce wrong result"
+            );
+            println!("Original: {}", json_arg);
+            println!("Got:      {}", stdout);
+        }
+    }
+
+    /// Test that demonstrates the issue when bash -c is used with an already-quoted command
+    /// This is a potential source of double-escaping if not handled carefully.
+    #[test]
+    #[cfg(unix)]
+    fn test_bash_c_double_interpretation() {
+        use std::process::Command;
+
+        let json_arg = r#"{"a": "b\"c"}"#;
+
+        // When using bash -c, the command string is interpreted by bash
+        // If we then pass it to another bash -c, we get double interpretation
+
+        // Correct: single bash -c with properly quoted argument
+        let quoted = shlex::try_quote(json_arg).unwrap();
+        let cmd = format!("python3 -c 'import sys; print(sys.argv[1])' {}", quoted);
+
+        let output = Command::new("bash").arg("-c").arg(&cmd).output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert_eq!(stdout, json_arg, "Single bash -c should work");
+        }
+
+        // Problematic: if the command string itself is quoted for another shell layer
+        // This can happen if pixi builds a command string and then passes it through
+        // another shell interpretation layer
+        let cmd_quoted_for_outer_shell = shlex::try_quote(&cmd).unwrap();
+
+        // Now if we use this in another bash -c context:
+        let outer_cmd = format!("bash -c {}", cmd_quoted_for_outer_shell);
+
+        println!("=== Nested bash -c command ===");
+        println!("{}", outer_cmd);
+
+        let output = Command::new("bash").arg("-c").arg(&outer_cmd).output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // This should still work because we properly quoted for the outer shell
+            assert_eq!(
+                stdout, json_arg,
+                "Properly nested bash -c should work.\nCommand: {}",
+                outer_cmd
+            );
+        }
+    }
 }
