@@ -1546,4 +1546,102 @@ mod tests {
             );
         }
     }
+
+    /// This test demonstrates the EXACT bug pattern from pixi#5054:
+    ///
+    /// The bug occurs when:
+    /// 1. Arguments are quoted with shlex (e.g., `{"a": "b\"c"}` → `"{\"a\": \"b\\\"c\"}"`)
+    /// 2. The quoted string is passed as a positional argument ($1) or environment variable
+    /// 3. The receiving script uses it literally (e.g., `"$1"`)
+    /// 4. The shell expands $1 to the LITERAL quoted string, not interpreting the quotes
+    ///
+    /// The result is that the subprocess receives the shlex-quoted representation
+    /// instead of the original value.
+    ///
+    /// Related to: https://github.com/prefix-dev/pixi/issues/5054
+    #[test]
+    #[cfg(unix)]
+    fn test_pixi_run_double_escape_root_cause() {
+        use std::process::Command;
+
+        let json_arg = r#"{"a": "b\"c"}"#;
+        let shlex_quoted = shlex::try_quote(json_arg).unwrap();
+
+        println!("Original value: {}", json_arg);
+        println!("After shlex:    {}", shlex_quoted);
+
+        // CORRECT: Pass raw argument directly via Command::arg()
+        // No shell interpretation, argument goes directly to subprocess
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg("import sys; print(sys.argv[1])")
+            .arg(json_arg)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("\n=== CORRECT: Direct arg passing ===");
+        println!("Result: {}", stdout);
+        assert_eq!(stdout, json_arg, "Direct arg passing should work");
+
+        // CORRECT: Embed shlex-quoted arg in shell script, let bash interpret it
+        // The quotes are part of the script syntax, bash interprets them
+        let script = format!(
+            "python3 -c 'import sys; print(sys.argv[1])' {}",
+            shlex_quoted
+        );
+        let output = Command::new("bash").arg("-c").arg(&script).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("\n=== CORRECT: Shlex-quoted in script, bash interprets ===");
+        println!("Script: {}", script);
+        println!("Result: {}", stdout);
+        assert_eq!(stdout, json_arg, "Embedded shlex-quoted should work");
+
+        // BUG: Pass shlex-quoted string as a positional argument to be used literally
+        // The shlex output is passed as $1, which bash expands literally
+        // Python receives the quoted string, not the original value!
+        let wrapper_script = r#"python3 -c 'import sys; print(sys.argv[1])' "$1""#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(wrapper_script)
+            .arg("_") // $0
+            .arg(&*shlex_quoted) // $1 - the shlex-quoted string!
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("\n=== BUG: Shlex-quoted passed as $1, used literally ===");
+        println!("Wrapper: {}", wrapper_script);
+        println!("$1 value: {}", shlex_quoted);
+        println!("Result: {}", stdout);
+
+        // The bug: stdout contains the shlex-quoted string, not the original!
+        // Expected: {"a": "b\"c"}
+        // Actual:   "{\"a\": \"b\\\"c\"}" (the shlex output itself)
+        assert_ne!(
+            stdout, json_arg,
+            "BUG: shlex-quoted passed as literal should NOT match original"
+        );
+        assert_eq!(
+            stdout,
+            &*shlex_quoted,
+            "BUG: subprocess receives the shlex-quoted string literally"
+        );
+
+        println!("\n=== BUG DEMONSTRATED ===");
+        println!("Expected: {}", json_arg);
+        println!("Got:      {}", stdout);
+        println!("The shlex-quoted string was passed literally, not interpreted!");
+
+        // CORRECT FIX: Pass raw argument via $1, not the shlex-quoted version
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(wrapper_script)
+            .arg("_")
+            .arg(json_arg) // Pass raw value, not shlex-quoted
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("\n=== CORRECT FIX: Pass raw value as $1 ===");
+        println!("Result: {}", stdout);
+        assert_eq!(stdout, json_arg, "Raw value as $1 should work");
+    }
 }
