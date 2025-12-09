@@ -95,6 +95,30 @@ impl ShardedSubdir {
                 ))
             })?;
 
+        // Check if the shards_base_url is on a different host than the channel.
+        // If so, we should not use sharded repodata because when a user has configured
+        // mirrors, requests to a different host won't be mirrored and may fail.
+        // See: https://github.com/prefix-dev/pixi/issues/5092
+        if shards_base_url.host() != index_base_url.host() {
+            tracing::info!(
+                "shards_base_url ({}) is on a different host than the channel ({}), \
+                 falling back to repodata.json to ensure mirror compatibility",
+                shards_base_url.host_str().unwrap_or("unknown"),
+                index_base_url.host_str().unwrap_or("unknown")
+            );
+            return Err(GatewayError::SubdirNotFoundError(Box::new(
+                SubdirNotFoundError {
+                    channel: channel.clone(),
+                    subdir,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "shards hosted on different domain than channel",
+                    )
+                    .into(),
+                },
+            )));
+        }
+
         // Determine the cache directory and make sure it exists.
         let cache_dir = cache_dir.join("shards-v1");
         tokio_fs::create_dir_all(&cache_dir)
