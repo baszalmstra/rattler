@@ -56,7 +56,11 @@
     },
     "legacy_bz2_md5": {
       "description": "A deprecated md5 hash",
-      "type": "string"
+      "allOf": [
+        {
+          "$ref": "#/definitions/Md5Hash"
+        }
+      ]
     },
     "legacy_bz2_size": {
       "description": "A deprecated package archive size.",
@@ -74,7 +78,11 @@
     },
     "md5": {
       "description": "Optionally a MD5 hash of the package archive",
-      "type": "string"
+      "allOf": [
+        {
+          "$ref": "#/definitions/Md5Hash"
+        }
+      ]
     },
     "name": {
       "description": "The name of the package",
@@ -118,7 +126,11 @@
     },
     "sha256": {
       "description": "Optionally a SHA256 hash of the package archive",
-      "type": "string"
+      "allOf": [
+        {
+          "$ref": "#/definitions/Sha256Hash"
+        }
+      ]
     },
     "size": {
       "description": "Optionally the size of the package archive in bytes",
@@ -150,12 +162,18 @@
       "description": "The version of the package",
       "allOf": [
         {
-          "$ref": "#/definitions/VersionWithSource"
+          "$ref": "#/definitions/Version"
         }
       ]
     }
   },
   "definitions": {
+    "Md5Hash": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
     "NoArchType": {
       "oneOf": [
         {
@@ -216,10 +234,16 @@
         }
       }
     },
+    "Sha256Hash": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "TimestampMs": {
       "type": "integer"
     },
-    "VersionWithSource": {
+    "Version": {
       "type": "string",
       "minLength": 1
     }

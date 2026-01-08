@@ -15,6 +15,13 @@ use std::borrow::Cow;
 use std::fmt::LowerHex;
 use std::ops::Deref;
 
+#[cfg(feature = "schemars")]
+use schemars::{
+    gen::SchemaGenerator,
+    schema::{InstanceType, Schema, SchemaObject, StringValidation},
+    JsonSchema,
+};
+
 /// Deserialize the [`Output`] of a [`Digest`].
 ///
 /// If the deserializer is human-readable, it will parse the digest from a hex
@@ -178,6 +185,35 @@ impl<'de, T: Digest + Default> DeserializeAs<'de, Output<T>> for SerializableHas
         D: Deserializer<'de>,
     {
         deserialize::<D, T>(deserializer)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl<T: Digest> JsonSchema for SerializableHash<T> {
+    fn schema_name() -> String {
+        // Use the digest output size to determine the hash type name
+        let output_size = <T as OutputSizeUser>::output_size();
+        match output_size {
+            16 => "Md5Hash".to_string(),
+            32 => "Sha256Hash".to_string(),
+            _ => format!("Hash{}", output_size * 2),
+        }
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        let output_size = <T as OutputSizeUser>::output_size();
+        let hex_length = (output_size * 2) as u32;
+
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                // Pattern matches lowercase hex string of exact length
+                pattern: Some(format!("^[0-9a-f]{{{}}}$", hex_length)),
+                min_length: Some(hex_length),
+                max_length: Some(hex_length),
+            })),
+            ..Default::default()
+        })
     }
 }
 

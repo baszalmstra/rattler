@@ -133,7 +133,7 @@ pub struct PackageRecord {
 
     /// A deprecated md5 hash
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<SerializableHash<rattler_digest::Md5>>"))]
     pub legacy_bz2_md5: Option<Md5Hash>,
 
     /// A deprecated package archive size.
@@ -147,7 +147,7 @@ pub struct PackageRecord {
 
     /// Optionally a MD5 hash of the package archive
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<SerializableHash<rattler_digest::Md5>>"))]
     pub md5: Option<Md5Hash>,
 
     /// The name of the package
@@ -190,7 +190,7 @@ pub struct PackageRecord {
 
     /// Optionally a SHA256 hash of the package archive
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<SerializableHash<rattler_digest::Sha256>>"))]
     pub sha256: Option<Sha256Hash>,
 
     /// Optionally the size of the package archive in bytes

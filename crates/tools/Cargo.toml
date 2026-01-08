@@ -18,7 +18,7 @@ url = { workspace = true }
 fslock = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
-rattler_digest = { path = "../rattler_digest" }
+rattler_digest = { path = "../rattler_digest", features = ["schemars"] }
 rattler_conda_types = { path = "../rattler_conda_types", features = ["schemars"] }
 reqwest = { workspace = true, default-features = false, features = [
   "blocking",

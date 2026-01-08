@@ -176,7 +176,7 @@ impl<'de> Deserialize<'de> for VersionWithSource {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for VersionWithSource {
     fn schema_name() -> String {
-        "VersionWithSource".to_string()
+        "Version".to_string()
     }
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {

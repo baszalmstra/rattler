@@ -105,6 +105,7 @@ pub fn generate(mode: Mode) -> anyhow::Result<()> {
         package::RunExportsJson, utils::TimestampMs, Arch, NoArchType, PackageName, PackageRecord,
         Platform, VersionWithSource,
     };
+    use rattler_digest::serde::SerializableHash;
 
     generate_schemas!(
         mode,
@@ -112,9 +113,11 @@ pub fn generate(mode: Mode) -> anyhow::Result<()> {
         Arch => "Arch",
         NoArchType => "NoArchType",
         PackageName => "PackageName",
-        VersionWithSource => "VersionWithSource",
+        VersionWithSource => "Version",
         TimestampMs => "TimestampMs",
         RunExportsJson => "RunExportsJson",
+        SerializableHash<rattler_digest::Md5> => "Md5Hash",
+        SerializableHash<rattler_digest::Sha256> => "Sha256Hash",
         PackageRecord => "PackageRecord",
     )
 }

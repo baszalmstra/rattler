@@ -12,6 +12,7 @@ readme.workspace = true
 
 [features]
 default = ["rayon"]
+schemars = ["dep:schemars", "rattler_digest/schemars"]
 
 [package.metadata.docs.rs]
 all-features = true
