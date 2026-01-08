@@ -12,6 +12,7 @@ use super::PackageFile;
 #[serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Default, Deserialize, Serialize, Eq, PartialEq, Hash, Clone)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RunExportsJson {
     /// weak run exports apply a dependency from host to run
     #[serde(skip_serializing_if = "Vec::is_empty", default)]

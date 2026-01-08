@@ -92,6 +92,7 @@ pub trait RecordFromPath {
 #[skip_serializing_none]
 #[sorted]
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq, Clone, Hash)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PackageRecord {
     /// Optionally the architecture the package supports. This is almost
     /// always the second part of the `subdir` string. Except for `64` which
@@ -132,6 +133,7 @@ pub struct PackageRecord {
 
     /// A deprecated md5 hash
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub legacy_bz2_md5: Option<Md5Hash>,
 
     /// A deprecated package archive size.
@@ -145,6 +147,7 @@ pub struct PackageRecord {
 
     /// Optionally a MD5 hash of the package archive
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub md5: Option<Md5Hash>,
 
     /// The name of the package
@@ -173,6 +176,7 @@ pub struct PackageRecord {
     /// one. [`Some([`PackageUrl`])`] means that it is a pypi package.
     /// See this CEP: <https://github.com/conda/ceps/pull/63>
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<BTreeSet<String>>"))]
     pub purls: Option<BTreeSet<PackageUrl>>,
 
     /// Optionally a path within the environment of the site-packages directory.
@@ -186,6 +190,7 @@ pub struct PackageRecord {
 
     /// Optionally a SHA256 hash of the package archive
     #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub sha256: Option<Sha256Hash>,
 
     /// Optionally the size of the package archive in bytes
@@ -203,6 +208,7 @@ pub struct PackageRecord {
     /// by the number of track_features.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde_as(as = "crate::utils::serde::Features")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Vec<String>"))]
     pub track_features: Vec<String>,
 
     /// The version of the package

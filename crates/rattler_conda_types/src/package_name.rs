@@ -263,6 +263,28 @@ impl Borrow<str> for PackageName {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for PackageName {
+    fn schema_name() -> String {
+        "PackageName".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
+
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                // Package names can only contain alphanumeric characters, hyphens, underscores, and dots
+                pattern: Some(r"^[a-zA-Z0-9._-]+$".to_string()),
+                min_length: Some(1),
+                max_length: None,
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use rstest::rstest;

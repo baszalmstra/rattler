@@ -172,3 +172,23 @@ impl<'de> Deserialize<'de> for VersionWithSource {
         })
     }
 }
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for VersionWithSource {
+    fn schema_name() -> String {
+        "VersionWithSource".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
+
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                min_length: Some(1),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}

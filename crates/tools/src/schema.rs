@@ -3,9 +3,12 @@
 //! This module generates JSON schemas for types in rattler_conda_types that implement
 //! `schemars::JsonSchema`. The generated schemas are stored in the `schemas/` directory
 //! at the repository root.
+//!
+//! Schemas use `$ref` to reference other types, keeping each schema focused on its own
+//! type while allowing composition.
 
 use crate::{project_root, Mode};
-use schemars::{schema_for, JsonSchema};
+use schemars::JsonSchema;
 use std::fs;
 use std::path::PathBuf;
 
@@ -14,10 +17,14 @@ fn schemas_dir() -> PathBuf {
     project_root().join("schemas")
 }
 
-/// Generate a JSON schema for a type and return it as a pretty-printed string.
-fn generate_schema<T: JsonSchema>() -> String {
-    let schema = schema_for!(T);
-    serde_json::to_string_pretty(&schema).expect("failed to serialize schema")
+/// Generate a root schema for a type, including all referenced definitions.
+fn generate_root_schema<T: JsonSchema>() -> schemars::schema::RootSchema {
+    let settings = schemars::gen::SchemaSettings::draft07().with(|s| {
+        s.option_nullable = false;
+        s.option_add_null_type = false;
+    });
+    let gen = settings.into_generator();
+    gen.into_root_schema_for::<T>()
 }
 
 /// Update or verify a schema file.
@@ -64,34 +71,50 @@ fn update_schema_file(name: &str, contents: &str, mode: Mode) -> anyhow::Result<
     }
 }
 
+/// Generate and save a schema for a single type.
+fn generate_and_save_schema<T: JsonSchema>(name: &str, mode: Mode) -> anyhow::Result<()> {
+    let schema = generate_root_schema::<T>();
+    let contents =
+        serde_json::to_string_pretty(&schema).expect("failed to serialize schema") + "\n";
+    update_schema_file(name, &contents, mode)
+}
+
 /// A macro to generate schemas for multiple types.
 macro_rules! generate_schemas {
     ($mode:expr, $( $type:ty => $name:expr ),* $(,)?) => {{
         let mut errors = Vec::new();
         $(
-            let schema = generate_schema::<$type>();
-            if let Err(e) = update_schema_file($name, &schema, $mode) {
-                errors.push(e);
+            if let Err(e) = generate_and_save_schema::<$type>($name, $mode) {
+                errors.push(($name, e));
             }
         )*
         if errors.is_empty() {
             Ok(())
         } else {
-            for e in &errors {
-                eprintln!("Error: {}", e);
+            for (name, e) in &errors {
+                eprintln!("Error generating schema for {}: {}", name, e);
             }
-            anyhow::bail!("{} schema(s) failed verification", errors.len());
+            anyhow::bail!("{} schema(s) failed", errors.len());
         }
     }};
 }
 
 /// Generate or verify all JSON schemas.
 pub fn generate(mode: Mode) -> anyhow::Result<()> {
-    use rattler_conda_types::{Arch, Platform};
+    use rattler_conda_types::{
+        package::RunExportsJson, utils::TimestampMs, Arch, NoArchType, PackageName, PackageRecord,
+        Platform, VersionWithSource,
+    };
 
     generate_schemas!(
         mode,
         Platform => "Platform",
         Arch => "Arch",
+        NoArchType => "NoArchType",
+        PackageName => "PackageName",
+        VersionWithSource => "VersionWithSource",
+        TimestampMs => "TimestampMs",
+        RunExportsJson => "RunExportsJson",
+        PackageRecord => "PackageRecord",
     )
 }

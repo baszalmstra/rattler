@@ -230,6 +230,23 @@ impl Serialize for TimestampMs {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for TimestampMs {
+    fn schema_name() -> String {
+        "TimestampMs".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Schema, SchemaObject};
+
+        // TimestampMs serializes as an integer (either seconds or milliseconds since Unix epoch)
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::Integer.into()),
+            ..Default::default()
+        })
+    }
+}
+
 /// A helper struct to deserialize types from a string without checking the
 /// string.
 pub struct DeserializeFromStrUnchecked;

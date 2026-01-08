@@ -175,3 +175,42 @@ impl Serialize for NoArchType {
         }
     }
 }
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for NoArchType {
+    fn schema_name() -> String {
+        "NoArchType".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Schema, SchemaObject, SingleOrVec, SubschemaValidation};
+
+        // NoArchType can be:
+        // - false (not noarch)
+        // - true (generic v1)
+        // - "generic" (generic v2)
+        // - "python" (python noarch)
+        Schema::Object(SchemaObject {
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    // Boolean case (true or false)
+                    Schema::Object(SchemaObject {
+                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Boolean))),
+                        ..Default::default()
+                    }),
+                    // String enum case ("generic" or "python")
+                    Schema::Object(SchemaObject {
+                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+                        enum_values: Some(vec![
+                            serde_json::json!("generic"),
+                            serde_json::json!("python"),
+                        ]),
+                        ..Default::default()
+                    }),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
