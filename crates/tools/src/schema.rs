@@ -4,8 +4,8 @@
 //! `schemars::JsonSchema`. The generated schemas are stored in the `schemas/` directory
 //! at the repository root.
 //!
-//! Schemas use `$ref` to reference external schema files, keeping each schema focused
-//! on its own type while allowing composition.
+//! Each type gets its own schema file, and composite types like PackageRecord reference
+//! other schemas using external `$ref` (e.g., `"$ref": "Md5Hash.json"`).
 
 use crate::{project_root, Mode};
 use schemars::JsonSchema;
@@ -17,7 +17,7 @@ fn schemas_dir() -> PathBuf {
     project_root().join("schemas")
 }
 
-/// Generate a root schema for a type, including all referenced definitions.
+/// Generate a root schema for a type.
 fn generate_root_schema<T: JsonSchema>() -> schemars::schema::RootSchema {
     let settings = schemars::gen::SchemaSettings::draft07().with(|s| {
         s.option_nullable = false;
@@ -27,14 +27,12 @@ fn generate_root_schema<T: JsonSchema>() -> schemars::schema::RootSchema {
     gen.into_root_schema_for::<T>()
 }
 
-/// Convert internal `#/definitions/TypeName` references to external `TypeName.json` references,
+/// Convert internal `#/definitions/` references to external file references,
 /// and remove the `definitions` section from the schema.
 fn externalize_refs(schema: &mut schemars::schema::RootSchema) {
-    // Recursively update $ref in the schema
     fn update_refs(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Object(map) => {
-                // Check if this object has a $ref that points to definitions
                 if let Some(serde_json::Value::String(ref_str)) = map.get("$ref") {
                     if let Some(type_name) = ref_str.strip_prefix("#/definitions/") {
                         map.insert(
@@ -43,7 +41,6 @@ fn externalize_refs(schema: &mut schemars::schema::RootSchema) {
                         );
                     }
                 }
-                // Recurse into all values
                 for v in map.values_mut() {
                     update_refs(v);
                 }
@@ -57,18 +54,13 @@ fn externalize_refs(schema: &mut schemars::schema::RootSchema) {
         }
     }
 
-    // Convert to serde_json::Value for easier manipulation
     let mut value = serde_json::to_value(&*schema).expect("schema serialization failed");
-
-    // Update all $ref occurrences
     update_refs(&mut value);
 
-    // Remove the definitions section
     if let serde_json::Value::Object(ref mut map) = value {
         map.remove("definitions");
     }
 
-    // Convert back to RootSchema
     *schema = serde_json::from_value(value).expect("schema deserialization failed");
 }
 
@@ -78,7 +70,6 @@ fn update_schema_file(name: &str, contents: &str, mode: Mode) -> anyhow::Result<
 
     match mode {
         Mode::Overwrite => {
-            // Ensure schemas directory exists
             fs::create_dir_all(schemas_dir())?;
             let old_contents = fs::read_to_string(&path).unwrap_or_default();
             let old_contents = old_contents.replace("\r\n", "\n");
