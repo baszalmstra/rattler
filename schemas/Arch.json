@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Arch",
+  "type": "string",
+  "enum": [
+    "x86",
+    "x86_64",
+    "aarch64",
+    "arm64",
+    "armv6l",
+    "armv7l",
+    "loong64",
+    "ppc64le",
+    "ppc64",
+    "ppc",
+    "s390x",
+    "riscv32",
+    "riscv64",
+    "wasm32",
+    "z"
+  ]
+}

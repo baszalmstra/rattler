@@ -407,6 +407,31 @@ impl<'de> serde::Deserialize<'de> for Platform {
     }
 }
 
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Platform {
+    fn schema_name() -> String {
+        "Platform".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
+
+        let enum_values: Vec<serde_json::Value> =
+            Platform::iter().map(|p| serde_json::json!(p.as_str())).collect();
+
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                pattern: None,
+                max_length: None,
+                min_length: None,
+            })),
+            enum_values: Some(enum_values),
+            ..Default::default()
+        })
+    }
+}
+
 impl Arch {
     /// Returns the current arch.
     pub fn current() -> Self {
@@ -502,6 +527,31 @@ impl<'de> serde::Deserialize<'de> for Arch {
         String::deserialize(deserializer)?
             .parse()
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Arch {
+    fn schema_name() -> String {
+        "Arch".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
+
+        let enum_values: Vec<serde_json::Value> =
+            Arch::iter().map(|a| serde_json::json!(a.as_str())).collect();
+
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                pattern: None,
+                max_length: None,
+                min_length: None,
+            })),
+            enum_values: Some(enum_values),
+            ..Default::default()
+        })
     }
 }
 

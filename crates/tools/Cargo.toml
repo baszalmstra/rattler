@@ -19,9 +19,12 @@ fslock = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
 rattler_digest = { path = "../rattler_digest" }
+rattler_conda_types = { path = "../rattler_conda_types", features = ["schemars"] }
 reqwest = { workspace = true, default-features = false, features = [
   "blocking",
 ] }
+schemars = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 fs-err = { workspace = true, features = ["tokio"] }
