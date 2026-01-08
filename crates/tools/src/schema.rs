@@ -4,8 +4,8 @@
 //! `schemars::JsonSchema`. The generated schemas are stored in the `schemas/` directory
 //! at the repository root.
 //!
-//! Schemas use `$ref` to reference other types, keeping each schema focused on its own
-//! type while allowing composition.
+//! Schemas use `$ref` to reference external schema files, keeping each schema focused
+//! on its own type while allowing composition.
 
 use crate::{project_root, Mode};
 use schemars::JsonSchema;
@@ -25,6 +25,51 @@ fn generate_root_schema<T: JsonSchema>() -> schemars::schema::RootSchema {
     });
     let gen = settings.into_generator();
     gen.into_root_schema_for::<T>()
+}
+
+/// Convert internal `#/definitions/TypeName` references to external `TypeName.json` references,
+/// and remove the `definitions` section from the schema.
+fn externalize_refs(schema: &mut schemars::schema::RootSchema) {
+    // Recursively update $ref in the schema
+    fn update_refs(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                // Check if this object has a $ref that points to definitions
+                if let Some(serde_json::Value::String(ref_str)) = map.get("$ref") {
+                    if let Some(type_name) = ref_str.strip_prefix("#/definitions/") {
+                        map.insert(
+                            "$ref".to_string(),
+                            serde_json::Value::String(format!("{type_name}.json")),
+                        );
+                    }
+                }
+                // Recurse into all values
+                for v in map.values_mut() {
+                    update_refs(v);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    update_refs(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Convert to serde_json::Value for easier manipulation
+    let mut value = serde_json::to_value(&*schema).expect("schema serialization failed");
+
+    // Update all $ref occurrences
+    update_refs(&mut value);
+
+    // Remove the definitions section
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.remove("definitions");
+    }
+
+    // Convert back to RootSchema
+    *schema = serde_json::from_value(value).expect("schema deserialization failed");
 }
 
 /// Update or verify a schema file.
@@ -72,31 +117,18 @@ fn update_schema_file(name: &str, contents: &str, mode: Mode) -> anyhow::Result<
 }
 
 /// Generate and save a schema for a single type.
-fn generate_and_save_schema<T: JsonSchema>(name: &str, mode: Mode) -> anyhow::Result<()> {
-    let schema = generate_root_schema::<T>();
+fn generate_and_save_schema<T: JsonSchema>(
+    name: &str,
+    mode: Mode,
+    externalize: bool,
+) -> anyhow::Result<()> {
+    let mut schema = generate_root_schema::<T>();
+    if externalize {
+        externalize_refs(&mut schema);
+    }
     let contents =
         serde_json::to_string_pretty(&schema).expect("failed to serialize schema") + "\n";
     update_schema_file(name, &contents, mode)
-}
-
-/// A macro to generate schemas for multiple types.
-macro_rules! generate_schemas {
-    ($mode:expr, $( $type:ty => $name:expr ),* $(,)?) => {{
-        let mut errors = Vec::new();
-        $(
-            if let Err(e) = generate_and_save_schema::<$type>($name, $mode) {
-                errors.push(($name, e));
-            }
-        )*
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            for (name, e) in &errors {
-                eprintln!("Error generating schema for {}: {}", name, e);
-            }
-            anyhow::bail!("{} schema(s) failed", errors.len());
-        }
-    }};
 }
 
 /// Generate or verify all JSON schemas.
@@ -107,17 +139,49 @@ pub fn generate(mode: Mode) -> anyhow::Result<()> {
     };
     use rattler_digest::serde::SerializableHash;
 
-    generate_schemas!(
-        mode,
-        Platform => "Platform",
-        Arch => "Arch",
-        NoArchType => "NoArchType",
-        PackageName => "PackageName",
-        VersionWithSource => "Version",
-        TimestampMs => "TimestampMs",
-        RunExportsJson => "RunExportsJson",
-        SerializableHash<rattler_digest::Md5> => "Md5Hash",
-        SerializableHash<rattler_digest::Sha256> => "Sha256Hash",
-        PackageRecord => "PackageRecord",
-    )
+    let mut errors = Vec::new();
+
+    // Standalone types (no external references needed)
+    let standalone: &[(&str, fn(&str, Mode, bool) -> anyhow::Result<()>)] = &[
+        ("Platform", generate_and_save_schema::<Platform>),
+        ("Arch", generate_and_save_schema::<Arch>),
+        ("NoArchType", generate_and_save_schema::<NoArchType>),
+        ("PackageName", generate_and_save_schema::<PackageName>),
+        ("Version", generate_and_save_schema::<VersionWithSource>),
+        ("TimestampMs", generate_and_save_schema::<TimestampMs>),
+        ("RunExportsJson", generate_and_save_schema::<RunExportsJson>),
+        (
+            "Md5Hash",
+            generate_and_save_schema::<SerializableHash<rattler_digest::Md5>>,
+        ),
+        (
+            "Sha256Hash",
+            generate_and_save_schema::<SerializableHash<rattler_digest::Sha256>>,
+        ),
+    ];
+
+    for (name, gen_fn) in standalone {
+        if let Err(e) = gen_fn(name, mode, false) {
+            errors.push((*name, e));
+        }
+    }
+
+    // Composite types (convert $ref to external file references)
+    let composite: &[(&str, fn(&str, Mode, bool) -> anyhow::Result<()>)] =
+        &[("PackageRecord", generate_and_save_schema::<PackageRecord>)];
+
+    for (name, gen_fn) in composite {
+        if let Err(e) = gen_fn(name, mode, true) {
+            errors.push((*name, e));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        for (name, e) in &errors {
+            eprintln!("Error generating schema for {name}: {e}");
+        }
+        anyhow::bail!("{} schema(s) failed", errors.len());
+    }
 }

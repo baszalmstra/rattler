@@ -58,7 +58,7 @@
       "description": "A deprecated md5 hash",
       "allOf": [
         {
-          "$ref": "#/definitions/Md5Hash"
+          "$ref": "Md5Hash.json"
         }
       ]
     },
@@ -80,7 +80,7 @@
       "description": "Optionally a MD5 hash of the package archive",
       "allOf": [
         {
-          "$ref": "#/definitions/Md5Hash"
+          "$ref": "Md5Hash.json"
         }
       ]
     },
@@ -88,7 +88,7 @@
       "description": "The name of the package",
       "allOf": [
         {
-          "$ref": "#/definitions/PackageName"
+          "$ref": "PackageName.json"
         }
       ]
     },
@@ -96,7 +96,7 @@
       "description": "If this package is independent of architecture this field specifies in what way. See [`NoArchType`] for more information.",
       "allOf": [
         {
-          "$ref": "#/definitions/NoArchType"
+          "$ref": "NoArchType.json"
         }
       ]
     },
@@ -120,7 +120,7 @@
       "description": "Run exports that are specified in the package.",
       "allOf": [
         {
-          "$ref": "#/definitions/RunExportsJson"
+          "$ref": "RunExportsJson.json"
         }
       ]
     },
@@ -128,7 +128,7 @@
       "description": "Optionally a SHA256 hash of the package archive",
       "allOf": [
         {
-          "$ref": "#/definitions/Sha256Hash"
+          "$ref": "Sha256Hash.json"
         }
       ]
     },
@@ -147,7 +147,7 @@
       "description": "The date this entry was created.",
       "allOf": [
         {
-          "$ref": "#/definitions/TimestampMs"
+          "$ref": "TimestampMs.json"
         }
       ]
     },
@@ -162,90 +162,9 @@
       "description": "The version of the package",
       "allOf": [
         {
-          "$ref": "#/definitions/Version"
+          "$ref": "Version.json"
         }
       ]
-    }
-  },
-  "definitions": {
-    "Md5Hash": {
-      "type": "string",
-      "maxLength": 32,
-      "minLength": 32,
-      "pattern": "^[0-9a-f]{32}$"
-    },
-    "NoArchType": {
-      "oneOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "string",
-          "enum": [
-            "generic",
-            "python"
-          ]
-        }
-      ]
-    },
-    "PackageName": {
-      "type": "string",
-      "minLength": 1,
-      "pattern": "^[a-zA-Z0-9._-]+$"
-    },
-    "RunExportsJson": {
-      "description": "A representation of the `run_exports.json` file found in package archives.\n\nThe `run_exports.json` file contains information about the run exports of a package",
-      "type": "object",
-      "properties": {
-        "noarch": {
-          "description": "noarch run exports apply a run export only to noarch packages (other run exports are ignored) for example, python uses this to apply a dependency on python to all noarch packages, but not to the python_abi package",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "strong": {
-          "description": "strong run exports apply a dependency from build to host and run",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "strong_constrains": {
-          "description": "strong constrains apply a constrain dependency from build to host and run",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "weak": {
-          "description": "weak run exports apply a dependency from host to run",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "weak_constrains": {
-          "description": "weak constrains apply a constrain dependency from host to build, or run to host",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      }
-    },
-    "Sha256Hash": {
-      "type": "string",
-      "maxLength": 64,
-      "minLength": 64,
-      "pattern": "^[0-9a-f]{64}$"
-    },
-    "TimestampMs": {
-      "type": "integer"
-    },
-    "Version": {
-      "type": "string",
-      "minLength": 1
     }
   }
 }
