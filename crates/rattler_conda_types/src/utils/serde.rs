@@ -233,15 +233,14 @@ impl Serialize for TimestampMs {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for TimestampMs {
     fn schema_name() -> String {
-        "TimestampMs".to_string()
+        "timestamp".to_string()
     }
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Schema, SchemaObject};
-
-        // TimestampMs serializes as an integer (either seconds or milliseconds since Unix epoch)
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::Integer.into()),
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            reference: Some(
+                "https://schemas.conda.org/common-1.schema.json#/definitions/timestamp".to_string(),
+            ),
             ..Default::default()
         })
     }

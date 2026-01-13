@@ -194,26 +194,46 @@ impl<T: Digest> JsonSchema for SerializableHash<T> {
         // Use the digest output size to determine the hash type name
         let output_size = <T as OutputSizeUser>::output_size();
         match output_size {
-            16 => "Md5Hash".to_string(),
-            32 => "Sha256Hash".to_string(),
-            _ => format!("Hash{}", output_size * 2),
+            16 => "md5".to_string(),
+            32 => "sha256".to_string(),
+            _ => format!("hash{}", output_size * 2),
         }
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
         let output_size = <T as OutputSizeUser>::output_size();
-        let hex_length = (output_size * 2) as u32;
 
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                // Pattern matches lowercase hex string of exact length
-                pattern: Some(format!("^[0-9a-f]{{{}}}$", hex_length)),
-                min_length: Some(hex_length),
-                max_length: Some(hex_length),
-            })),
-            ..Default::default()
-        })
+        // Reference official conda schemas for known hash types
+        let reference = match output_size {
+            16 => Some(
+                "https://schemas.conda.org/repodata-record-1.schema.json#/properties/md5"
+                    .to_string(),
+            ),
+            32 => Some(
+                "https://schemas.conda.org/repodata-record-1.schema.json#/properties/sha256"
+                    .to_string(),
+            ),
+            _ => None,
+        };
+
+        if let Some(ref_url) = reference {
+            Schema::Object(SchemaObject {
+                reference: Some(ref_url),
+                ..Default::default()
+            })
+        } else {
+            // Fallback for unknown hash sizes
+            let hex_length = (output_size * 2) as u32;
+            Schema::Object(SchemaObject {
+                instance_type: Some(InstanceType::String.into()),
+                string: Some(Box::new(StringValidation {
+                    pattern: Some(format!("^[0-9a-f]{{{}}}$", hex_length)),
+                    min_length: Some(hex_length),
+                    max_length: Some(hex_length),
+                })),
+                ..Default::default()
+            })
+        }
     }
 }
 

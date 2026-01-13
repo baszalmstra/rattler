@@ -1,5 +1,4 @@
 pub mod libsolv_bindings;
-pub mod schema;
 mod test_files;
 
 pub use test_files::{

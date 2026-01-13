@@ -14,15 +14,12 @@ struct Args {
 enum Commands {
     /// Generate Rust bindings for libsolv
     GenLibsolvBindings,
-    /// Generate JSON schemas for rattler_conda_types
-    GenSchemas,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
         Commands::GenLibsolvBindings => tools::libsolv_bindings::generate(Overwrite)?,
-        Commands::GenSchemas => tools::schema::generate(Overwrite)?,
     }
     Ok(())
 }

@@ -176,18 +176,15 @@ impl<'de> Deserialize<'de> for VersionWithSource {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for VersionWithSource {
     fn schema_name() -> String {
-        "Version".to_string()
+        "package_version".to_string()
     }
 
     fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
-
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                min_length: Some(1),
-                ..Default::default()
-            })),
+        schemars::schema::Schema::Object(schemars::schema::SchemaObject {
+            reference: Some(
+                "https://schemas.conda.org/common-1.schema.json#/definitions/package_version"
+                    .to_string(),
+            ),
             ..Default::default()
         })
     }
