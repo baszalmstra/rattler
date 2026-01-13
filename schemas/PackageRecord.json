@@ -58,7 +58,7 @@
       "description": "A deprecated md5 hash",
       "allOf": [
         {
-          "$ref": "Md5Hash.json"
+          "$ref": "https://schemas.conda.org/repodata-record-1.schema.json#/properties/md5"
         }
       ]
     },
@@ -80,7 +80,7 @@
       "description": "Optionally a MD5 hash of the package archive",
       "allOf": [
         {
-          "$ref": "Md5Hash.json"
+          "$ref": "https://schemas.conda.org/repodata-record-1.schema.json#/properties/md5"
         }
       ]
     },
@@ -88,7 +88,7 @@
       "description": "The name of the package",
       "allOf": [
         {
-          "$ref": "PackageName.json"
+          "$ref": "https://schemas.conda.org/common-1.schema.json#/definitions/name"
         }
       ]
     },
@@ -128,7 +128,7 @@
       "description": "Optionally a SHA256 hash of the package archive",
       "allOf": [
         {
-          "$ref": "Sha256Hash.json"
+          "$ref": "https://schemas.conda.org/repodata-record-1.schema.json#/properties/sha256"
         }
       ]
     },
@@ -147,7 +147,7 @@
       "description": "The date this entry was created.",
       "allOf": [
         {
-          "$ref": "TimestampMs.json"
+          "$ref": "https://schemas.conda.org/common-1.schema.json#/definitions/timestamp"
         }
       ]
     },
@@ -162,7 +162,7 @@
       "description": "The version of the package",
       "allOf": [
         {
-          "$ref": "Version.json"
+          "$ref": "https://schemas.conda.org/common-1.schema.json#/definitions/package_version"
         }
       ]
     }
