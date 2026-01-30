@@ -32,6 +32,21 @@ impl Display for MatchSpecCondition {
     }
 }
 
+impl MatchSpecCondition {
+    /// Returns the canonical string representation following CEP rules.
+    pub fn to_canonical(&self) -> String {
+        match self {
+            MatchSpecCondition::MatchSpec(ms) => ms.to_canonical(),
+            MatchSpecCondition::And(lhs, rhs) => {
+                format!("({} and {})", lhs.to_canonical(), rhs.to_canonical())
+            }
+            MatchSpecCondition::Or(lhs, rhs) => {
+                format!("({} or {})", lhs.to_canonical(), rhs.to_canonical())
+            }
+        }
+    }
+}
+
 // Parse whitespace
 fn ws(input: &str) -> IResult<&str, &str> {
     multispace0(input)

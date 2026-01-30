@@ -1,0 +1,93 @@
+---
+source: crates/rattler_conda_types/src/match_spec/mod.rs
+assertion_line: 1423
+expression: "results.iter().map(|(input, canonical)|\nformat!(\"{input}\\n  -> {canonical}\")).collect::<Vec<_>>().join(\"\\n\")"
+---
+python
+  -> python
+python ==3.8.5
+  -> python==3.8.5
+python==3.8.5
+  -> python==3.8.5
+python 3.8.*
+  -> python=3.8
+python 3.8.5.*
+  -> python=3.8.5
+python 3.*
+  -> python=3
+python >=3.8
+  -> python>=3.8
+python >3.8
+  -> python>3.8
+python <=3.8
+  -> python<=3.8
+python <3.8
+  -> python<3.8
+python !=3.8
+  -> python!=3.8
+python >=3.8,<4.0
+  -> python>=3.8,<4.0
+python >=3.8|<3.6
+  -> python>=3.8|<3.6
+python ~=3.8
+  -> python~=3.8
+python ==3.8.5 py38_0
+  -> python==3.8.5=py38_0
+python ==3.8.5 py38*
+  -> python==3.8.5[build='py38*']
+python 3.8.* py38_0
+  -> python=3.8[build='py38_0']
+conda-forge::python
+  -> conda-forge::python
+conda-forge::python ==3.8.5
+  -> conda-forge::python==3.8.5
+conda-forge::python 3.8.*
+  -> conda-forge::python=3.8
+conda-forge/linux-64::python
+  -> conda-forge/linux-64::python
+conda-forge/linux-64::python ==3.8.5
+  -> conda-forge/linux-64::python==3.8.5
+conda-forge/linux-64::python 3.8.*
+  -> conda-forge/linux-64::python=3.8
+conda-forge/linux-64::python ==3.8.5 py38_0
+  -> conda-forge/linux-64::python==3.8.5=py38_0
+conda-forge/linux-64::python 3.8.* py38_0
+  -> conda-forge/linux-64::python=3.8[build='py38_0']
+*/linux-64::python >=3.8
+  -> python>=3.8[channel='*',subdir='linux-64']
+python[build_number=5]
+  -> python[build_number='==5']
+python[build_number=">=5"]
+  -> python[build_number='>=5']
+python[build_number=>5]
+  -> python[build_number='>5']
+python[md5=1234567890abcdef1234567890abcdef]
+  -> python[md5='1234567890abcdef1234567890abcdef']
+python[sha256=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef]
+  -> python[sha256='1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef']
+python[license=MIT]
+  -> python[license='MIT']
+python[url='https://example.com/python.tar.bz2']
+  -> python[url='https://example.com/python.tar.bz2']
+python[fn='python-3.8.5-py38_0.tar.bz2']
+  -> python[fn='python-3.8.5-py38_0.tar.bz2']
+python ==3.8.5[md5=1234567890abcdef1234567890abcdef, license=MIT]
+  -> python==3.8.5[md5='1234567890abcdef1234567890abcdef',license='MIT']
+conda-forge/linux-64::python ==3.8.5 py38_0[license=MIT]
+  -> conda-forge/linux-64::python==3.8.5=py38_0[license='MIT']
+conda-forge::python 3.8.*[build_number=">=5"]
+  -> conda-forge::python=3.8[build_number='>=5']
+python[subdir=linux-64]
+  -> python[subdir='linux-64']
+*
+  -> *
+*[license=MIT]
+  -> *[license='MIT']
+* >=1.0
+  -> *>=1.0
+conda-forge/Linux-64::python
+  -> conda-forge/Linux-64::python
+python[build='^py3.*$']
+  -> python[build='^py3.*$']
+python[track_features='mkl']
+  -> python[track_features='mkl']

@@ -2,8 +2,9 @@
 use crate::match_spec::condition::MatchSpecCondition;
 use crate::package::CondaArchiveIdentifier;
 use crate::{
-    build_spec::BuildNumberSpec, GenericVirtualPackage, PackageName, PackageRecord, RepoDataRecord,
-    VersionSpec,
+    build_spec::BuildNumberSpec,
+    version_spec::{EqualityOperator, StrictRangeOperator},
+    GenericVirtualPackage, PackageName, PackageRecord, RepoDataRecord, VersionSpec,
 };
 use itertools::Itertools;
 use rattler_digest::{parse_digest_from_hex, Md5, Sha256};
@@ -252,6 +253,194 @@ impl Display for MatchSpec {
 }
 
 impl MatchSpec {
+    /// Returns the canonical string representation following CEP rules.
+    ///
+    /// CEP Canonical Rules:
+    /// 1. Name required as positional, may be `*`
+    /// 2. Exact version uses `==`, fuzzy uses `=` (without `.*` suffix)
+    /// 3. Build as positional if version is exact and build has no asterisks
+    /// 4. Channel uses `::` separator if no asterisks
+    /// 5. Key-value pairs use no spaces, single quotes
+    /// 6. Namespace MUST NOT be written
+    /// 7. Case-insensitive fields must be lowercased
+    ///
+    /// # Example
+    /// ```
+    /// use rattler_conda_types::{MatchSpec, ParseStrictness::Strict};
+    /// use std::str::FromStr;
+    ///
+    /// let spec = MatchSpec::from_str("conda-forge::python 3.8.*", Strict).unwrap();
+    /// assert_eq!(spec.to_canonical(), "conda-forge::python=3.8");
+    /// ```
+    pub fn to_canonical(&self) -> String {
+        use std::fmt::Write;
+
+        // Destructure to ensure all fields are handled - compiler will error if new fields are added
+        let MatchSpec {
+            name,
+            version,
+            build,
+            build_number,
+            file_name,
+            extras,
+            channel,
+            subdir,
+            namespace: _, // Rule 6: Namespace MUST NOT be written
+            md5,
+            sha256,
+            url,
+            license,
+            condition,
+            track_features,
+        } = self;
+
+        let mut result = String::new();
+
+        // Helper to check if channel name contains asterisks
+        let channel_has_asterisk = channel
+            .as_ref()
+            .map(|c| c.name().contains('*'))
+            .unwrap_or(false);
+
+        // Helper to check if version is exact (==)
+        let version_is_exact = matches!(
+            version,
+            Some(VersionSpec::Exact(EqualityOperator::Equals, _))
+        );
+
+        // Helper to check if version is fuzzy (starts with, e.g., 1.0.*)
+        let version_is_fuzzy = matches!(
+            version,
+            Some(VersionSpec::StrictRange(StrictRangeOperator::StartsWith, _))
+        );
+
+        // Helper to check if build is exact (no asterisks, no regex)
+        let build_is_exact = matches!(build, Some(StringMatcher::Exact(_)));
+
+        // Rule 4: Channel uses :: separator if no asterisks
+        if let Some(chan) = channel {
+            if !channel_has_asterisk {
+                let chan_name = chan.name();
+                let _ = write!(result, "{chan_name}");
+
+                // Subdir appended with / if channel is exact
+                if let Some(sub) = subdir {
+                    // Rule 7: Case-insensitive fields (subdir) must be lowercased
+                    let _ = write!(result, "/{}", sub.to_lowercase());
+                }
+
+                // Rule 6: Namespace MUST NOT be written
+                let _ = write!(result, "::");
+            }
+        }
+
+        // Rule 1: name required as positional, may be *
+        match name {
+            Some(n) => {
+                let _ = write!(result, "{n}");
+            }
+            None => {
+                let _ = write!(result, "*");
+            }
+        }
+
+        // Rule 2: Exact version uses ==, fuzzy uses = (without .* suffix)
+        // All versions are written positionally (no space after name)
+        if let Some(ver) = version {
+            if version_is_fuzzy {
+                // Fuzzy version: use = prefix without .* suffix
+                if let VersionSpec::StrictRange(StrictRangeOperator::StartsWith, v) = ver {
+                    let _ = write!(result, "={v}");
+                }
+            } else {
+                // Exact and other versions (range, group) are written as-is
+                let _ = write!(result, "{ver}");
+            }
+        }
+
+        // Rule 3: Build as positional if version is exact and build has no asterisks
+        let build_in_brackets = if let Some(b) = build {
+            if version_is_exact && build_is_exact {
+                // Build goes positionally with = prefix (no space)
+                let _ = write!(result, "={b}");
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        // Collect key-value pairs for bracket section
+        // Rule 5: Key-value pairs use no spaces, single quotes
+        let mut keys = Vec::new();
+
+        // Channel goes in brackets if it has asterisks
+        if channel_has_asterisk {
+            if let Some(chan) = channel {
+                keys.push(format!("channel='{}'", chan.name()));
+            }
+        }
+
+        // Subdir in brackets if channel has asterisks or no channel
+        if channel_has_asterisk || channel.is_none() {
+            if let Some(sub) = subdir {
+                // Rule 7: Case-insensitive fields (subdir) must be lowercased
+                keys.push(format!("subdir='{}'", sub.to_lowercase()));
+            }
+        }
+
+        // Build in brackets if not positional
+        if build_in_brackets {
+            if let Some(b) = build {
+                keys.push(format!("build='{b}'"));
+            }
+        }
+
+        if let Some(ext) = extras {
+            keys.push(format!("extras=[{}]", ext.iter().format(",")));
+        }
+
+        if let Some(hash) = md5 {
+            keys.push(format!("md5='{hash:x}'"));
+        }
+
+        if let Some(hash) = sha256 {
+            keys.push(format!("sha256='{hash:x}'"));
+        }
+
+        if let Some(bn) = build_number {
+            keys.push(format!("build_number='{bn}'"));
+        }
+
+        if let Some(fn_name) = file_name {
+            keys.push(format!("fn='{fn_name}'"));
+        }
+
+        if let Some(u) = url {
+            keys.push(format!("url='{u}'"));
+        }
+
+        if let Some(lic) = license {
+            keys.push(format!("license='{lic}'"));
+        }
+
+        if let Some(tf) = track_features {
+            keys.push(format!("track_features='{}'", tf.iter().format(" ")));
+        }
+
+        // Rule 5: Key-value pairs use no spaces (comma separator without space)
+        if !keys.is_empty() {
+            let _ = write!(result, "[{}]", keys.join(","));
+        }
+
+        if let Some(cond) = condition {
+            let _ = write!(result, "; if {}", cond.to_canonical());
+        }
+
+        result
+    }
+
     /// Decomposes this instance into a [`NamelessMatchSpec`] and a name.
     pub fn into_nameless(self) -> (Option<PackageNameMatcher>, NamelessMatchSpec) {
         (
@@ -1143,5 +1332,98 @@ mod tests {
             err,
             ParseMatchSpecError::OnlyExactPackageNameMatchersAllowedGlob("foo*".to_string())
         );
+    }
+
+    #[test]
+    fn test_to_canonical() {
+        // Test cases: (input, expected canonical output)
+        // We parse from various formats and verify the canonical output
+        let test_cases = vec![
+            // Basic name only
+            "python",
+            // Exact version with ==
+            "python ==3.8.5",
+            "python==3.8.5",
+            // Fuzzy version (starts with)
+            "python 3.8.*",
+            "python 3.8.5.*",
+            "python 3.*",
+            // Range versions
+            "python >=3.8",
+            "python >3.8",
+            "python <=3.8",
+            "python <3.8",
+            "python !=3.8",
+            // Complex version specs
+            "python >=3.8,<4.0",
+            "python >=3.8|<3.6",
+            // Compatible release
+            "python ~=3.8",
+            // Exact version with exact build (positional)
+            "python ==3.8.5 py38_0",
+            // Exact version with glob build (in brackets)
+            "python ==3.8.5 py38*",
+            // Fuzzy version with build (build in brackets)
+            "python 3.8.* py38_0",
+            // Channel without subdir
+            "conda-forge::python",
+            "conda-forge::python ==3.8.5",
+            "conda-forge::python 3.8.*",
+            // Channel with subdir
+            "conda-forge/linux-64::python",
+            "conda-forge/linux-64::python ==3.8.5",
+            "conda-forge/linux-64::python 3.8.*",
+            // Channel with subdir and version and build
+            "conda-forge/linux-64::python ==3.8.5 py38_0",
+            "conda-forge/linux-64::python 3.8.* py38_0",
+            // Wildcard channel (goes in brackets)
+            "*/linux-64::python >=3.8",
+            // Build number
+            "python[build_number=5]",
+            "python[build_number=\">=5\"]",
+            "python[build_number=>5]",
+            // MD5 hash
+            "python[md5=1234567890abcdef1234567890abcdef]",
+            // SHA256 hash
+            "python[sha256=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef]",
+            // License
+            "python[license=MIT]",
+            // URL
+            "python[url='https://example.com/python.tar.bz2']",
+            // Filename
+            "python[fn='python-3.8.5-py38_0.tar.bz2']",
+            // Multiple bracket fields
+            "python ==3.8.5[md5=1234567890abcdef1234567890abcdef, license=MIT]",
+            // Complex combinations
+            "conda-forge/linux-64::python ==3.8.5 py38_0[license=MIT]",
+            "conda-forge::python 3.8.*[build_number=\">=5\"]",
+            // Subdir in brackets (no channel)
+            "python[subdir=linux-64]",
+            // Asterisk as name
+            "*",
+            "*[license=MIT]",
+            "* >=1.0",
+            // Case sensitivity for subdir (should be lowercased)
+            "conda-forge/Linux-64::python",
+            // Build with regex pattern
+            "python[build='^py3.*$']",
+            // Track features
+            "python[track_features='mkl']",
+        ];
+
+        let results: Vec<(&str, String)> = test_cases
+            .iter()
+            .filter_map(|input| {
+                MatchSpec::from_str(input, Lenient)
+                    .ok()
+                    .map(|spec| (*input, spec.to_canonical()))
+            })
+            .collect();
+
+        assert_snapshot!(results
+            .iter()
+            .map(|(input, canonical)| format!("{input}\n  -> {canonical}"))
+            .collect::<Vec<_>>()
+            .join("\n"));
     }
 }
