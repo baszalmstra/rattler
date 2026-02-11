@@ -12,6 +12,9 @@ pub mod gcs_middleware;
 #[cfg(feature = "gcs")]
 pub use gcs_middleware::GCSMiddleware;
 
+#[cfg(feature = "oauth2")]
+pub mod oauth2_client;
+
 #[cfg(feature = "s3")]
 pub mod s3_middleware;
 #[cfg(feature = "s3")]

@@ -15,6 +15,7 @@ default = ['rustls-tls']
 native-tls = ['reqwest/native-tls', 'rattler_package_streaming/native-tls', 'rattler_cache/native-tls', 'rattler_networking/native-tls']
 rustls-tls = ['reqwest/rustls-tls', 'rattler_package_streaming/rustls-tls', 'rattler_cache/rustls-tls', 'rattler_networking/rustls-tls']
 cli-tools = ['dep:clap', 'reqwest/blocking']
+oauth2 = ['rattler_networking/oauth2', 'dep:openidconnect', 'dep:open', 'dep:axum', 'dep:serde']
 indicatif = ['dep:indicatif', 'dep:console']
 
 [package.metadata.docs.rs]
@@ -22,6 +23,7 @@ features = ["cli-tools", "indicatif"]
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 digest = { workspace = true }
 dirs = { workspace = true }
@@ -35,6 +37,8 @@ itertools = { workspace = true }
 memchr = { workspace = true }
 memmap2 = { workspace = true }
 once_cell = { workspace = true }
+open = { workspace = true, optional = true }
+openidconnect = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_conda_types = { workspace = true }
@@ -53,7 +57,8 @@ smallvec = { workspace = true }
 simple_spawn_blocking = { workspace = true, features = ["tokio"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "io-util", "macros"] }
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "io-util", "macros", "net", "sync"] }
 tracing = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }

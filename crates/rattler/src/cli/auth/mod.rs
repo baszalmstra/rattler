@@ -1,4 +1,8 @@
 //! This module contains CLI common entrypoint for authentication.
+
+#[cfg(feature = "oauth2")]
+mod oauth2;
+
 use clap::Parser;
 use rattler_networking::{
     authentication_storage::AuthenticationStorageError, Authentication, AuthenticationStorage,
@@ -41,6 +45,21 @@ struct LoginArgs {
     /// The S3 session token
     #[clap(long, requires_all = ["s3_access_key_id"])]
     s3_session_token: Option<String>,
+
+    /// Use OAuth2/OIDC login flow (implied for prefix.dev hosts)
+    #[cfg(feature = "oauth2")]
+    #[clap(long, conflicts_with_all = ["token", "username", "password", "conda_token", "s3_access_key_id"])]
+    oauth2: bool,
+
+    /// OAuth2 client ID (uses well-known default for prefix.dev)
+    #[cfg(feature = "oauth2")]
+    #[clap(long)]
+    client_id: Option<String>,
+
+    /// OIDC issuer URL (derived from host for prefix.dev)
+    #[cfg(feature = "oauth2")]
+    #[clap(long)]
+    issuer_url: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -114,6 +133,11 @@ pub enum AuthenticationCLIError {
     /// Token is unauthorized or invalid
     #[error("Unauthorized or invalid token")]
     UnauthorizedToken,
+
+    /// OAuth2 flow error
+    #[cfg(feature = "oauth2")]
+    #[error("OAuth2 authentication failed: {0}")]
+    OAuth2Error(#[from] rattler_networking::oauth2_client::OAuth2Error),
 }
 
 fn get_url(url: &str) -> Result<String, AuthenticationCLIError> {
@@ -152,6 +176,19 @@ async fn login(
     args: LoginArgs,
     storage: AuthenticationStorage,
 ) -> Result<(), AuthenticationCLIError> {
+    // Check if we should use the OAuth2 flow
+    #[cfg(feature = "oauth2")]
+    if oauth2::should_use_oauth2(&args) {
+        let issuer_url = oauth2::resolve_issuer_url(&args.host, args.issuer_url.as_deref())?;
+        let client_id = oauth2::resolve_client_id(args.client_id.as_deref());
+        let tokens = oauth2::run_oauth2_flow(&issuer_url, &client_id).await?;
+        let host = get_url(&args.host)?;
+        let auth = tokens.into_authentication();
+        eprintln!("Storing OAuth2 credentials for {host}...");
+        storage.store(&host, &auth)?;
+        return Ok(());
+    }
+
     let auth = if let Some(conda_token) = args.conda_token {
         Authentication::CondaToken(conda_token)
     } else if let Some(username) = args.username {
@@ -176,7 +213,12 @@ async fn login(
         return Err(AuthenticationCLIError::NoAuthenticationMethod);
     };
 
-    if args.host.contains("prefix.dev") && !matches!(auth, Authentication::BearerToken(_)) {
+    if args.host.contains("prefix.dev")
+        && !matches!(
+            auth,
+            Authentication::BearerToken(_) | Authentication::OAuth2Token { .. }
+        )
+    {
         return Err(AuthenticationCLIError::PrefixDevBadMethod);
     }
 
@@ -331,6 +373,12 @@ mod tests {
             s3_access_key_id: None,
             s3_secret_access_key: None,
             s3_session_token: None,
+            #[cfg(feature = "oauth2")]
+            oauth2: false,
+            #[cfg(feature = "oauth2")]
+            client_id: None,
+            #[cfg(feature = "oauth2")]
+            issuer_url: None,
         }
     }
 

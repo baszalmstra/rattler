@@ -17,7 +17,7 @@ name = "rattler"
 path = "src/main.rs"
 
 [features]
-default = ["rustls-tls", "s3", "gcs"]
+default = ["rustls-tls", "s3", "gcs", "oauth2"]
 native-tls = [
   "reqwest/native-tls",
   "rattler/native-tls",
@@ -35,6 +35,7 @@ rustls-tls = [
 ]
 s3 = ["rattler_networking/s3", "rattler_upload/s3"]
 gcs = ["rattler_networking/gcs"]
+oauth2 = ["rattler/oauth2", "rattler_networking/oauth2"]
 
 [dependencies]
 anyhow = { workspace = true }

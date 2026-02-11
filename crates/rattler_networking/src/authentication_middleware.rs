@@ -9,10 +9,21 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use url::Url;
 
+#[cfg(feature = "oauth2")]
+use std::collections::HashMap;
+#[cfg(feature = "oauth2")]
+use std::sync::Arc;
+
 /// `reqwest` middleware to authenticate requests
 #[derive(Clone)]
 pub struct AuthenticationMiddleware {
     auth_storage: AuthenticationStorage,
+    /// HTTP client used for OAuth2 token refresh.
+    #[cfg(feature = "oauth2")]
+    http_client: reqwest::Client,
+    /// Per-host mutex map to serialize token refresh operations.
+    #[cfg(feature = "oauth2")]
+    refresh_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -36,13 +47,51 @@ impl Middleware for AuthenticationMiddleware {
                 next.run(req, extensions).await
             }
             Ok((url, auth)) => {
-                let url = Self::authenticate_url(url, &auth);
+                // Pre-flight: refresh expired OAuth2 tokens before sending
+                #[cfg(feature = "oauth2")]
+                let auth = self.maybe_refresh_oauth2(&url, auth).await;
+
+                let authenticated_url = Self::authenticate_url(url.clone(), &auth);
 
                 let mut req = req;
-                *req.url_mut() = url;
+                *req.url_mut() = authenticated_url;
 
                 let req = Self::authenticate_request(req, &auth).await?;
-                next.run(req, extensions).await
+
+                #[cfg(feature = "oauth2")]
+                {
+                    let response = next.run(req, extensions).await?;
+
+                    // If we got a 401 and we have an OAuth2 token with a
+                    // refresh token, try refreshing and update the stored
+                    // credentials so that subsequent retries succeed.
+                    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                        if let Some(Authentication::OAuth2Token {
+                            refresh_token: Some(ref rt),
+                            ref token_url,
+                            ref client_id,
+                            ..
+                        }) = auth
+                        {
+                            if let Ok(tokens) = crate::oauth2_client::refresh_token(
+                                &self.http_client, token_url, client_id, rt,
+                            )
+                            .await
+                            {
+                                if let Ok(host) = Self::host_from_url(&url) {
+                                    let new_auth = tokens.into_authentication();
+                                    let _ = self.auth_storage.store(&host, &new_auth);
+                                }
+                            }
+                        }
+                    }
+                    Ok(response)
+                }
+
+                #[cfg(not(feature = "oauth2"))]
+                {
+                    next.run(req, extensions).await
+                }
             }
         }
     }
@@ -51,14 +100,103 @@ impl Middleware for AuthenticationMiddleware {
 impl AuthenticationMiddleware {
     /// Create a new authentication middleware with the given authentication storage
     pub fn from_auth_storage(auth_storage: AuthenticationStorage) -> Self {
-        Self { auth_storage }
+        Self {
+            auth_storage,
+            #[cfg(feature = "oauth2")]
+            http_client: reqwest::ClientBuilder::new()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build HTTP client for OAuth2 refresh"),
+            #[cfg(feature = "oauth2")]
+            refresh_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     /// Create a new authentication middleware with the default authentication storage
     pub fn from_env_and_defaults() -> Result<Self, AuthenticationStorageError> {
         Ok(Self {
             auth_storage: AuthenticationStorage::from_env_and_defaults()?,
+            #[cfg(feature = "oauth2")]
+            http_client: reqwest::ClientBuilder::new()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build HTTP client for OAuth2 refresh"),
+            #[cfg(feature = "oauth2")]
+            refresh_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Extract the host string from a URL (used for auth storage lookups).
+    #[cfg(feature = "oauth2")]
+    fn host_from_url(url: &Url) -> Result<String, ()> {
+        url.host_str().map(|h| h.to_string()).ok_or(())
+    }
+
+    /// If the stored authentication is an OAuth2 token that is about to expire,
+    /// refresh it proactively using the stored refresh token. Returns the
+    /// (possibly updated) authentication.
+    #[cfg(feature = "oauth2")]
+    async fn maybe_refresh_oauth2(
+        &self,
+        url: &Url,
+        auth: Option<Authentication>,
+    ) -> Option<Authentication> {
+        let Some(Authentication::OAuth2Token {
+            ref access_token,
+            refresh_token: Some(ref rt),
+            ref token_url,
+            ref client_id,
+            expires_at: Some(expires_at),
+        }) = auth
+        else {
+            return auth;
+        };
+
+        // Check if the token expires within 30 seconds
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_secs();
+        if now + 30 < expires_at {
+            return auth;
+        }
+
+        let host = Self::host_from_url(url).ok()?;
+
+        // Acquire per-host lock to prevent concurrent refreshes
+        let host_lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks.entry(host.clone()).or_default().clone()
+        };
+        let _guard = host_lock.lock().await;
+
+        // Double-check: another task may have refreshed while we waited
+        if let Ok(Some(Authentication::OAuth2Token {
+            expires_at: Some(new_exp),
+            ..
+        })) = self.auth_storage.get(&host)
+        {
+            if now + 30 < new_exp {
+                // Already refreshed by another task
+                return self.auth_storage.get(&host).ok().flatten();
+            }
+        }
+
+        // Perform the refresh
+        let _ = access_token; // suppress unused warning
+        match crate::oauth2_client::refresh_token(&self.http_client, token_url, client_id, rt).await {
+            Ok(tokens) => {
+                let new_auth = tokens.into_authentication();
+                let _ = self.auth_storage.store(&host, &new_auth);
+                Some(new_auth)
+            }
+            Err(e) => {
+                tracing::warn!("OAuth2 token refresh failed: {e}");
+                // Return the original (possibly expired) token; the request may
+                // still succeed or trigger a 401-retry.
+                auth
+            }
+        }
     }
 
     /// Authenticate the given URL with the given authentication information
@@ -114,6 +252,17 @@ impl AuthenticationMiddleware {
                     Ok(req)
                 }
                 Authentication::CondaToken(_) | Authentication::S3Credentials { .. } => Ok(req),
+                Authentication::OAuth2Token { access_token, .. } => {
+                    let bearer_auth = format!("Bearer {access_token}");
+
+                    let mut header_value = reqwest::header::HeaderValue::from_str(&bearer_auth)
+                        .map_err(reqwest_middleware::Error::middleware)?;
+                    header_value.set_sensitive(true);
+
+                    req.headers_mut()
+                        .insert(reqwest::header::AUTHORIZATION, header_value);
+                    Ok(req)
+                }
             }
         } else {
             Ok(req)

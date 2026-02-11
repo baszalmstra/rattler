@@ -28,6 +28,19 @@ pub enum Authentication {
         /// The session token to use for S3 authentication
         session_token: Option<String>,
     },
+    /// OAuth2 token obtained via OIDC flow
+    OAuth2Token {
+        /// The access token used for Bearer authentication
+        access_token: String,
+        /// The refresh token used to obtain new access tokens
+        refresh_token: Option<String>,
+        /// The token endpoint URL for refreshing tokens
+        token_url: String,
+        /// The OAuth2 client ID
+        client_id: String,
+        /// Unix timestamp (seconds) when the access token expires
+        expires_at: Option<u64>,
+    },
 }
 
 /// An error that can occur when parsing an authentication string
@@ -56,6 +69,7 @@ impl Authentication {
             Authentication::BasicHTTP { .. } => "BasicHTTP",
             Authentication::CondaToken(_) => "CondaToken",
             Authentication::S3Credentials { .. } => "S3",
+            Authentication::OAuth2Token { .. } => "OAuth2",
         }
     }
 }
