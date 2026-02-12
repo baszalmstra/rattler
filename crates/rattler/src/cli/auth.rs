@@ -1,4 +1,8 @@
 //! This module contains CLI common entrypoint for authentication.
+
+#[cfg(feature = "oauth")]
+pub mod oauth;
+
 use clap::Parser;
 use rattler_networking::{
     authentication_storage::AuthenticationStorageError, Authentication, AuthenticationStorage,
@@ -41,6 +45,31 @@ struct LoginArgs {
     /// The S3 session token
     #[clap(long, requires_all = ["s3_access_key_id"])]
     s3_session_token: Option<String>,
+
+    /// Use OAuth/OIDC authentication
+    #[cfg(feature = "oauth")]
+    #[clap(long, conflicts_with_all = ["token", "username", "password", "conda_token", "s3_access_key_id"])]
+    oauth: bool,
+
+    /// OIDC issuer URL (defaults to https://{host})
+    #[cfg(feature = "oauth")]
+    #[clap(long, requires = "oauth")]
+    issuer_url: Option<String>,
+
+    /// OAuth client ID (defaults to "rattler")
+    #[cfg(feature = "oauth")]
+    #[clap(long, requires = "oauth")]
+    client_id: Option<String>,
+
+    /// OAuth flow: auto (default), auth-code, device-code
+    #[cfg(feature = "oauth")]
+    #[clap(long, requires = "oauth", value_parser = ["auto", "auth-code", "device-code"])]
+    oauth_flow: Option<String>,
+
+    /// Additional OAuth scopes to request (repeatable)
+    #[cfg(feature = "oauth")]
+    #[clap(long = "oauth-scope", requires = "oauth")]
+    oauth_scopes: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -114,6 +143,11 @@ pub enum AuthenticationCLIError {
     /// Token is unauthorized or invalid
     #[error("Unauthorized or invalid token")]
     UnauthorizedToken,
+
+    /// OAuth error
+    #[cfg(feature = "oauth")]
+    #[error("OAuth error: {0}")]
+    OAuthError(#[from] oauth::OAuthError),
 }
 
 fn get_url(url: &str) -> Result<String, AuthenticationCLIError> {
@@ -152,6 +186,34 @@ async fn login(
     args: LoginArgs,
     storage: AuthenticationStorage,
 ) -> Result<(), AuthenticationCLIError> {
+    // OAuth flow (when --oauth is set)
+    #[cfg(feature = "oauth")]
+    if args.oauth {
+        let issuer_url = args
+            .issuer_url
+            .unwrap_or_else(|| format!("https://{}", args.host));
+        let client_id = args.client_id.unwrap_or_else(|| "rattler".to_string());
+        let flow = match args.oauth_flow.as_deref() {
+            Some("auth-code") => oauth::OAuthFlow::AuthCode,
+            Some("device-code") => oauth::OAuthFlow::DeviceCode,
+            _ => oauth::OAuthFlow::Auto,
+        };
+
+        let config = oauth::OAuthConfig {
+            issuer_url,
+            client_id,
+            flow,
+            scopes: args.oauth_scopes,
+        };
+
+        let auth = oauth::perform_oauth_login(config).await?;
+        // OAuth credentials are issuer-specific, skip wildcard conversion
+        let host = args.host.clone();
+        eprintln!("Authenticating with {host} using {} method", auth.method());
+        storage.store(&host, &auth)?;
+        return Ok(());
+    }
+
     let auth = if let Some(conda_token) = args.conda_token {
         Authentication::CondaToken(conda_token)
     } else if let Some(username) = args.username {
@@ -281,8 +343,33 @@ async fn validate_prefix_dev_token(
     }
 }
 
-fn logout(args: LogoutArgs, storage: AuthenticationStorage) -> Result<(), AuthenticationCLIError> {
+async fn logout(
+    args: LogoutArgs,
+    storage: AuthenticationStorage,
+) -> Result<(), AuthenticationCLIError> {
     let host = get_url(&args.host)?;
+
+    // Revoke OAuth tokens before deleting credentials
+    #[cfg(feature = "oauth")]
+    if let Ok(Some(Authentication::OAuth {
+        ref access_token,
+        ref refresh_token,
+        ref revocation_endpoint,
+        ref client_id,
+        ..
+    })) = storage.get(&host)
+    {
+        if let Some(endpoint) = revocation_endpoint {
+            eprintln!("Revoking OAuth tokens...");
+            oauth::revoke_tokens(
+                endpoint,
+                access_token,
+                refresh_token.as_deref(),
+                client_id,
+            )
+            .await;
+        }
+    }
 
     println!("Removing authentication for {host}");
 
@@ -296,7 +383,7 @@ pub async fn execute(args: Args) -> Result<(), AuthenticationCLIError> {
 
     match args.subcommand {
         Subcommand::Login(args) => login(args, storage).await,
-        Subcommand::Logout(args) => logout(args, storage),
+        Subcommand::Logout(args) => logout(args, storage).await,
     }
 }
 
@@ -331,6 +418,16 @@ mod tests {
             s3_access_key_id: None,
             s3_secret_access_key: None,
             s3_session_token: None,
+            #[cfg(feature = "oauth")]
+            oauth: false,
+            #[cfg(feature = "oauth")]
+            issuer_url: None,
+            #[cfg(feature = "oauth")]
+            client_id: None,
+            #[cfg(feature = "oauth")]
+            oauth_flow: None,
+            #[cfg(feature = "oauth")]
+            oauth_scopes: vec![],
         }
     }
 
