@@ -229,8 +229,7 @@ impl AuthenticationMiddleware {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
                     if error_code == "invalid_grant" {
-                        "refresh token is expired or revoked — please re-authenticate"
-                            .to_string()
+                        "refresh token is expired or revoked — please re-authenticate".to_string()
                     } else {
                         format!("error code: {error_code}")
                     }

@@ -189,10 +189,7 @@ impl AuthenticationStorage {
                         }
                     }
                     Ok(Some(credentials)) => {
-                        return Ok((
-                            url,
-                            Some((current_url.as_str().to_string(), credentials)),
-                        ));
+                        return Ok((url, Some((current_url.as_str().to_string(), credentials))));
                     }
                     Err(_) => return Ok((url, None)),
                 }
