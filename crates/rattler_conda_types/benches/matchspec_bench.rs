@@ -6,6 +6,9 @@
 //! - Cloning
 //! - Memory footprint measurement
 //! - Hashing
+//!
+//! Uses real conda-forge repodata (linux-64 + noarch) for representative
+//! workloads.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -17,17 +20,21 @@ use rattler_conda_types::{
     MatchSpec, Matches, NamelessMatchSpec, PackageRecord, ParseStrictness, RepoData,
 };
 
-/// Load repodata and return (unique_dep_strings, package_records).
-fn load_test_data() -> (Vec<String>, Vec<PackageRecord>) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-data/channels/pytorch/linux-64/repodata.json");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read repodata at {}: {e}", path.display()));
-    let repodata: RepoData =
-        serde_json::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse repodata: {e}"));
-
-    let mut unique_deps = HashSet::new();
-    let mut records = Vec::new();
+/// Load a single repodata.json and accumulate unique dep strings and records.
+fn load_repodata(
+    path: &Path,
+    unique_deps: &mut HashSet<String>,
+    records: &mut Vec<PackageRecord>,
+) {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping {}: {e}", path.display());
+            return;
+        }
+    };
+    let repodata: RepoData = serde_json::from_str(&contents)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
 
     for record in repodata
         .packages
@@ -41,6 +48,25 @@ fn load_test_data() -> (Vec<String>, Vec<PackageRecord>) {
             unique_deps.insert(con.clone());
         }
         records.push(record.clone());
+    }
+}
+
+/// Load conda-forge repodata (linux-64 + noarch) and return unique dep
+/// strings + package records.
+fn load_test_data() -> (Vec<String>, Vec<PackageRecord>) {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-data/channels/conda-forge");
+
+    let mut unique_deps = HashSet::new();
+    let mut records = Vec::new();
+
+    load_repodata(&base.join("linux-64/repodata.json"), &mut unique_deps, &mut records);
+    load_repodata(&base.join("noarch/repodata.json"), &mut unique_deps, &mut records);
+
+    // Fallback: if conda-forge data is not available, use pytorch
+    if records.is_empty() {
+        let fallback = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/channels/pytorch/linux-64/repodata.json");
+        load_repodata(&fallback, &mut unique_deps, &mut records);
     }
 
     let mut specs: Vec<String> = unique_deps.into_iter().collect();
@@ -107,8 +133,8 @@ fn matchspec_benchmarks(c: &mut Criterion) {
     // a set of dependency constraints.
     {
         // Use a subset of records and specs for realistic matching workload
-        let sample_records: Vec<&PackageRecord> = records.iter().take(200).collect();
-        let sample_specs: Vec<&NamelessMatchSpec> = nameless_specs.iter().take(100).collect();
+        let sample_records: Vec<&PackageRecord> = records.iter().take(500).collect();
+        let sample_specs: Vec<&NamelessMatchSpec> = nameless_specs.iter().take(200).collect();
 
         let match_count = (sample_records.len() * sample_specs.len()) as u64;
 
