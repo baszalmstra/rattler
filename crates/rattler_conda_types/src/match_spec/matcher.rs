@@ -21,7 +21,10 @@ pub enum StringMatcher {
     /// and uses the regex syntax. For example, `^py.*37$` matches any
     /// string starting with `py` and ending with `37`. Note that the regex
     /// is anchored, so it must match the entire string.
-    Regex(fancy_regex::Regex),
+    ///
+    /// Boxed to keep the enum small — `fancy_regex::Regex` is 144 bytes but
+    /// the Regex variant is rarely used.
+    Regex(Box<fancy_regex::Regex>),
 }
 
 impl Hash for StringMatcher {
@@ -81,11 +84,13 @@ impl FromStr for StringMatcher {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.starts_with('^') && s.ends_with('$') {
-            Ok(StringMatcher::Regex(fancy_regex::Regex::new(s).map_err(
-                |_err| StringMatcherParseError::InvalidRegex {
-                    regex: s.to_string(),
-                },
-            )?))
+            Ok(StringMatcher::Regex(Box::new(
+                fancy_regex::Regex::new(s).map_err(|_err| {
+                    StringMatcherParseError::InvalidRegex {
+                        regex: s.to_string(),
+                    }
+                })?,
+            )))
         } else if s.contains('*') {
             Ok(StringMatcher::Glob(glob::Pattern::new(s).map_err(
                 |_err| StringMatcherParseError::InvalidGlob {
@@ -150,7 +155,7 @@ mod tests {
             "foo*".parse().unwrap()
         );
         assert_eq!(
-            StringMatcher::Regex(fancy_regex::Regex::new("^foo.*$").unwrap()),
+            StringMatcher::Regex(Box::new(fancy_regex::Regex::new("^foo.*$").unwrap())),
             "^foo.*$".parse().unwrap()
         );
     }

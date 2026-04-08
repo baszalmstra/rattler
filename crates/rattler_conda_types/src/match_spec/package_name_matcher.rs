@@ -23,7 +23,10 @@ pub enum PackageNameMatcher {
     /// and uses the regex syntax. For example, `^foo.*bar$` matches any
     /// string starting with `foo` and ending with `bar`. Note that the regex
     /// is anchored, so it must match the entire string.
-    Regex(fancy_regex::Regex),
+    ///
+    /// Boxed to keep the enum small — `fancy_regex::Regex` is 144 bytes but
+    /// the Regex variant is rarely used.
+    Regex(Box<fancy_regex::Regex>),
 }
 
 impl Hash for PackageNameMatcher {
@@ -119,7 +122,7 @@ impl From<glob::Pattern> for PackageNameMatcher {
 
 impl From<fancy_regex::Regex> for PackageNameMatcher {
     fn from(value: fancy_regex::Regex) -> Self {
-        PackageNameMatcher::Regex(value)
+        PackageNameMatcher::Regex(Box::new(value))
     }
 }
 
@@ -156,11 +159,11 @@ impl FromStr for PackageNameMatcher {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.starts_with('^') && s.ends_with('$') {
-            Ok(PackageNameMatcher::Regex(
+            Ok(PackageNameMatcher::Regex(Box::new(
                 fancy_regex::Regex::new(s).map_err(|_err| PackageNameMatcherParseError::Regex {
                     regex: s.to_string(),
                 })?,
-            ))
+            )))
         } else if s.contains('*') {
             Ok(PackageNameMatcher::Glob(glob::Pattern::new(s).map_err(
                 |_err| PackageNameMatcherParseError::Glob {
@@ -230,7 +233,7 @@ mod tests {
             "foo*bar".parse().unwrap()
         );
         assert_eq!(
-            PackageNameMatcher::Regex(fancy_regex::Regex::new("^foo.*$").unwrap()),
+            PackageNameMatcher::Regex(Box::new(fancy_regex::Regex::new("^foo.*$").unwrap())),
             "^foo.*$".parse().unwrap()
         );
     }
