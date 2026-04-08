@@ -338,7 +338,7 @@ impl<'a> CondaDependencyProvider<'a> {
         // TODO: Normalize these channel names to urls so we can compare them correctly.
         let channel_specific_specs = match_specs
             .iter()
-            .filter(|spec| spec.channel.is_some())
+            .filter(|spec| spec.channel().is_some())
             .collect::<Vec<_>>();
 
         // Hashmap that maps the package name to the channel it was first found in.
@@ -455,7 +455,7 @@ impl<'a> CondaDependencyProvider<'a> {
                     }) {
                         // Check if the spec has a channel, and compare it to the repodata
                         // channel
-                        if let Some(spec_channel) = &spec.channel {
+                        if let Some(spec_channel) = spec.channel() {
                             if record.channel.as_ref() != Some(&spec_channel.canonical_name()) {
                                 tracing::debug!("Ignoring {} {} because it was not requested from that channel.", &record.package_record.name.as_normalized(), match &record.channel {
                                         Some(channel) => format!("from {}", &channel),
@@ -964,7 +964,7 @@ impl super::SolverImpl for Solver {
         });
 
         let root_requirements = task.specs.into_iter().flat_map(|spec| {
-            let condition_id = if let Some(condition) = spec.condition.as_ref() {
+            let condition_id = if let Some(condition) = spec.condition() {
                 let mut cache = provider.parse_match_spec_cache.borrow_mut();
                 Some(parse_condition(condition, &provider.pool, &mut cache))
             } else {
@@ -1051,7 +1051,7 @@ fn parse_match_spec(
         spec_str,
         ParseMatchSpecOptions::lenient().with_experimental_conditionals(true),
     )?;
-    let condition_id = if let Some(condition) = match_spec.condition.as_ref() {
+    let condition_id = if let Some(condition) = match_spec.condition() {
         let condition_id = parse_condition(condition, pool, parse_match_spec_cache);
         Some(condition_id)
     } else {
@@ -1080,7 +1080,7 @@ fn version_sets_for_match_spec(
 
     // Add a dependency on each extra.
     let mut version_set_ids = vec![];
-    for extra in spec.extras.iter().flatten() {
+    for extra in spec.optional_extras().into_iter().flatten() {
         version_set_ids.push(extra_version_set(pool, name.clone(), extra.clone()));
     }
 

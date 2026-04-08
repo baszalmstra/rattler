@@ -8,7 +8,7 @@ use crate::{
 use itertools::Itertools;
 use rattler_digest::{parse_digest_from_hex, Md5, Sha256};
 use rattler_digest::{serde::SerializableHash, Md5Hash, Sha256Hash};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, skip_serializing_none};
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
@@ -103,20 +103,20 @@ use parse::escape_bracket_value;
 /// let spec = MatchSpec::from_str(r#"conda-forge::foo[version="1.0.*"]"#, Strict).unwrap();
 /// assert_eq!(spec.name, PackageNameMatcher::Exact(PackageName::new_unchecked("foo")));
 /// assert_eq!(spec.version, Some(VersionSpec::from_str("1.0.*", Strict).unwrap()));
-/// assert_eq!(spec.channel, Some(Channel::from_str("conda-forge", &channel_config).map(|channel| Arc::new(channel)).unwrap()));
+/// assert_eq!(spec.channel(), Some(&Channel::from_str("conda-forge", &channel_config).map(|channel| Arc::new(channel)).unwrap()));
 ///
 /// let spec = MatchSpec::from_str(r#"conda-forge::foo >=1.0[subdir="linux-64"]"#, Strict).unwrap();
 /// assert_eq!(spec.name, PackageNameMatcher::Exact(PackageName::new_unchecked("foo")));
 /// assert_eq!(spec.version, Some(VersionSpec::from_str(">=1.0", Strict).unwrap()));
-/// assert_eq!(spec.channel, Some(Channel::from_str("conda-forge", &channel_config).map(|channel| Arc::new(channel)).unwrap()));
-/// assert_eq!(spec.subdir, Some("linux-64".to_string()));
+/// assert_eq!(spec.channel(), Some(&Channel::from_str("conda-forge", &channel_config).map(|channel| Arc::new(channel)).unwrap()));
+/// assert_eq!(spec.subdir(), Some("linux-64"));
 /// assert_eq!(spec, MatchSpec::from_str("conda-forge/linux-64::foo >=1.0", Strict).unwrap());
 ///
 /// let spec = MatchSpec::from_str("*/linux-64::foo >=1.0", Strict).unwrap();
 /// assert_eq!(spec.name, PackageNameMatcher::Exact(PackageName::new_unchecked("foo")));
 /// assert_eq!(spec.version, Some(VersionSpec::from_str(">=1.0", Strict).unwrap()));
-/// assert_eq!(spec.channel, Some(Channel::from_str("*", &channel_config).map(|channel| Arc::new(channel)).unwrap()));
-/// assert_eq!(spec.subdir, Some("linux-64".to_string()));
+/// assert_eq!(spec.channel(), Some(&Channel::from_str("*", &channel_config).map(|channel| Arc::new(channel)).unwrap()));
+/// assert_eq!(spec.subdir(), Some("linux-64"));
 ///
 /// let spec = MatchSpec::from_str(r#"foo[build="py2*"]"#, Strict).unwrap();
 /// assert_eq!(spec.name, PackageNameMatcher::Exact(PackageName::new_unchecked("foo")));
@@ -134,58 +134,35 @@ use parse::escape_bracket_value;
 /// In the future, the namespace field might be added to this list.
 ///
 /// Alternatively, an exact spec is given by `*[sha256=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b]`.
-#[skip_serializing_none]
-#[serde_as]
-#[derive(Debug, Default, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
+/// A [`MatchSpec`] is composed of a package name matcher and a [`NamelessMatchSpec`].
+///
+/// The struct is memory-optimized: commonly-used fields (`version`, `build`,
+/// `build_number`) are stored inline, while rarely-populated fields (hashes,
+/// url, channel, etc.) are stored behind a single heap-allocated
+/// [`MatchSpecExtras`] that is only allocated when at least one of those
+/// fields is set.
+#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub struct MatchSpec {
     /// The name of the package
     pub name: PackageNameMatcher,
-    /// The version spec of the package (e.g. `1.2.3`, `>=1.2.3`, `1.2.*`)
-    pub version: Option<VersionSpec>,
-    /// The build string of the package (e.g. `py37_0`, `py37h6de7cb9_0`, `py*`)
-    pub build: Option<StringMatcher>,
-    /// The build number of the package
-    pub build_number: Option<BuildNumberSpec>,
-    /// Match the specific filename of the package
-    pub file_name: Option<String>,
-    /// The selected optional features of the package
-    pub extras: Option<Vec<String>>,
-    /// The channel of the package
-    pub channel: Option<Arc<Channel>>,
-    /// The subdir of the channel
-    pub subdir: Option<String>,
-    /// The namespace of the package (currently not used)
-    pub namespace: Option<String>,
-    /// The md5 hash of the package
-    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
-    pub md5: Option<Md5Hash>,
-    /// The sha256 hash of the package
-    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
-    pub sha256: Option<Sha256Hash>,
-    /// The url of the package
-    pub url: Option<Url>,
-    /// The license of the package
-    pub license: Option<String>,
-    /// The condition under which this match spec applies.
-    pub condition: Option<MatchSpecCondition>,
-    /// The track features of the package
-    pub track_features: Option<Vec<String>>,
+    /// The nameless portion of the match spec (version, build, and optional extras).
+    inner: NamelessMatchSpec,
 }
 
 impl Display for MatchSpec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if let Some(channel) = &self.channel {
+        if let Some(channel) = self.channel() {
             let name = channel.name();
             write!(f, "{name}")?;
 
-            if let Some(subdir) = &self.subdir {
+            if let Some(subdir) = self.subdir() {
                 write!(f, "/{subdir}")?;
             }
         }
 
-        if let Some(namespace) = &self.namespace {
+        if let Some(namespace) = self.namespace() {
             write!(f, ":{namespace}:")?;
-        } else if self.channel.is_some() || self.subdir.is_some() {
+        } else if self.channel().is_some() || self.subdir().is_some() {
             write!(f, "::")?;
         }
 
@@ -201,42 +178,42 @@ impl Display for MatchSpec {
 
         let mut keys = Vec::new();
 
-        if let Some(extras) = &self.extras {
+        if let Some(extras) = self.optional_extras() {
             keys.push(format!("extras=[{}]", extras.iter().format(", ")));
         }
 
-        if let Some(md5) = &self.md5 {
+        if let Some(md5) = self.md5() {
             keys.push(format!("md5=\"{md5:x}\""));
         }
 
-        if let Some(sha256) = &self.sha256 {
+        if let Some(sha256) = self.sha256() {
             keys.push(format!("sha256=\"{sha256:x}\""));
         }
 
-        if let Some(build_number) = &self.build_number {
+        if let Some(build_number) = self.build_number() {
             keys.push(format!("build_number=\"{build_number}\""));
         }
 
-        if let Some(file_name) = &self.file_name {
+        if let Some(file_name) = self.file_name() {
             keys.push(format!("fn=\"{file_name}\""));
         }
 
-        if let Some(url) = &self.url {
+        if let Some(url) = self.url() {
             keys.push(format!("url=\"{url}\""));
         }
 
-        if let Some(license) = &self.license {
+        if let Some(license) = self.license() {
             keys.push(format!("license=\"{license}\""));
         }
 
-        if let Some(track_features) = &self.track_features {
+        if let Some(track_features) = self.track_features() {
             keys.push(format!(
                 "track_features=\"{}\"",
                 track_features.iter().format(" ")
             ));
         }
 
-        if let Some(condition) = &self.condition {
+        if let Some(condition) = self.condition() {
             let condition_str = condition.to_string();
             keys.push(format!("when=\"{}\"", escape_bracket_value(&condition_str)));
         }
@@ -252,25 +229,12 @@ impl Display for MatchSpec {
 impl MatchSpec {
     /// Decomposes this instance into a [`NamelessMatchSpec`] and a name.
     pub fn into_nameless(self) -> (PackageNameMatcher, NamelessMatchSpec) {
-        (
-            self.name,
-            NamelessMatchSpec {
-                version: self.version,
-                build: self.build,
-                build_number: self.build_number,
-                file_name: self.file_name,
-                extras: self.extras,
-                channel: self.channel,
-                subdir: self.subdir,
-                namespace: self.namespace,
-                md5: self.md5,
-                sha256: self.sha256,
-                url: self.url,
-                license: self.license,
-                condition: self.condition,
-                track_features: self.track_features,
-            },
-        )
+        (self.name, self.inner)
+    }
+
+    /// Constructs a [`MatchSpec`] from a [`NamelessMatchSpec`] and a name.
+    pub fn from_nameless(spec: NamelessMatchSpec, name: PackageNameMatcher) -> Self {
+        Self { name, inner: spec }
     }
 
     /// Returns whether the package is a virtual package.
@@ -284,6 +248,30 @@ impl MatchSpec {
             PackageNameMatcher::Regex(regex) => regex.as_str().starts_with(r"^__"),
         }
     }
+
+    /// Returns a reference to the inner [`NamelessMatchSpec`].
+    pub fn nameless(&self) -> &NamelessMatchSpec {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the inner [`NamelessMatchSpec`].
+    pub fn nameless_mut(&mut self) -> &mut NamelessMatchSpec {
+        &mut self.inner
+    }
+}
+
+// Delegate hot field access from MatchSpec to inner NamelessMatchSpec via Deref.
+impl std::ops::Deref for MatchSpec {
+    type Target = NamelessMatchSpec;
+    fn deref(&self) -> &NamelessMatchSpec {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for MatchSpec {
+    fn deref_mut(&mut self) -> &mut NamelessMatchSpec {
+        &mut self.inner
+    }
 }
 
 // Enable constructing a match spec from a package name.
@@ -296,16 +284,12 @@ impl From<PackageName> for MatchSpec {
     }
 }
 
-/// Similar to a [`MatchSpec`] but does not include the package name. This is useful in places
-/// where the package name is already known (e.g. `foo = "3.4.1 *cuda"`)
+/// Rarely-populated fields of a match spec, stored behind a `Box` to keep
+/// the common case (version + build only) compact.
 #[serde_as]
 #[skip_serializing_none]
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
-pub struct NamelessMatchSpec {
-    /// The version spec of the package (e.g. `1.2.3`, `>=1.2.3`, `1.2.*`)
-    pub version: Option<VersionSpec>,
-    /// The build string of the package (e.g. `py37_0`, `py37h6de7cb9_0`, `py*`)
-    pub build: Option<StringMatcher>,
+pub struct MatchSpecExtras {
     /// The build number of the package
     pub build_number: Option<BuildNumberSpec>,
     /// Match the specific filename of the package
@@ -335,6 +319,256 @@ pub struct NamelessMatchSpec {
     pub track_features: Option<Vec<String>>,
 }
 
+impl MatchSpecExtras {
+    /// Returns `true` if all fields are `None`.
+    fn is_empty(&self) -> bool {
+        self.build_number.is_none()
+            && self.file_name.is_none()
+            && self.extras.is_none()
+            && self.channel.is_none()
+            && self.subdir.is_none()
+            && self.namespace.is_none()
+            && self.md5.is_none()
+            && self.sha256.is_none()
+            && self.url.is_none()
+            && self.license.is_none()
+            && self.condition.is_none()
+            && self.track_features.is_none()
+    }
+}
+
+/// Similar to a [`MatchSpec`] but does not include the package name. This is
+/// useful in places where the package name is already known (e.g.
+/// `foo = "3.4.1 *cuda"`).
+///
+/// The struct is memory-optimized: commonly-used fields (`version`, `build`,
+/// `build_number`) are stored inline, while rarely-populated fields are stored
+/// behind a single heap-allocated [`MatchSpecExtras`] that is only present
+/// when at least one of those fields is set.
+#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
+pub struct NamelessMatchSpec {
+    /// The version spec of the package (e.g. `1.2.3`, `>=1.2.3`, `1.2.*`)
+    pub version: Option<VersionSpec>,
+    /// The build string of the package (e.g. `py37_0`, `py37h6de7cb9_0`, `py*`)
+    pub build: Option<StringMatcher>,
+    /// Rarely-populated fields, only allocated when at least one is set.
+    extras: Option<Box<MatchSpecExtras>>,
+}
+
+impl NamelessMatchSpec {
+    /// Returns a reference to the extras, if any cold fields are set.
+    pub fn extras(&self) -> Option<&MatchSpecExtras> {
+        self.extras.as_deref()
+    }
+
+    /// Returns a mutable reference to the extras, allocating if needed.
+    pub fn extras_mut(&mut self) -> &mut MatchSpecExtras {
+        self.extras.get_or_insert_with(Default::default)
+    }
+
+    /// Normalize: drop the extras box if all cold fields are None.
+    pub fn normalize(&mut self) {
+        if let Some(ref extras) = self.extras {
+            if extras.is_empty() {
+                self.extras = None;
+            }
+        }
+    }
+
+    // --- Getters for cold fields ---
+
+    /// The build number of the package
+    pub fn build_number(&self) -> Option<&BuildNumberSpec> {
+        self.extras.as_ref().and_then(|e| e.build_number.as_ref())
+    }
+
+    /// The channel of the package
+    pub fn channel(&self) -> Option<&Arc<Channel>> {
+        self.extras.as_ref().and_then(|e| e.channel.as_ref())
+    }
+
+    /// The subdir of the channel
+    pub fn subdir(&self) -> Option<&str> {
+        self.extras.as_ref().and_then(|e| e.subdir.as_deref())
+    }
+
+    /// The namespace of the package
+    pub fn namespace(&self) -> Option<&str> {
+        self.extras.as_ref().and_then(|e| e.namespace.as_deref())
+    }
+
+    /// The md5 hash of the package
+    pub fn md5(&self) -> Option<&Md5Hash> {
+        self.extras.as_ref().and_then(|e| e.md5.as_ref())
+    }
+
+    /// The sha256 hash of the package
+    pub fn sha256(&self) -> Option<&Sha256Hash> {
+        self.extras.as_ref().and_then(|e| e.sha256.as_ref())
+    }
+
+    /// The url of the package
+    pub fn url(&self) -> Option<&Url> {
+        self.extras.as_ref().and_then(|e| e.url.as_ref())
+    }
+
+    /// The license of the package
+    pub fn license(&self) -> Option<&str> {
+        self.extras.as_ref().and_then(|e| e.license.as_deref())
+    }
+
+    /// The condition under which this match spec applies.
+    pub fn condition(&self) -> Option<&MatchSpecCondition> {
+        self.extras.as_ref().and_then(|e| e.condition.as_ref())
+    }
+
+    /// The track features of the package
+    pub fn track_features(&self) -> Option<&[String]> {
+        self.extras
+            .as_ref()
+            .and_then(|e| e.track_features.as_deref())
+    }
+
+    /// The filename of the package
+    pub fn file_name(&self) -> Option<&str> {
+        self.extras.as_ref().and_then(|e| e.file_name.as_deref())
+    }
+
+    /// The optional extra dependencies
+    pub fn optional_extras(&self) -> Option<&[String]> {
+        self.extras.as_ref().and_then(|e| e.extras.as_deref())
+    }
+
+    // --- Setters for cold fields (allocate extras box on first use) ---
+
+    /// Set the build number
+    pub fn set_build_number(&mut self, build_number: Option<BuildNumberSpec>) {
+        if build_number.is_some() {
+            self.extras_mut().build_number = build_number;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.build_number = None;
+        }
+    }
+
+    /// Set the channel
+    pub fn set_channel(&mut self, channel: Option<Arc<Channel>>) {
+        if channel.is_some() {
+            self.extras_mut().channel = channel;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.channel = None;
+        }
+    }
+
+    /// Set the subdir
+    pub fn set_subdir(&mut self, subdir: Option<String>) {
+        if subdir.is_some() {
+            self.extras_mut().subdir = subdir;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.subdir = None;
+        }
+    }
+
+    /// Set the namespace
+    pub fn set_namespace(&mut self, namespace: Option<String>) {
+        if namespace.is_some() {
+            self.extras_mut().namespace = namespace;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.namespace = None;
+        }
+    }
+
+    /// Set the md5
+    pub fn set_md5(&mut self, md5: Option<Md5Hash>) {
+        if md5.is_some() {
+            self.extras_mut().md5 = md5;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.md5 = None;
+        }
+    }
+
+    /// Set the sha256
+    pub fn set_sha256(&mut self, sha256: Option<Sha256Hash>) {
+        if sha256.is_some() {
+            self.extras_mut().sha256 = sha256;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.sha256 = None;
+        }
+    }
+
+    /// Set the url
+    pub fn set_url(&mut self, url: Option<Url>) {
+        if url.is_some() {
+            self.extras_mut().url = url;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.url = None;
+        }
+    }
+
+    /// Set the license
+    pub fn set_license(&mut self, license: Option<String>) {
+        if license.is_some() {
+            self.extras_mut().license = license;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.license = None;
+        }
+    }
+
+    /// Set the condition
+    pub fn set_condition(&mut self, condition: Option<MatchSpecCondition>) {
+        if condition.is_some() {
+            self.extras_mut().condition = condition;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.condition = None;
+        }
+    }
+
+    /// Set the track features
+    pub fn set_track_features(&mut self, track_features: Option<Vec<String>>) {
+        if track_features.is_some() {
+            self.extras_mut().track_features = track_features;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.track_features = None;
+        }
+    }
+
+    /// Set the filename
+    pub fn set_file_name(&mut self, file_name: Option<String>) {
+        if file_name.is_some() {
+            self.extras_mut().file_name = file_name;
+        } else if let Some(ref mut extras) = self.extras {
+            extras.file_name = None;
+        }
+    }
+
+    /// Set the optional extras
+    pub fn set_extras(&mut self, extras: Option<Vec<String>>) {
+        if extras.is_some() {
+            self.extras_mut().extras = extras;
+        } else if let Some(ref mut ex) = self.extras {
+            ex.extras = None;
+        }
+    }
+
+    // --- Builder-style with_ methods ---
+
+    /// Set the channel and return self
+    pub fn with_channel(mut self, channel: Arc<Channel>) -> Self {
+        self.extras_mut().channel = Some(channel);
+        self
+    }
+
+    /// Set the extras from a [`MatchSpecExtras`]. If all fields are None, the
+    /// box is not allocated.
+    pub fn with_extras(mut self, extras: MatchSpecExtras) -> Self {
+        if extras.is_empty() {
+            self.extras = None;
+        } else {
+            self.extras = Some(Box::new(extras));
+        }
+        self
+    }
+}
+
 impl Display for NamelessMatchSpec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.version {
@@ -348,15 +582,15 @@ impl Display for NamelessMatchSpec {
 
         let mut keys = Vec::new();
 
-        if let Some(md5) = &self.md5 {
+        if let Some(md5) = self.md5() {
             keys.push(format!("md5=\"{md5:x}\""));
         }
 
-        if let Some(sha256) = &self.sha256 {
+        if let Some(sha256) = self.sha256() {
             keys.push(format!("sha256=\"{sha256:x}\""));
         }
 
-        if let Some(condition) = &self.condition {
+        if let Some(condition) = self.condition() {
             let condition_str = condition.to_string();
             keys.push(format!("when=\"{}\"", escape_bracket_value(&condition_str)));
         }
@@ -371,45 +605,7 @@ impl Display for NamelessMatchSpec {
 
 impl From<MatchSpec> for NamelessMatchSpec {
     fn from(spec: MatchSpec) -> Self {
-        Self {
-            version: spec.version,
-            build: spec.build,
-            build_number: spec.build_number,
-            file_name: spec.file_name,
-            extras: spec.extras,
-            channel: spec.channel,
-            subdir: spec.subdir,
-            namespace: spec.namespace,
-            md5: spec.md5,
-            sha256: spec.sha256,
-            url: spec.url,
-            license: spec.license,
-            condition: spec.condition,
-            track_features: spec.track_features,
-        }
-    }
-}
-
-impl MatchSpec {
-    /// Constructs a [`MatchSpec`] from a [`NamelessMatchSpec`] and a name.
-    pub fn from_nameless(spec: NamelessMatchSpec, name: PackageNameMatcher) -> Self {
-        Self {
-            name,
-            version: spec.version,
-            build: spec.build,
-            build_number: spec.build_number,
-            file_name: spec.file_name,
-            extras: spec.extras,
-            channel: spec.channel,
-            subdir: spec.subdir,
-            namespace: spec.namespace,
-            md5: spec.md5,
-            sha256: spec.sha256,
-            url: spec.url,
-            license: spec.license,
-            condition: spec.condition,
-            track_features: spec.track_features,
-        }
+        spec.inner
     }
 }
 
@@ -458,31 +654,31 @@ impl Matches<PackageRecord> for NamelessMatchSpec {
             }
         }
 
-        if let Some(build_number) = self.build_number.as_ref() {
+        if let Some(build_number) = self.build_number() {
             if !build_number.matches(&other.build_number) {
                 return false;
             }
         }
 
-        if let Some(md5_spec) = self.md5.as_ref() {
+        if let Some(md5_spec) = self.md5() {
             if Some(md5_spec) != other.md5.as_ref() {
                 return false;
             }
         }
 
-        if let Some(sha256_spec) = self.sha256.as_ref() {
+        if let Some(sha256_spec) = self.sha256() {
             if Some(sha256_spec) != other.sha256.as_ref() {
                 return false;
             }
         }
 
-        if let Some(license) = self.license.as_ref() {
-            if Some(license) != other.license.as_ref() {
+        if let Some(license) = self.license() {
+            if Some(license) != other.license.as_deref() {
                 return false;
             }
         }
 
-        if let Some(track_features) = self.track_features.as_ref() {
+        if let Some(track_features) = self.track_features() {
             for feature in track_features {
                 if !other.track_features.contains(feature) {
                     return false;
@@ -501,58 +697,14 @@ impl Matches<PackageRecord> for MatchSpec {
             return false;
         }
 
-        if let Some(spec) = self.version.as_ref() {
-            if !spec.matches(&other.version) {
-                return false;
-            }
-        }
-
-        if let Some(build_string) = self.build.as_ref() {
-            if !build_string.matches(&other.build) {
-                return false;
-            }
-        }
-
-        if let Some(build_number) = self.build_number.as_ref() {
-            if !build_number.matches(&other.build_number) {
-                return false;
-            }
-        }
-
-        if let Some(md5_spec) = self.md5.as_ref() {
-            if Some(md5_spec) != other.md5.as_ref() {
-                return false;
-            }
-        }
-
-        if let Some(sha256_spec) = self.sha256.as_ref() {
-            if Some(sha256_spec) != other.sha256.as_ref() {
-                return false;
-            }
-        }
-
-        if let Some(license) = self.license.as_ref() {
-            if Some(license) != other.license.as_ref() {
-                return false;
-            }
-        }
-
-        if let Some(track_features) = self.track_features.as_ref() {
-            for feature in track_features {
-                if !other.track_features.contains(feature) {
-                    return false;
-                }
-            }
-        }
-
-        true
+        self.inner.matches(other)
     }
 }
 
 impl Matches<RepoDataRecord> for MatchSpec {
     /// Match a [`MatchSpec`] against a [`RepoDataRecord`]
     fn matches(&self, other: &RepoDataRecord) -> bool {
-        if let Some(url_spec) = self.url.as_ref() {
+        if let Some(url_spec) = self.url() {
             if url_spec != &other.url {
                 return false;
             }
@@ -569,7 +721,7 @@ impl Matches<RepoDataRecord> for MatchSpec {
 impl Matches<RepoDataRecord> for NamelessMatchSpec {
     /// Match a [`NamelessMatchSpec`] against a [`RepoDataRecord`]
     fn matches(&self, other: &RepoDataRecord) -> bool {
-        if let Some(url_spec) = self.url.as_ref() {
+        if let Some(url_spec) = self.url() {
             if url_spec != &other.url {
                 return false;
             }
@@ -614,21 +766,21 @@ impl TryFrom<Url> for MatchSpec {
         let mut spec = MatchSpec::default();
         let mut url_without_fragment = value.clone();
         url_without_fragment.set_fragment(None);
-        spec.url = Some(url_without_fragment);
+        spec.set_url(Some(url_without_fragment));
 
         // Handle URL fragment for checksums
         if let Some(fragment) = value.fragment() {
             if fragment.starts_with("sha256:") {
                 let sha256 = fragment.trim_start_matches("sha256:");
-                spec.sha256 = Some(
+                spec.set_sha256(Some(
                     parse_digest_from_hex::<Sha256>(sha256)
                         .ok_or(MatchSpecUrlError::InvalidSha256(fragment.to_string()))?,
-                );
+                ));
             } else if !fragment.is_empty() {
-                spec.md5 = Some(
+                spec.set_md5(Some(
                     parse_digest_from_hex::<Md5>(fragment)
                         .ok_or(MatchSpecUrlError::InvalidMd5(fragment.to_string()))?,
-                );
+                ));
             }
         }
 
@@ -673,6 +825,192 @@ pub enum MatchSpecUrlError {
     InvalidPackageName(String),
 }
 
+// ---------------------------------------------------------------------------
+// Serde support — serialize/deserialize as the original flat JSON layout
+// ---------------------------------------------------------------------------
+
+/// Helper struct for flat (de)serialization of [`NamelessMatchSpec`].
+#[serde_as]
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize)]
+struct NamelessMatchSpecRaw {
+    version: Option<VersionSpec>,
+    build: Option<StringMatcher>,
+    build_number: Option<BuildNumberSpec>,
+    file_name: Option<String>,
+    extras: Option<Vec<String>>,
+    #[serde(deserialize_with = "deserialize_channel", default)]
+    channel: Option<Arc<Channel>>,
+    subdir: Option<String>,
+    namespace: Option<String>,
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
+    md5: Option<Md5Hash>,
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
+    sha256: Option<Sha256Hash>,
+    url: Option<Url>,
+    license: Option<String>,
+    condition: Option<MatchSpecCondition>,
+    track_features: Option<Vec<String>>,
+}
+
+impl From<NamelessMatchSpec> for NamelessMatchSpecRaw {
+    fn from(spec: NamelessMatchSpec) -> Self {
+        let extras = spec.extras.map(|e| *e).unwrap_or_default();
+        Self {
+            version: spec.version,
+            build: spec.build,
+            build_number: extras.build_number,
+            file_name: extras.file_name,
+            extras: extras.extras,
+            channel: extras.channel,
+            subdir: extras.subdir,
+            namespace: extras.namespace,
+            md5: extras.md5,
+            sha256: extras.sha256,
+            url: extras.url,
+            license: extras.license,
+            condition: extras.condition,
+            track_features: extras.track_features,
+        }
+    }
+}
+
+impl From<NamelessMatchSpecRaw> for NamelessMatchSpec {
+    fn from(raw: NamelessMatchSpecRaw) -> Self {
+        let extras = MatchSpecExtras {
+            build_number: raw.build_number,
+            file_name: raw.file_name,
+            extras: raw.extras,
+            channel: raw.channel,
+            subdir: raw.subdir,
+            namespace: raw.namespace,
+            md5: raw.md5,
+            sha256: raw.sha256,
+            url: raw.url,
+            license: raw.license,
+            condition: raw.condition,
+            track_features: raw.track_features,
+        };
+        Self {
+            version: raw.version,
+            build: raw.build,
+            extras: if extras.is_empty() {
+                None
+            } else {
+                Some(Box::new(extras))
+            },
+        }
+    }
+}
+
+impl Serialize for NamelessMatchSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        NamelessMatchSpecRaw::from(self.clone()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NamelessMatchSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        NamelessMatchSpecRaw::deserialize(deserializer).map(Into::into)
+    }
+}
+
+/// Helper struct for flat (de)serialization of [`MatchSpec`].
+#[serde_as]
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize)]
+struct MatchSpecRaw {
+    name: PackageNameMatcher,
+    version: Option<VersionSpec>,
+    build: Option<StringMatcher>,
+    build_number: Option<BuildNumberSpec>,
+    file_name: Option<String>,
+    extras: Option<Vec<String>>,
+    channel: Option<Arc<Channel>>,
+    subdir: Option<String>,
+    namespace: Option<String>,
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
+    md5: Option<Md5Hash>,
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
+    sha256: Option<Sha256Hash>,
+    url: Option<Url>,
+    license: Option<String>,
+    condition: Option<MatchSpecCondition>,
+    track_features: Option<Vec<String>>,
+}
+
+impl From<MatchSpec> for MatchSpecRaw {
+    fn from(spec: MatchSpec) -> Self {
+        let nameless_raw = NamelessMatchSpecRaw::from(spec.inner);
+        Self {
+            name: spec.name,
+            version: nameless_raw.version,
+            build: nameless_raw.build,
+            build_number: nameless_raw.build_number,
+            file_name: nameless_raw.file_name,
+            extras: nameless_raw.extras,
+            channel: nameless_raw.channel,
+            subdir: nameless_raw.subdir,
+            namespace: nameless_raw.namespace,
+            md5: nameless_raw.md5,
+            sha256: nameless_raw.sha256,
+            url: nameless_raw.url,
+            license: nameless_raw.license,
+            condition: nameless_raw.condition,
+            track_features: nameless_raw.track_features,
+        }
+    }
+}
+
+impl From<MatchSpecRaw> for MatchSpec {
+    fn from(raw: MatchSpecRaw) -> Self {
+        let nameless_raw = NamelessMatchSpecRaw {
+            version: raw.version,
+            build: raw.build,
+            build_number: raw.build_number,
+            file_name: raw.file_name,
+            extras: raw.extras,
+            channel: raw.channel,
+            subdir: raw.subdir,
+            namespace: raw.namespace,
+            md5: raw.md5,
+            sha256: raw.sha256,
+            url: raw.url,
+            license: raw.license,
+            condition: raw.condition,
+            track_features: raw.track_features,
+        };
+        Self {
+            name: raw.name,
+            inner: NamelessMatchSpec::from(nameless_raw),
+        }
+    }
+}
+
+impl Serialize for MatchSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        MatchSpecRaw::from(self.clone()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MatchSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        MatchSpecRaw::deserialize(deserializer).map(Into::into)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -708,7 +1046,7 @@ mod tests {
 
         let spec = MatchSpec::from_str("*[license=MIT]", options).unwrap();
         assert_eq!(spec.name, PackageNameMatcher::from_str("*").unwrap());
-        assert_eq!(spec.license, Some("MIT".to_string()));
+        assert_eq!(spec.license(), Some("MIT"));
 
         let spec = MatchSpec::from_str("* >=1.0", options).unwrap();
         assert_eq!(spec.name, PackageNameMatcher::from_str("*").unwrap());
@@ -744,8 +1082,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec.name, PackageNameMatcher::from_str("*").unwrap());
-        assert_eq!(spec.channel.unwrap().name(), "conda-forge");
-        assert_eq!(spec.subdir, Some("linux-64".to_string()));
+        assert_eq!(spec.channel().unwrap().name(), "conda-forge");
+        assert_eq!(spec.subdir(), Some("linux-64"));
         assert_eq!(
             spec.version,
             Some(VersionSpec::from_str(">=2.0", Strict).unwrap())
@@ -861,13 +1199,13 @@ mod tests {
     fn precedence_version_build() {
         let spec =
             MatchSpec::from_str("foo 3.0.* [version=1.2.3, build='foobar']", Lenient).unwrap();
-        assert_eq!(spec.version.unwrap(), "1.2.3".parse().unwrap());
-        assert_eq!(spec.build.unwrap(), "foobar".parse().unwrap());
+        assert_eq!(spec.version.as_ref().unwrap(), &"1.2.3".parse().unwrap());
+        assert_eq!(spec.build.as_ref().unwrap(), &"foobar".parse().unwrap());
 
         let spec = MatchSpec::from_str("foo 3.0.* abcdef[build='foobar', version=1.2.3]", Lenient)
             .unwrap();
-        assert_eq!(spec.build.unwrap(), "foobar".parse().unwrap());
-        assert_eq!(spec.version.unwrap(), "1.2.3".parse().unwrap());
+        assert_eq!(spec.build.as_ref().unwrap(), &"foobar".parse().unwrap());
+        assert_eq!(spec.version.as_ref().unwrap(), &"1.2.3".parse().unwrap());
 
         let spec =
             NamelessMatchSpec::from_str("3.0.* [version=1.2.3, build='foobar']", Lenient).unwrap();

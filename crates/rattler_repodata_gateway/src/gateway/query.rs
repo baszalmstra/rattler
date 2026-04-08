@@ -183,7 +183,7 @@ impl QueryExecutor {
         // Categorize specs into direct_url_specs, pending_package_specs, and
         // pending_pattern_specs
         for spec in specs {
-            if let Some(url) = spec.url.clone() {
+            if let Some(url) = spec.url().cloned() {
                 let name = spec.name.clone().into_exact().ok_or(
                     GatewayError::MatchSpecWithoutExactName(Box::new(spec.clone())),
                 )?;
@@ -287,8 +287,8 @@ impl QueryExecutor {
                     url.clone(),
                     gateway.package_cache.clone(),
                     gateway.client.clone(),
-                    spec.sha256,
-                    spec.md5,
+                    spec.sha256().copied(),
+                    spec.md5().copied(),
                 );
 
                 let records = query

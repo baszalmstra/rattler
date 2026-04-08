@@ -48,7 +48,7 @@ pub use match_spec::package_name_matcher::{PackageNameMatcher, PackageNameMatche
 pub use match_spec::{
     matcher::{StringMatcher, StringMatcherParseError},
     parse::ParseMatchSpecError,
-    MatchSpec, MatchSpecUrlError, Matches, NamelessMatchSpec,
+    MatchSpec, MatchSpecExtras, MatchSpecUrlError, Matches, NamelessMatchSpec,
 };
 pub use minimal_prefix_record::{
     collect_minimal_prefix_records, MinimalPrefixCollection, MinimalPrefixRecord,

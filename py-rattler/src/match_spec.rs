@@ -85,63 +85,61 @@ impl PyMatchSpec {
     #[getter]
     pub fn build_number(&self) -> Option<String> {
         self.inner
-            .build_number
-            .clone()
+            .build_number()
             .map(|build_number| build_number.to_string())
     }
 
     /// Match the specific filename of the package
     #[getter]
     pub fn file_name(&self) -> Option<String> {
-        self.inner.file_name.clone()
+        self.inner.file_name().map(|s| s.to_owned())
     }
 
     /// The channel of the package
     #[getter]
     pub fn channel(&self) -> Option<PyChannel> {
         self.inner
-            .channel
-            .clone()
+            .channel()
+            .cloned()
             .map(|mut channel| Arc::<Channel>::make_mut(&mut channel).clone().into())
     }
 
     /// The subdir of the channel
     #[getter]
     pub fn subdir(&self) -> Option<String> {
-        self.inner.subdir.clone()
+        self.inner.subdir().map(|s| s.to_owned())
     }
 
     /// The namespace of the package (currently not used)
     #[getter]
     pub fn namespace(&self) -> Option<String> {
-        self.inner.namespace.clone()
+        self.inner.namespace().map(|s| s.to_owned())
     }
 
     /// The extras (optional dependencies) of the package
     #[getter]
     pub fn extras(&self) -> Option<Vec<String>> {
-        self.inner.extras.clone()
+        self.inner.optional_extras().map(|s| s.to_vec())
     }
 
     /// The condition under which this match spec applies
     #[getter]
     pub fn condition(&self) -> Option<String> {
         self.inner
-            .condition
-            .as_ref()
+            .condition()
             .map(std::string::ToString::to_string)
     }
 
     /// The md5 hash of the package
     #[getter]
     pub fn md5<'a>(&self, py: Python<'a>) -> Option<Bound<'a, PyBytes>> {
-        self.inner.md5.map(|md5| PyBytes::new(py, &md5))
+        self.inner.md5().map(|md5| PyBytes::new(py, md5.as_ref()))
     }
 
     /// The sha256 hash of the package
     #[getter]
     pub fn sha256<'a>(&self, py: Python<'a>) -> Option<Bound<'a, PyBytes>> {
-        self.inner.sha256.map(|sha256| PyBytes::new(py, &sha256))
+        self.inner.sha256().map(|sha256| PyBytes::new(py, sha256.as_ref()))
     }
 
     /// Returns a string representation of `MatchSpec`

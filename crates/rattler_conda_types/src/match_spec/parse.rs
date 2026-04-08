@@ -443,28 +443,30 @@ fn parse_bracket_vec_into_components(
                 match_spec.version = Some(VersionSpec::from_str(value, options.strictness())?);
             }
             "build" => match_spec.build = Some(StringMatcher::from_str(value)?),
-            "build_number" => match_spec.build_number = Some(BuildNumberSpec::from_str(value)?),
+            "build_number" => {
+                match_spec.set_build_number(Some(BuildNumberSpec::from_str(value)?));
+            }
             "extras" => {
                 // Optional features are still experimental
                 if options.allow_experimental_extras() {
-                    match_spec.extras = Some(parse_extras(value)?);
+                    match_spec.set_extras(Some(parse_extras(value)?));
                 } else {
                     return Err(ParseMatchSpecError::InvalidBracketKey("extras".to_string()));
                 }
             }
             "sha256" => {
-                match_spec.sha256 = Some(
+                match_spec.set_sha256(Some(
                     parse_digest_from_hex::<Sha256>(value)
                         .ok_or(ParseMatchSpecError::InvalidHashDigest)?,
-                );
+                ));
             }
             "md5" => {
-                match_spec.md5 = Some(
+                match_spec.set_md5(Some(
                     parse_digest_from_hex::<Md5>(value)
                         .ok_or(ParseMatchSpecError::InvalidHashDigest)?,
-                );
+                ));
             }
-            "fn" => match_spec.file_name = Some(value.to_string()),
+            "fn" => match_spec.set_file_name(Some(value.to_string())),
             "url" => {
                 // Is the spec an url, parse it as an url
                 let url = if parse_scheme(value).is_some() {
@@ -479,24 +481,26 @@ fn parse_bracket_vec_into_components(
                     return Err(ParseMatchSpecError::InvalidPackagePathOrUrl);
                 };
 
-                match_spec.url = Some(url);
+                match_spec.set_url(Some(url));
             }
-            "subdir" => match_spec.subdir = Some(value.to_string()),
+            "subdir" => match_spec.set_subdir(Some(value.to_string())),
             "channel" => {
                 let (channel, subdir) = parse_channel_and_subdir(value)?;
-                match_spec.channel = match_spec.channel.or(channel.map(Arc::new));
-                match_spec.subdir = match_spec.subdir.or(subdir);
+                let existing_channel = match_spec.channel().cloned();
+                let existing_subdir = match_spec.subdir().map(|s| s.to_owned());
+                match_spec.set_channel(existing_channel.or(channel.map(Arc::new)));
+                match_spec.set_subdir(existing_subdir.or(subdir));
             }
-            "license" => match_spec.license = Some(value.to_string()),
+            "license" => match_spec.set_license(Some(value.to_string())),
             "track_features" => {
-                match_spec.track_features = Some(
+                match_spec.set_track_features(Some(
                     value
                         .split([',', ' ']) // Split on BOTH comma and space
                         .map(str::trim) // Remove surrounding whitespace
                         .filter(|s| !s.is_empty()) // Filter out empty strings from "a, b"
                         .map(ToString::to_string)
                         .collect(),
-                );
+                ));
             }
             "when" => {
                 // Conditional dependencies using bracket syntax
@@ -515,7 +519,7 @@ fn parse_bracket_vec_into_components(
                         ));
                     }
 
-                    match_spec.condition = Some(condition);
+                    match_spec.set_condition(Some(condition));
                 } else {
                     return Err(ParseMatchSpecError::InvalidBracketKey("when".to_string()));
                 }
@@ -761,10 +765,9 @@ impl NamelessMatchSpec {
 
         // Parse url or path spec
         if let Some(url) = parse_url_like(input)? {
-            return Ok(NamelessMatchSpec {
-                url: Some(url),
-                ..NamelessMatchSpec::default()
-            });
+            let mut spec = NamelessMatchSpec::default();
+            spec.set_url(Some(url));
+            return Ok(spec);
         }
 
         let mut match_spec =
@@ -778,16 +781,23 @@ impl NamelessMatchSpec {
         let namespace = input_split.next();
         let channel_str = input_split.next();
 
-        match_spec.namespace = namespace
-            .map(str::trim)
-            .filter(|namespace| !namespace.is_empty())
-            .map(ToOwned::to_owned)
-            .or(match_spec.namespace);
+        {
+            let existing_ns = match_spec.namespace().map(|s| s.to_owned());
+            match_spec.set_namespace(
+                namespace
+                    .map(str::trim)
+                    .filter(|namespace| !namespace.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or(existing_ns),
+            );
+        }
 
         if let Some(channel_str) = channel_str {
             let (channel, subdir) = parse_channel_and_subdir(channel_str)?;
-            match_spec.channel = match_spec.channel.or(channel.map(Arc::new));
-            match_spec.subdir = match_spec.subdir.or(subdir);
+            let existing_channel = match_spec.channel().cloned();
+            let existing_subdir = match_spec.subdir().map(|s| s.to_owned());
+            match_spec.set_channel(existing_channel.or(channel.map(Arc::new)));
+            match_spec.set_subdir(existing_subdir.or(subdir));
         }
 
         // Get the version and optional build string
@@ -854,7 +864,7 @@ pub(crate) fn matchspec_parser(
     // TODO: What is this? I've never seen it
 
     // 4. Parse as url
-    if nameless_match_spec.url.is_none() {
+    if nameless_match_spec.url().is_none() {
         if let Some(url) = parse_url_like(&input)? {
             let archive = CondaArchiveIdentifier::try_from_url(&url);
             let name = archive.and_then(|a| PackageNameMatcher::from_str(&a.identifier.name).ok());
@@ -863,11 +873,10 @@ pub(crate) fn matchspec_parser(
                 // Only return the 'url' and 'name' to avoid miss parsing the rest of the
                 // information. e.g. when a version is provided in the url is not the
                 // actual version this might be a problem when solving.
-                return Ok(MatchSpec {
-                    url: Some(url),
-                    name,
-                    ..Default::default()
-                });
+                let mut spec = MatchSpec::default();
+                spec.set_url(Some(url));
+                spec.name = name;
+                return Ok(spec);
             } else {
                 // TODO: This should also work without a proper name from the url filename
                 // If we can't figure out the name from the URL, return an error
@@ -884,16 +893,23 @@ pub(crate) fn matchspec_parser(
     let namespace = input_split.next();
     let channel_str = input_split.next();
 
-    nameless_match_spec.namespace = namespace
-        .map(str::trim)
-        .filter(|namespace| !namespace.is_empty())
-        .map(ToOwned::to_owned)
-        .or(nameless_match_spec.namespace);
+    {
+        let existing_ns = nameless_match_spec.namespace().map(|s| s.to_owned());
+        nameless_match_spec.set_namespace(
+            namespace
+                .map(str::trim)
+                .filter(|namespace| !namespace.is_empty())
+                .map(ToOwned::to_owned)
+                .or(existing_ns),
+        );
+    }
 
     if let Some(channel_str) = channel_str {
         let (channel, subdir) = parse_channel_and_subdir(channel_str)?;
-        nameless_match_spec.channel = nameless_match_spec.channel.or(channel.map(Arc::new));
-        nameless_match_spec.subdir = nameless_match_spec.subdir.or(subdir);
+        let existing_channel = nameless_match_spec.channel().cloned();
+        let existing_subdir = nameless_match_spec.subdir().map(|s| s.to_owned());
+        nameless_match_spec.set_channel(existing_channel.or(channel.map(Arc::new)));
+        nameless_match_spec.set_subdir(existing_subdir.or(subdir));
     }
 
     // Step 6. Strip off the package name from the input
@@ -915,8 +931,9 @@ pub(crate) fn matchspec_parser(
                 return Err(ParseMatchSpecError::MultipleValueForKey("build".to_owned()));
             }
         }
-        match_spec.version = match_spec.version.or(version);
-        match_spec.build = match_spec.build.or(build);
+        let inner = match_spec.nameless_mut();
+        inner.version = inner.version.take().or(version);
+        inner.build = inner.build.take().or(build);
     }
 
     Ok(match_spec)
@@ -1152,9 +1169,9 @@ mod tests {
             Some(VersionSpec::from_str("1.0.*", Strict).unwrap())
         );
         assert_eq!(
-            spec.channel,
+            spec.channel(),
             Some(
-                Channel::from_str("conda-forge", &channel_config())
+                &Channel::from_str("conda-forge", &channel_config())
                     .map(Arc::new)
                     .unwrap()
             )
@@ -1167,9 +1184,9 @@ mod tests {
             Some(VersionSpec::from_str("1.0.*", Strict).unwrap())
         );
         assert_eq!(
-            spec.channel,
+            spec.channel(),
             Some(
-                Channel::from_str("conda-forge", &channel_config())
+                &Channel::from_str("conda-forge", &channel_config())
                     .map(Arc::new)
                     .unwrap()
             )
@@ -1186,16 +1203,16 @@ mod tests {
             Some(VersionSpec::from_str("1.0.*", Strict).unwrap())
         );
         assert_eq!(
-            spec.channel,
+            spec.channel(),
             Some(
-                Channel::from_str("conda-forge", &channel_config())
+                &Channel::from_str("conda-forge", &channel_config())
                     .map(Arc::new)
                     .unwrap()
             )
         );
         assert_eq!(
-            spec.build_number,
-            Some(BuildNumberSpec::from_str(">6").unwrap())
+            spec.build_number(),
+            Some(&BuildNumberSpec::from_str(">6").unwrap())
         );
     }
 
@@ -1205,11 +1222,11 @@ mod tests {
             "https://conda.anaconda.org/conda-forge/linux-64/py-rattler-0.6.1-py39h8169da8_0.conda";
         let url = Url::parse(url_str).unwrap();
         let spec1 = NamelessMatchSpec::from_str(url_str, Strict).unwrap();
-        assert_eq!(spec1.url, Some(url.clone()));
+        assert_eq!(spec1.url(), Some(&url));
 
         let spec_with_brackets =
             NamelessMatchSpec::from_str(format!("[url={url_str}]").as_str(), Strict).unwrap();
-        assert_eq!(spec_with_brackets.url, Some(url));
+        assert_eq!(spec_with_brackets.url(), Some(&url));
     }
 
     #[test]
@@ -1218,21 +1235,21 @@ mod tests {
         let win_path_str = "C:\\Users\\user\\conda-bld\\linux-64\\foo-1.0-py27_0.tar.bz2";
         let spec = NamelessMatchSpec::from_str(win_path_str, Strict).unwrap();
         let win_path = file_url::file_path_to_url(win_path_str).unwrap();
-        assert_eq!(spec.url, Some(win_path.clone()));
+        assert_eq!(spec.url(), Some(&win_path));
 
         let spec_with_brackets =
             NamelessMatchSpec::from_str(format!("[url={win_path_str}]").as_str(), Strict).unwrap();
-        assert_eq!(spec_with_brackets.url, Some(win_path));
+        assert_eq!(spec_with_brackets.url(), Some(&win_path));
 
         // Unix
         let unix_path_str = "/users/user/conda-bld/linux-64/foo-1.0-py27_0.tar.bz2";
         let spec = NamelessMatchSpec::from_str(unix_path_str, Strict).unwrap();
         let unix_path = file_url::file_path_to_url(unix_path_str).unwrap();
-        assert_eq!(spec.url, Some(unix_path.clone()));
+        assert_eq!(spec.url(), Some(&unix_path));
 
         let spec_with_brackets =
             NamelessMatchSpec::from_str(format!("[url={unix_path_str}]").as_str(), Strict).unwrap();
-        assert_eq!(spec_with_brackets.url, Some(unix_path));
+        assert_eq!(spec_with_brackets.url(), Some(&unix_path));
     }
 
     #[test]
@@ -1245,7 +1262,7 @@ mod tests {
 
         let spec = MatchSpec::from_str("conda-forge::foo[sha256=315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3]", Strict).unwrap();
         assert_eq!(
-            spec.sha256,
+            spec.sha256().copied(),
             Some(
                 parse_digest_from_hex::<Sha256>(
                     "315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3"
@@ -1260,7 +1277,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            spec.md5,
+            spec.md5().copied(),
             Some(parse_digest_from_hex::<Md5>("8b1a9953c4611296a827abf8c47804d7").unwrap())
         );
     }
@@ -1514,7 +1531,7 @@ mod tests {
     #[test]
     fn test_empty_namespace() {
         let spec = MatchSpec::from_str("conda-forge::foo", Strict).unwrap();
-        assert!(spec.namespace.is_none());
+        assert!(spec.namespace().is_none());
     }
 
     #[test]
@@ -1536,12 +1553,12 @@ mod tests {
             Strict,
         )
         .unwrap();
-        assert_eq!(spec.namespace, Some("namespace".to_owned()));
+        assert_eq!(spec.namespace(), Some("namespace"));
         assert_eq!(spec.name, "foo".parse().unwrap());
-        assert_eq!(spec.channel.unwrap().name(), "conda-forge");
+        assert_eq!(spec.channel().unwrap().name(), "conda-forge");
         assert_eq!(
-            spec.url,
-            Some(Url::parse("https://a.b/c/d/p-1-b_0.conda").unwrap())
+            spec.url(),
+            Some(&Url::parse("https://a.b/c/d/p-1-b_0.conda").unwrap())
         );
     }
 
@@ -1553,7 +1570,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(spec.url, Some(Url::parse("https://conda.anaconda.org/conda-forge/linux-64/py-rattler-0.6.1-py39h8169da8_0.conda").unwrap()));
+        assert_eq!(spec.url(), Some(&Url::parse("https://conda.anaconda.org/conda-forge/linux-64/py-rattler-0.6.1-py39h8169da8_0.conda").unwrap()));
     }
 
     #[test]
@@ -1564,9 +1581,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            spec.url,
+            spec.url(),
             Some(
-                Url::parse("file://C:/Users/user/conda-bld/linux-64/foo-1.0-py27_0.tar.bz2")
+                &Url::parse("file://C:/Users/user/conda-bld/linux-64/foo-1.0-py27_0.tar.bz2")
                     .unwrap()
             )
         );
@@ -1578,8 +1595,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            spec.url,
-            Some(Url::parse("file:/home/user/conda-bld/linux-64/foo-1.0-py27_0.tar.bz2").unwrap())
+            spec.url(),
+            Some(&Url::parse("file:/home/user/conda-bld/linux-64/foo-1.0-py27_0.tar.bz2").unwrap())
         );
     }
 
@@ -1607,7 +1624,7 @@ mod tests {
         let spec = MatchSpec::from_str("python[license=MIT]", Strict).unwrap();
 
         assert_eq!(spec.name, "python".parse().unwrap());
-        assert_eq!(spec.license, Some("MIT".into()));
+        assert_eq!(spec.license(), Some("MIT"));
     }
 
     #[test]
@@ -1621,8 +1638,8 @@ mod tests {
         for case in cases {
             let spec = MatchSpec::from_str(case, Strict).unwrap();
             assert_eq!(
-                spec.track_features,
-                Some(vec!["pypy".to_string(), "debug".to_string()]),
+                spec.track_features(),
+                Some(["pypy".to_string(), "debug".to_string()].as_slice()),
                 "Failed on syntax: {case}",
             );
         }
@@ -1686,37 +1703,39 @@ mod tests {
             vec![MatchSpec::from_str("foo[version=1.0.*, build_number=\">6\"]", Strict).unwrap()];
 
         // complete matchspec to verify that we print all fields
-        specs.push(MatchSpec {
-            name: "foo".parse().unwrap(),
-            version: Some(VersionSpec::from_str("1.0.*", Strict).unwrap()),
-            build: "py27_0*".parse().ok(),
-            build_number: Some(BuildNumberSpec::from_str(">=6").unwrap()),
-            file_name: Some("foo-1.0-py27_0.tar.bz2".to_string()),
-            extras: None,
-            channel: Some(
+        {
+            let mut nameless = NamelessMatchSpec {
+                version: Some(VersionSpec::from_str("1.0.*", Strict).unwrap()),
+                build: "py27_0*".parse().ok(),
+                ..Default::default()
+            };
+            nameless.set_build_number(Some(BuildNumberSpec::from_str(">=6").unwrap()));
+            nameless.set_file_name(Some("foo-1.0-py27_0.tar.bz2".to_string()));
+            nameless.set_channel(Some(
                 Channel::from_str("conda-forge", &channel_config())
                     .map(Arc::new)
                     .unwrap(),
-            ),
-            subdir: Some("linux-64".to_string()),
-            namespace: Some("foospace".to_string()),
-            md5: Some(parse_digest_from_hex::<Md5>("8b1a9953c4611296a827abf8c47804d7").unwrap()),
-            sha256: Some(
+            ));
+            nameless.set_subdir(Some("linux-64".to_string()));
+            nameless.set_namespace(Some("foospace".to_string()));
+            nameless.set_md5(Some(
+                parse_digest_from_hex::<Md5>("8b1a9953c4611296a827abf8c47804d7").unwrap(),
+            ));
+            nameless.set_sha256(Some(
                 parse_digest_from_hex::<Sha256>(
                     "315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3",
                 )
                 .unwrap(),
-            ),
-            url: Some(
+            ));
+            nameless.set_url(Some(
                 Url::parse(
                     "https://conda.anaconda.org/conda-forge/linux-64/foo-1.0-py27_0.tar.bz2",
                 )
                 .unwrap(),
-            ),
-            license: Some("MIT".into()),
-            condition: None,
-            track_features: None,
-        });
+            ));
+            nameless.set_license(Some("MIT".into()));
+            specs.push(MatchSpec::from_nameless(nameless, "foo".parse().unwrap()));
+        }
 
         // insta check all the strings
         let vec_strings = specs.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -1737,7 +1756,7 @@ mod tests {
             ParseStrictness::Lenient,
         )
         .unwrap();
-        let version_spec = match_spec.version.unwrap();
+        let version_spec = match_spec.version.as_ref().unwrap();
         let version = Version::from_str("0.4.1").unwrap();
         assert!(version_spec.matches(&version));
     }
@@ -1752,7 +1771,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.name, "foo".parse().unwrap());
         assert_eq!(
-            spec.condition.unwrap().to_string(),
+            spec.condition().unwrap().to_string(),
             "python >=3.6".to_string()
         );
     }
@@ -1771,7 +1790,7 @@ mod tests {
             Some(VersionSpec::from_str(">=2.0", Strict).unwrap())
         );
         assert_eq!(
-            spec.condition.unwrap().to_string(),
+            spec.condition().unwrap().to_string(),
             "python >=3.10".to_string()
         );
     }
@@ -1786,7 +1805,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.name, "foo".parse().unwrap());
         assert_eq!(
-            spec.condition.unwrap().to_string(),
+            spec.condition().unwrap().to_string(),
             "python >=3.6".to_string()
         );
     }
@@ -1804,7 +1823,7 @@ mod tests {
         // Complex condition with AND/OR
         let spec = parse_conditional(r#"foo[when="python >=3.6 and linux"]"#).unwrap();
         assert_eq!(
-            spec.condition.unwrap().to_string(),
+            spec.condition().unwrap().to_string(),
             "(python >=3.6 and linux)"
         );
     }
@@ -1813,7 +1832,7 @@ mod tests {
     fn test_conditional_parsing_escaped_quotes_in_when_value() {
         // When value containing an inner bracket spec with quotes
         let spec = parse_conditional(r#"foo[when="python[version=\">=3.6\"]"]"#).unwrap();
-        assert!(spec.condition.is_some());
+        assert!(spec.condition().is_some());
         // Verify round-trip
         let reparsed = parse_conditional(&spec.to_string()).unwrap();
         assert_eq!(spec, reparsed);
@@ -1823,12 +1842,12 @@ mod tests {
     fn test_conditional_parsing_complex_version() {
         // Complex version constraints in condition
         let spec = parse_conditional(r#"foo[when="python >=3.6,<4.0"]"#).unwrap();
-        assert_eq!(spec.condition.unwrap().to_string(), "python >=3.6,<4.0");
+        assert_eq!(spec.condition().unwrap().to_string(), "python >=3.6,<4.0");
 
         // Multiple conditions with or
         let spec = parse_conditional(r#"foo[when="python >=3.6 or python <3.0"]"#).unwrap();
         assert_eq!(
-            spec.condition.unwrap().to_string(),
+            spec.condition().unwrap().to_string(),
             "(python >=3.6 or python <3.0)"
         );
     }
@@ -1885,8 +1904,8 @@ mod tests {
             spec.version,
             Some(VersionSpec::from_str(">=1.0", Strict).unwrap())
         );
-        assert_eq!(spec.condition.unwrap().to_string(), "python >=3.6");
-        assert_eq!(spec.build.unwrap().to_string(), "py*");
+        assert_eq!(spec.condition().unwrap().to_string(), "python >=3.6");
+        assert_eq!(spec.build.as_ref().unwrap().to_string(), "py*");
     }
 
     #[test]
@@ -2008,7 +2027,7 @@ mod tests {
     fn test_conditional_package_name_with_and_or_substring() {
         // Package names containing "and"/"or" substrings should not be split
         let spec = parse_conditional(r#"foo[when="pandoc >=2.0"]"#).unwrap();
-        assert_eq!(spec.condition.unwrap().to_string(), "pandoc >=2.0");
+        assert_eq!(spec.condition().unwrap().to_string(), "pandoc >=2.0");
     }
 
     #[test]
@@ -2045,7 +2064,7 @@ mod tests {
             spec.version,
             Some(VersionSpec::from_str(">=1.0", Strict).unwrap())
         );
-        assert_eq!(spec.condition.unwrap().to_string(), "python >=3.6");
+        assert_eq!(spec.condition().unwrap().to_string(), "python >=3.6");
     }
 
     #[test]
@@ -2069,7 +2088,7 @@ mod tests {
     fn test_conditional_inner_bracket_spec() {
         // Inner bracket specs in conditions should work with proper bracket syntax
         let spec = parse_conditional(r#"foo[when="python[version=\">=3.6\"]"]"#).unwrap();
-        assert!(spec.condition.is_some());
+        assert!(spec.condition().is_some());
     }
 
     #[test]
@@ -2080,7 +2099,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(spec.extras, Some(vec!["bar".to_string()]));
+        assert_eq!(spec.optional_extras(), Some(["bar".to_string()].as_slice()));
         assert!(MatchSpec::from_str(
             "foo[extras=[bar,baz]",
             ParseMatchSpecOptions::strict().with_experimental_extras(true)
@@ -2096,8 +2115,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            spec.extras,
-            Some(vec!["bar".to_string(), "baz".to_string()])
+            spec.optional_extras(),
+            Some(["bar".to_string(), "baz".to_string()].as_slice())
         );
     }
 

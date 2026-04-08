@@ -403,7 +403,7 @@ impl Matches<MatchSpec> for CondaPackageData {
         }
 
         // Check if the channel matches
-        if let Some(channel) = &spec.channel {
+        if let Some(channel) = spec.channel() {
             match self {
                 CondaPackageData::Binary(binary) => {
                     if let Some(record_channel) = &binary.channel {
@@ -426,7 +426,7 @@ impl Matches<MatchSpec> for CondaPackageData {
 impl Matches<NamelessMatchSpec> for CondaPackageData {
     fn matches(&self, spec: &NamelessMatchSpec) -> bool {
         // Check if the channel matches
-        if let Some(channel) = &spec.channel {
+        if let Some(channel) = spec.channel() {
             match self {
                 CondaPackageData::Binary(binary) => {
                     if let Some(record_channel) = &binary.channel {
