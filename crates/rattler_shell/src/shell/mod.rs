@@ -557,12 +557,6 @@ impl Shell for CmdExe {
         Ok(writeln!(f, "@SET {env_var}=")?)
     }
 
-    /// Emit one `@SET` per path so each line stays under cmd.exe's
-    /// ~8191-character command-line limit. A single concatenated
-    /// `@SET "Path=a;b;c;...;%Path%"` can overflow this limit when the conda
-    /// prefix or pre-existing PATH is long, producing
-    /// "The input line is too long." See
-    /// <https://github.com/prefix-dev/pixi/issues/6039>.
     fn set_path(
         &self,
         f: &mut impl Write,
@@ -570,39 +564,32 @@ impl Shell for CmdExe {
         modification_behavior: PathModificationBehavior,
         platform: &Platform,
     ) -> ShellResult {
+        // cmd.exe has a ~8191-char per-line limit. A single concatenated
+        // `@SET "Path=a;b;c;...;%Path%"` overflows it when the prefix or
+        // existing %Path% is long, producing "The input line is too long."
+        // Emit one @SET per entry so each line is bounded by a single path.
         let path_var = self.path_var(platform);
-        let separator = self.path_separator(platform);
+        let sep = self.path_separator(platform);
         let path_ref = self.format_env_var(path_var);
 
-        match modification_behavior {
-            PathModificationBehavior::Replace => {
-                // Seed Path with the first new entry, then append the rest one by one.
-                let mut iter = paths.iter();
-                let first = iter
-                    .next()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.set_env_var(f, path_var, &first)?;
-                for path in iter {
-                    let path = path.to_string_lossy();
-                    self.set_env_var(f, path_var, &format!("{path_ref}{separator}{path}"))?;
+        // Prepend walks in reverse so the last SET ends up first in Path.
+        let prepend = matches!(modification_behavior, PathModificationBehavior::Prepend);
+        let ordered: Vec<&PathBuf> = if prepend {
+            paths.iter().rev().collect()
+        } else {
+            paths.iter().collect()
+        };
+
+        for (i, path) in ordered.iter().enumerate() {
+            let path = path.to_string_lossy();
+            let value = match modification_behavior {
+                PathModificationBehavior::Replace if i == 0 => path.into_owned(),
+                PathModificationBehavior::Replace | PathModificationBehavior::Append => {
+                    format!("{path_ref}{sep}{path}")
                 }
-            }
-            PathModificationBehavior::Append => {
-                // Append each new entry after the existing Path one at a time.
-                for path in paths {
-                    let path = path.to_string_lossy();
-                    self.set_env_var(f, path_var, &format!("{path_ref}{separator}{path}"))?;
-                }
-            }
-            PathModificationBehavior::Prepend => {
-                // Iterate in reverse so the final ordering matches the input order:
-                // each SET prepends one entry, so the last one written ends up first.
-                for path in paths.iter().rev() {
-                    let path = path.to_string_lossy();
-                    self.set_env_var(f, path_var, &format!("{path}{separator}{path_ref}"))?;
-                }
-            }
+                PathModificationBehavior::Prepend => format!("{path}{sep}{path_ref}"),
+            };
+            self.set_env_var(f, path_var, &value)?;
         }
         Ok(())
     }
