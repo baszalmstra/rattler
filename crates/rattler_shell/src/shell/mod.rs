@@ -557,6 +557,56 @@ impl Shell for CmdExe {
         Ok(writeln!(f, "@SET {env_var}=")?)
     }
 
+    /// Emit one `@SET` per path so each line stays under cmd.exe's
+    /// ~8191-character command-line limit. A single concatenated
+    /// `@SET "Path=a;b;c;...;%Path%"` can overflow this limit when the conda
+    /// prefix or pre-existing PATH is long, producing
+    /// "The input line is too long." See
+    /// <https://github.com/prefix-dev/pixi/issues/6039>.
+    fn set_path(
+        &self,
+        f: &mut impl Write,
+        paths: &[PathBuf],
+        modification_behavior: PathModificationBehavior,
+        platform: &Platform,
+    ) -> ShellResult {
+        let path_var = self.path_var(platform);
+        let separator = self.path_separator(platform);
+        let path_ref = self.format_env_var(path_var);
+
+        match modification_behavior {
+            PathModificationBehavior::Replace => {
+                // Seed Path with the first new entry, then append the rest one by one.
+                let mut iter = paths.iter();
+                let first = iter
+                    .next()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.set_env_var(f, path_var, &first)?;
+                for path in iter {
+                    let path = path.to_string_lossy();
+                    self.set_env_var(f, path_var, &format!("{path_ref}{separator}{path}"))?;
+                }
+            }
+            PathModificationBehavior::Append => {
+                // Append each new entry after the existing Path one at a time.
+                for path in paths {
+                    let path = path.to_string_lossy();
+                    self.set_env_var(f, path_var, &format!("{path_ref}{separator}{path}"))?;
+                }
+            }
+            PathModificationBehavior::Prepend => {
+                // Iterate in reverse so the final ordering matches the input order:
+                // each SET prepends one entry, so the last one written ends up first.
+                for path in paths.iter().rev() {
+                    let path = path.to_string_lossy();
+                    self.set_env_var(f, path_var, &format!("{path}{separator}{path_ref}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_script(&self, f: &mut impl Write, path: &Path) -> ShellResult {
         Ok(writeln!(f, "@CALL \"{}\"", path.to_string_lossy())?)
     }
@@ -1200,6 +1250,78 @@ mod tests {
             .unwrap();
 
         insta::assert_snapshot!(script.contents);
+    }
+
+    #[test]
+    fn test_cmd_set_path_one_set_per_entry() {
+        // cmd.exe has a ~8191-char per-line limit. set_path must emit one @SET
+        // per path so a long PATH can never overflow that limit.
+        // See https://github.com/prefix-dev/pixi/issues/6039.
+        let paths = vec![
+            PathBuf::from("C:/a"),
+            PathBuf::from("C:/b"),
+            PathBuf::from("C:/c"),
+        ];
+
+        // Replace: first SET seeds Path, subsequent ones append via %Path%.
+        let mut script = ShellScript::new(CmdExe, Platform::Win64);
+        script
+            .set_path(&paths, PathModificationBehavior::Replace)
+            .unwrap();
+        assert_eq!(
+            script.contents,
+            "@SET \"Path=C:/a\"\n\
+             @SET \"Path=%Path%;C:/b\"\n\
+             @SET \"Path=%Path%;C:/c\"\n"
+        );
+
+        // Append preserves input order by appending each entry after %Path%.
+        let mut script = ShellScript::new(CmdExe, Platform::Win64);
+        script
+            .set_path(&paths, PathModificationBehavior::Append)
+            .unwrap();
+        assert_eq!(
+            script.contents,
+            "@SET \"Path=%Path%;C:/a\"\n\
+             @SET \"Path=%Path%;C:/b\"\n\
+             @SET \"Path=%Path%;C:/c\"\n"
+        );
+
+        // Prepend iterates in reverse so the resulting Path starts with C:/a.
+        let mut script = ShellScript::new(CmdExe, Platform::Win64);
+        script
+            .set_path(&paths, PathModificationBehavior::Prepend)
+            .unwrap();
+        assert_eq!(
+            script.contents,
+            "@SET \"Path=C:/c;%Path%\"\n\
+             @SET \"Path=C:/b;%Path%\"\n\
+             @SET \"Path=C:/a;%Path%\"\n"
+        );
+    }
+
+    #[test]
+    fn test_cmd_set_path_long_paths_stay_under_cmd_limit() {
+        // Each individual @SET line must stay under cmd.exe's 8191-char limit
+        // even when the total Path would otherwise overflow it.
+        let long_segment = "C:\\".to_string() + &"a".repeat(200);
+        let paths: Vec<PathBuf> = (0..200).map(|_| PathBuf::from(&long_segment)).collect();
+
+        for behavior in [
+            PathModificationBehavior::Replace,
+            PathModificationBehavior::Append,
+            PathModificationBehavior::Prepend,
+        ] {
+            let mut script = ShellScript::new(CmdExe, Platform::Win64);
+            script.set_path(&paths, behavior).unwrap();
+            for line in script.contents.lines() {
+                assert!(
+                    line.len() < 8191,
+                    "line is {} chars, exceeds cmd.exe limit: {line}",
+                    line.len()
+                );
+            }
+        }
     }
 
     #[test]
