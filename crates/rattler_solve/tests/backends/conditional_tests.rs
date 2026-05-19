@@ -297,6 +297,52 @@ pub(super) fn rattler_issue_1917_platform_conditionals<T: SolverImpl + Default>(
     ]);
 }
 
+/// Documents the current behavior when a `when` condition references a
+/// package's extras (e.g. `foo[when="baz[extras=[bla]]"]`).
+///
+/// One might expect `foo` to only be pulled in when `baz` is solved together
+/// with the named extra (or, with multiple extras, perhaps when *any* / *all*
+/// of them are selected). Today this syntax is rejected at parse time: the
+/// inner match spec inside a `when` clause is parsed in strict mode without
+/// experimental extras, so the bracket key `extras` is not accepted there.
+///
+/// This test pins that behavior so any future change that starts accepting
+/// `extras=` inside `when` conditions surfaces here.
+pub(super) fn solve_conditional_referencing_extras_is_rejected<T: SolverImpl + Default>() {
+    use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};
+
+    let options = ParseMatchSpecOptions::lenient()
+        .with_experimental_extras(true)
+        .with_experimental_conditionals(true);
+
+    // Single-extra form: `foo[when="baz[extras=[bla]]"]`
+    let single_extra = MatchSpec::from_str(r#"foo[when="baz[extras=[bla]]"]"#, options);
+    assert!(
+        matches!(
+            single_extra,
+            Err(ParseMatchSpecError::InvalidCondition(_, _))
+        ),
+        "expected InvalidCondition for `foo[when=\"baz[extras=[bla]]\"]`, got {single_extra:?}"
+    );
+
+    // Multi-extra form: `foo[when="baz[extras=[bla,blee]]"]`. We get the same
+    // failure mode -- the condition parser bails out before any logic about
+    // "any" vs "all" extras could even apply.
+    let multi_extra = MatchSpec::from_str(r#"foo[when="baz[extras=[bla,blee]]"]"#, options);
+    assert!(
+        matches!(
+            multi_extra,
+            Err(ParseMatchSpecError::InvalidCondition(_, _))
+        ),
+        "expected InvalidCondition for `foo[when=\"baz[extras=[bla,blee]]\"]`, got {multi_extra:?}"
+    );
+
+    // Sanity check: silence the unused type parameter for backends that don't
+    // currently exercise the spec at runtime. Using the solver here would be
+    // dead code because the spec fails before reaching it.
+    let _ = std::marker::PhantomData::<T>;
+}
+
 /// Test for <https://github.com/conda/rattler/issues/1917>
 pub(super) fn rattler_issue_1917_version_conditionals<T: SolverImpl + Default>() {
     use rattler_conda_types::Version;

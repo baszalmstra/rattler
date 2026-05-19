@@ -653,6 +653,11 @@ macro_rules! solver_backend_tests {
         }
 
         #[test]
+        fn test_solve_conditional_referencing_extras_is_rejected() {
+            crate::conditional_tests::solve_conditional_referencing_extras_is_rejected::<$T>();
+        }
+
+        #[test]
         fn test_solve_with_unparsable_dependency() {
             crate::solver_case_tests::solve_with_unparsable_dependency::<$T>();
         }
