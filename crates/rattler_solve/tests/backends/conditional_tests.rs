@@ -297,50 +297,116 @@ pub(super) fn rattler_issue_1917_platform_conditionals<T: SolverImpl + Default>(
     ]);
 }
 
-/// Documents the current behavior when a `when` condition references a
-/// package's extras (e.g. `foo[when="baz[extras=[bla]]"]`).
+/// Exercises a `when` condition that references one extra on another package
+/// (e.g. `foo[when="baz[extras=[bla]]"]`). With extras allowed inside
+/// conditions, the inner match spec lowers to "baz is selected AND baz[bla] is
+/// selected", so `foo` only appears when both are true.
+pub(super) fn solve_conditional_referencing_single_extra<T: SolverImpl + Default>() {
+    let foo_pkg = PackageBuilder::new("foo").version("1.0.0").build();
+
+    let baz_dep = PackageBuilder::new("baz-dep").version("1.0.0").build();
+
+    let baz_pkg = PackageBuilder::new("baz")
+        .version("1.0.0")
+        .extra_depends("bla", ["baz-dep"])
+        .extra_depends("other", ["baz-dep"])
+        .build();
+
+    // `pkg-a` only requires `foo` when `baz` is being installed *with* the
+    // `bla` extra selected.
+    let pkg_a = PackageBuilder::new("pkg-a")
+        .version("1.0.0")
+        .depends([r#"foo[when="baz[extras=[bla]]"]"#])
+        .build();
+
+    let repository = vec![
+        pkg_a.clone(),
+        baz_pkg.clone(),
+        baz_dep.clone(),
+        foo_pkg.clone(),
+    ];
+
+    run_solver_cases::<T>(&[
+        SolverCase::new("foo pulled in when baz is selected with the matching extra")
+            .repository(repository.clone())
+            .specs(["pkg-a", "baz[extras=[bla]]"])
+            .expect_present([&pkg_a, &baz_pkg, &baz_dep, &foo_pkg])
+            .expect_extras([("baz", ["bla"])]),
+        SolverCase::new("foo absent when baz is selected without the matching extra")
+            .repository(repository.clone())
+            .specs(["pkg-a", "baz"])
+            .expect_present([&pkg_a, &baz_pkg])
+            .expect_absent([&foo_pkg, &baz_dep]),
+        SolverCase::new("foo absent when baz is selected with a different extra")
+            .repository(repository.clone())
+            .specs(["pkg-a", "baz[extras=[other]]"])
+            .expect_present([&pkg_a, &baz_pkg, &baz_dep])
+            .expect_absent([&foo_pkg])
+            .expect_extras([("baz", ["other"])]),
+        SolverCase::new("foo absent when baz is not part of the solve at all")
+            .repository(repository)
+            .specs(["pkg-a"])
+            .expect_present([&pkg_a])
+            .expect_absent([&foo_pkg, &baz_pkg, &baz_dep]),
+    ]);
+}
+
+/// Exercises a `when` condition that lists *multiple* extras on the inner
+/// package (e.g. `foo[when="baz[extras=[bla,blee]]"]`).
 ///
-/// One might expect `foo` to only be pulled in when `baz` is solved together
-/// with the named extra (or, with multiple extras, perhaps when *any* / *all*
-/// of them are selected). Today this syntax is rejected at parse time: the
-/// inner match spec inside a `when` clause is parsed in strict mode without
-/// experimental extras, so the bracket key `extras` is not accepted there.
-///
-/// This test pins that behavior so any future change that starts accepting
-/// `extras=` inside `when` conditions surfaces here.
-pub(super) fn solve_conditional_referencing_extras_is_rejected<T: SolverImpl + Default>() {
-    use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};
+/// Each version-set produced by the inner match spec is combined with `AND`
+/// inside the solver, so the condition fires only when **every** listed extra
+/// of `baz` is selected. Selecting any strict subset of those extras is not
+/// enough.
+pub(super) fn solve_conditional_referencing_multiple_extras<T: SolverImpl + Default>() {
+    let foo_pkg = PackageBuilder::new("foo").version("1.0.0").build();
+    let dep_bla = PackageBuilder::new("dep-bla").version("1.0.0").build();
+    let dep_blee = PackageBuilder::new("dep-blee").version("1.0.0").build();
 
-    let options = ParseMatchSpecOptions::lenient()
-        .with_experimental_extras(true)
-        .with_experimental_conditionals(true);
+    let baz_pkg = PackageBuilder::new("baz")
+        .version("1.0.0")
+        .extra_depends("bla", ["dep-bla"])
+        .extra_depends("blee", ["dep-blee"])
+        .build();
 
-    // Single-extra form: `foo[when="baz[extras=[bla]]"]`
-    let single_extra = MatchSpec::from_str(r#"foo[when="baz[extras=[bla]]"]"#, options);
-    assert!(
-        matches!(
-            single_extra,
-            Err(ParseMatchSpecError::InvalidCondition(_, _))
-        ),
-        "expected InvalidCondition for `foo[when=\"baz[extras=[bla]]\"]`, got {single_extra:?}"
-    );
+    // `pkg-a` requires `foo` only when *both* extras are selected on `baz`.
+    let pkg_a = PackageBuilder::new("pkg-a")
+        .version("1.0.0")
+        .depends([r#"foo[when="baz[extras=[bla,blee]]"]"#])
+        .build();
 
-    // Multi-extra form: `foo[when="baz[extras=[bla,blee]]"]`. We get the same
-    // failure mode -- the condition parser bails out before any logic about
-    // "any" vs "all" extras could even apply.
-    let multi_extra = MatchSpec::from_str(r#"foo[when="baz[extras=[bla,blee]]"]"#, options);
-    assert!(
-        matches!(
-            multi_extra,
-            Err(ParseMatchSpecError::InvalidCondition(_, _))
-        ),
-        "expected InvalidCondition for `foo[when=\"baz[extras=[bla,blee]]\"]`, got {multi_extra:?}"
-    );
+    let repository = vec![
+        pkg_a.clone(),
+        baz_pkg.clone(),
+        dep_bla.clone(),
+        dep_blee.clone(),
+        foo_pkg.clone(),
+    ];
 
-    // Sanity check: silence the unused type parameter for backends that don't
-    // currently exercise the spec at runtime. Using the solver here would be
-    // dead code because the spec fails before reaching it.
-    let _ = std::marker::PhantomData::<T>;
+    run_solver_cases::<T>(&[
+        SolverCase::new("foo pulled in when both required extras are selected on baz")
+            .repository(repository.clone())
+            .specs(["pkg-a", "baz[extras=[bla,blee]]"])
+            .expect_present([&pkg_a, &baz_pkg, &dep_bla, &dep_blee, &foo_pkg])
+            .expect_extras([("baz", ["bla", "blee"])]),
+        SolverCase::new("foo absent when only one of the required extras is selected")
+            .repository(repository.clone())
+            .specs(["pkg-a", "baz[extras=[bla]]"])
+            .expect_present([&pkg_a, &baz_pkg, &dep_bla])
+            .expect_absent([&foo_pkg, &dep_blee])
+            .expect_extras([("baz", ["bla"])]),
+        SolverCase::new("foo absent when only the other required extra is selected")
+            .repository(repository.clone())
+            .specs(["pkg-a", "baz[extras=[blee]]"])
+            .expect_present([&pkg_a, &baz_pkg, &dep_blee])
+            .expect_absent([&foo_pkg, &dep_bla])
+            .expect_extras([("baz", ["blee"])]),
+        SolverCase::new("foo absent when baz is selected but no extras are")
+            .repository(repository)
+            .specs(["pkg-a", "baz"])
+            .expect_present([&pkg_a, &baz_pkg])
+            .expect_absent([&foo_pkg, &dep_bla, &dep_blee]),
+    ]);
 }
 
 /// Test for <https://github.com/conda/rattler/issues/1917>

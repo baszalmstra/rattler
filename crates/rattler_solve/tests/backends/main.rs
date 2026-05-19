@@ -653,8 +653,13 @@ macro_rules! solver_backend_tests {
         }
 
         #[test]
-        fn test_solve_conditional_referencing_extras_is_rejected() {
-            crate::conditional_tests::solve_conditional_referencing_extras_is_rejected::<$T>();
+        fn test_solve_conditional_referencing_single_extra() {
+            crate::conditional_tests::solve_conditional_referencing_single_extra::<$T>();
+        }
+
+        #[test]
+        fn test_solve_conditional_referencing_multiple_extras() {
+            crate::conditional_tests::solve_conditional_referencing_multiple_extras::<$T>();
         }
 
         #[test]
