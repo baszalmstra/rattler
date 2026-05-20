@@ -13,7 +13,6 @@ use itertools::Itertools;
 use rattler_conda_types::MatchSpecCondition;
 use rattler_conda_types::{
     package::{ArchiveIdentifier, DistArchiveType},
-    utils::TimestampMs,
     GenericVirtualPackage, MatchSpec, Matches, NamelessMatchSpec, PackageName, PackageNameMatcher,
     ParseMatchSpecError, ParseMatchSpecOptions, RepoDataRecord, RepodataRevision, SolverResult,
 };
@@ -191,13 +190,12 @@ impl SolverPackageRecord<'_> {
         }
     }
 
-    fn timestamp(&self) -> Option<&chrono::DateTime<chrono::Utc>> {
+    fn timestamp(&self) -> Option<jiff::Timestamp> {
         match self {
             SolverPackageRecord::Record(rec) => rec
                 .package_record
                 .timestamp
-                .as_ref()
-                .map(TimestampMs::datetime),
+                .map(|ts| ts.jiff_timestamp()),
             SolverPackageRecord::Extra { .. } | SolverPackageRecord::VirtualPackage(..) => None,
         }
     }
