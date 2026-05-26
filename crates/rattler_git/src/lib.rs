@@ -1,8 +1,9 @@
 /// Derived from `uv-git` implementation
-/// Source: <https://github.com/astral-sh/uv/blob/4b8cc3e29e4c2a6417479135beaa9783b05195d3/crates/uv-git/src/lib.rs>
+/// Source: <https://github.com/astral-sh/uv/blob/main/crates/uv-git-types/src/lib.rs>
 /// This module expose types and functions to interact with Git repositories.
+use std::cmp::Ordering;
+
 use ::url::Url;
-pub use git::CheckoutOptions;
 use git::{GitBinaryError, GitReference};
 use sha::{GitSha, OidParseError};
 
@@ -22,8 +23,88 @@ pub const GIT_URL_QUERY_REV_TYPE: &str = "rev_type";
 /// Original issue: <https://github.com/prefix-dev/pixi/issues/3709>
 pub const GIT_SSH_CLONING_WARNING_MSG: &str = "Heads-up: use `ssh-add` if this hangs.";
 
+/// Configuration for Git LFS (Large File Storage) support for a `GitUrl`.
+///
+/// Mirrors uv's `GitLfs`. When `Enabled`, the runtime will call `git lfs fetch`
+/// and validate objects with `git lfs fsck --objects` as part of fetching the
+/// repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum GitLfs {
+    /// Git LFS is disabled (default).
+    #[default]
+    Disabled,
+    /// Git LFS is enabled.
+    Enabled,
+}
+
+impl GitLfs {
+    /// Returns true if LFS is enabled.
+    pub fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    /// Read a `GitLfs` setting from the named environment variable.
+    ///
+    /// Accepts a wider set of truthy spellings than uv to preserve pixi's
+    /// existing call-site semantics:
+    ///
+    /// * Enabled: `1`, `true`, `t`, `yes`, `y`, `on` (case-insensitive)
+    /// * Disabled: anything else, including unset
+    pub fn from_env(var_name: &str) -> Self {
+        match std::env::var(var_name) {
+            Ok(value) => {
+                let value = value.trim().to_ascii_lowercase();
+                if matches!(value.as_str(), "1" | "true" | "t" | "yes" | "y" | "on") {
+                    Self::Enabled
+                } else {
+                    Self::Disabled
+                }
+            }
+            Err(_) => Self::Disabled,
+        }
+    }
+}
+
+impl From<bool> for GitLfs {
+    fn from(value: bool) -> Self {
+        if value { Self::Enabled } else { Self::Disabled }
+    }
+}
+
+impl std::fmt::Display for GitLfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enabled => write!(f, "enabled"),
+            Self::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
+/// Whether to initialize / update submodules during checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum Submodules {
+    /// Recursively initialize and update submodules.
+    Update,
+    /// Leave submodules untouched (default).
+    #[default]
+    Skip,
+}
+
+impl Submodules {
+    /// Returns true if submodules should be updated.
+    pub fn should_update(self) -> bool {
+        matches!(self, Self::Update)
+    }
+}
+
+impl From<bool> for Submodules {
+    fn from(value: bool) -> Self {
+        if value { Self::Update } else { Self::Skip }
+    }
+}
+
 /// A URL reference to a Git repository.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Hash, Ord)]
+#[derive(Debug, Clone)]
 pub struct GitUrl {
     /// The URL of the Git repository, with any query parameters, fragments, and leading `git+`
     /// removed.
@@ -32,6 +113,10 @@ pub struct GitUrl {
     reference: GitReference,
     /// The precise commit to use, if known.
     precise: Option<GitSha>,
+    /// Git LFS configuration for this repository.
+    lfs: GitLfs,
+    /// Submodule update behavior for this repository.
+    submodules: Submodules,
 }
 
 impl GitUrl {
@@ -42,6 +127,8 @@ impl GitUrl {
             repository,
             reference,
             precise,
+            lfs: GitLfs::default(),
+            submodules: Submodules::default(),
         }
     }
 
@@ -51,6 +138,8 @@ impl GitUrl {
             repository,
             reference,
             precise: Some(precise),
+            lfs: GitLfs::default(),
+            submodules: Submodules::default(),
         }
     }
 
@@ -68,6 +157,20 @@ impl GitUrl {
         self
     }
 
+    /// Set the Git LFS configuration for this Git URL.
+    #[must_use]
+    pub fn with_lfs(mut self, lfs: GitLfs) -> Self {
+        self.lfs = lfs;
+        self
+    }
+
+    /// Set the submodule behavior for this Git URL.
+    #[must_use]
+    pub fn with_submodules(mut self, submodules: Submodules) -> Self {
+        self.submodules = submodules;
+        self
+    }
+
     /// Return the [`Url`] of the Git repository.
     pub fn repository(&self) -> &Url {
         &self.repository
@@ -81,6 +184,55 @@ impl GitUrl {
     /// Return the precise commit, if known.
     pub fn precise(&self) -> Option<GitSha> {
         self.precise
+    }
+
+    /// Return the Git LFS configuration.
+    pub fn lfs(&self) -> GitLfs {
+        self.lfs
+    }
+
+    /// Return the submodule configuration.
+    pub fn submodules(&self) -> Submodules {
+        self.submodules
+    }
+}
+
+impl PartialEq for GitUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.repository == other.repository
+            && self.reference == other.reference
+            && self.precise == other.precise
+            && self.lfs == other.lfs
+            && self.submodules == other.submodules
+    }
+}
+
+impl Eq for GitUrl {}
+
+impl PartialOrd for GitUrl {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GitUrl {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.repository
+            .cmp(&other.repository)
+            .then_with(|| self.reference.cmp(&other.reference))
+            .then_with(|| self.precise.cmp(&other.precise))
+            .then_with(|| self.lfs.cmp(&other.lfs))
+            .then_with(|| self.submodules.cmp(&other.submodules))
+    }
+}
+
+impl std::hash::Hash for GitUrl {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.repository.hash(state);
+        self.reference.hash(state);
+        self.precise.hash(state);
+        self.lfs.hash(state);
+        self.submodules.hash(state);
     }
 }
 
@@ -212,4 +364,7 @@ pub enum GitError {
 
     #[error("failed to set submodule url for {0}: {1}")]
     SubmoduleUrl(String, String),
+
+    #[error("failed to fetch Git LFS objects from {0}: {1}")]
+    LfsFetch(Url, String),
 }

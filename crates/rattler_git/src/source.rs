@@ -1,5 +1,5 @@
 /// Derived from `uv-git` implementation
-/// Source: <https://github.com/astral-sh/uv/blob/4b8cc3e29e4c2a6417479135beaa9783b05195d3/crates/uv-git/src/source.rs>
+/// Source: <https://github.com/astral-sh/uv/blob/main/crates/uv-git/src/source.rs>
 /// This module expose `GitSource` type that represents a remote Git source that
 /// can be checked out locally.
 use std::{
@@ -9,13 +9,13 @@ use std::{
     sync::Arc,
 };
 
-use reqwest_middleware::ClientWithMiddleware;
+use rattler_networking::LazyClient;
 use tracing::instrument;
 
 use crate::{
     GitError, GitUrl, Reporter,
     credentials::GIT_STORE,
-    git::{CheckoutOptions, GitRemote},
+    git::GitRemote,
     resolver::RepositoryReference,
     sha::{GitOid, GitSha},
     url::RepositoryUrl,
@@ -26,28 +26,21 @@ pub struct GitSource {
     /// The Git reference from the manifest file.
     git: GitUrl,
     /// The HTTP client to use for fetching.
-    client: ClientWithMiddleware,
+    client: LazyClient,
     /// The path to the Git source database.
     cache: PathBuf,
     /// The reporter to use for this source.
     reporter: Option<Arc<dyn Reporter>>,
-    /// Options controlling checkout behavior (submodules, etc.).
-    checkout_options: CheckoutOptions,
 }
 
 impl GitSource {
     /// Initialize a new Git source.
-    pub fn new(
-        git: GitUrl,
-        client: impl Into<ClientWithMiddleware>,
-        cache: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(git: GitUrl, client: impl Into<LazyClient>, cache: impl Into<PathBuf>) -> Self {
         Self {
             git,
             client: client.into(),
             cache: cache.into(),
             reporter: None,
-            checkout_options: CheckoutOptions::default(),
         }
     }
 
@@ -60,30 +53,26 @@ impl GitSource {
         }
     }
 
-    /// Set the [`CheckoutOptions`] to use for the [`GitSource`].
-    #[must_use]
-    pub fn with_checkout_options(self, options: CheckoutOptions) -> Self {
-        Self {
-            checkout_options: options,
-            ..self
-        }
-    }
-
     /// Fetch the underlying Git repository at the given revision.
-    #[instrument(skip(self), fields(repository = %self.git.repository, rev = self.git.precise.map(tracing::field::display)))]
+    #[instrument(skip(self), fields(repository = %self.git.repository(), rev = self.git.precise().map(tracing::field::display)))]
     pub fn fetch(self) -> Result<Fetch, GitError> {
-        // Compute the canonical URL for the repository.
-        let canonical = RepositoryUrl::new(&self.git.repository);
+        let lfs_requested = self.git.lfs().enabled();
 
-        // The path to the repo, within the Git database.
+        // Compute the canonical URL for the repository.
+        let canonical = RepositoryUrl::new(self.git.repository());
+
+        // The path to the repo, within the Git database. The bare DB itself
+        // is shared across LFS / submodule preferences: LFS objects may be
+        // present in the DB without affecting other consumers, and
+        // submodules are never materialised in the bare DB.
         let ident = cache_digest(&canonical);
         let db_path = self.cache.join("db").join(&ident);
 
         // Authenticate the URL, if necessary.
         let remote = if let Some(credentials) = GIT_STORE.get(&canonical) {
-            Cow::Owned(credentials.apply(self.git.repository.clone()))
+            Cow::Owned(credentials.apply(self.git.repository().clone()))
         } else {
-            Cow::Borrowed(&self.git.repository)
+            Cow::Borrowed(self.git.repository())
         };
 
         let remote = GitRemote::new(&remote);
@@ -101,15 +90,20 @@ impl GitSource {
             Err(_) => None,
         };
 
-        let (db, actual_rev, task) = match (self.git.precise, existing_db) {
+        let (db, actual_rev, task) = match (self.git.precise(), existing_db) {
             // If we have a locked revision, and we have a preexisting database
-            // which has that revision, then no update needs to happen.
-            (Some(rev), Some(db)) if db.contains(rev.into()) => {
+            // which has that revision, then no update needs to happen, but
+            // only if LFS artifacts are also present when LFS was requested.
+            (Some(rev), Some(db))
+                if db.contains(rev.into())
+                    && (!lfs_requested || db.contains_lfs_artifacts(rev.into())) =>
+            {
                 tracing::debug!(
                     "Using existing Git source `{}` pointed at `{}`",
-                    self.git.repository,
+                    self.git.repository(),
                     rev
                 );
+                let db = db.with_lfs_ready(lfs_requested.then_some(true));
                 (db, rev, None)
             }
 
@@ -118,18 +112,19 @@ impl GitSource {
             // situation that we have a locked revision but the database
             // doesn't have it.
             (locked_rev, db) => {
-                tracing::debug!("Updating Git source `{}`", self.git.repository);
+                tracing::debug!("Updating Git source `{}`", self.git.repository());
 
                 // Report the checkout operation to the reporter.
                 let task = self.reporter.as_ref().map(|reporter| {
-                    reporter.on_checkout_start(remote.url(), self.git.reference.as_rev())
+                    reporter.on_checkout_start(remote.url(), self.git.reference().as_rev())
                 });
 
                 let (db, actual_rev) = remote.checkout(
                     &db_path,
                     db,
-                    &self.git.reference,
+                    self.git.reference(),
                     locked_rev.map(GitOid::from),
+                    self.git.lfs(),
                     &self.client,
                 )?;
 
@@ -141,13 +136,23 @@ impl GitSource {
         // path length limit on Windows.
         let short_id = db.to_short_id(actual_rev.into())?;
 
+        // Namespace the checkout dir by the full `GitUrl` when LFS is enabled
+        // so that LFS-enabled and LFS-disabled checkouts of the same revision
+        // don't trample each other. Mirrors uv's behaviour. We only re-hash
+        // when LFS is enabled to keep the path stable for the common case.
+        let checkout_ident = if lfs_requested {
+            cache_digest_git_url(&self.git)
+        } else {
+            ident
+        };
+
         // Check out `actual_rev` from the database to a scoped location on the
         // filesystem. This will use hard links and such to ideally make the
         // checkout operation here pretty fast.
         let checkout_path = self
             .cache
             .join("checkouts")
-            .join(&ident)
+            .join(&checkout_ident)
             .join(short_id.as_str());
 
         tracing::debug!(
@@ -155,11 +160,12 @@ impl GitSource {
             actual_rev,
             checkout_path.display()
         );
-        db.copy_to(
+        let checkout = db.copy_to(
             actual_rev.into(),
             &checkout_path,
-            &self.git.repository,
-            &self.checkout_options,
+            self.git.repository(),
+            self.git.lfs(),
+            self.git.submodules(),
         )?;
 
         // Report the checkout operation to the reporter.
@@ -167,15 +173,16 @@ impl GitSource {
             reporter.on_checkout_complete(remote.url(), short_id.as_str(), task);
         }
 
-        tracing::trace!("Finished fetching Git source `{}`", self.git.repository);
+        tracing::trace!("Finished fetching Git source `{}`", self.git.repository());
 
         Ok(Fetch {
             repository: RepositoryReference {
                 url: canonical,
-                reference: self.git.reference.clone(),
+                reference: self.git.reference().clone(),
             },
             commit: actual_rev,
             path: checkout_path,
+            lfs_ready: checkout.lfs_ready().unwrap_or(false),
         })
     }
 }
@@ -190,6 +197,10 @@ pub struct Fetch {
 
     /// The path to the checked-out repository.
     path: PathBuf,
+
+    /// Whether Git LFS artifacts have been initialized and validated for this
+    /// checkout. Always `false` when LFS wasn't requested.
+    lfs_ready: bool,
 }
 
 impl Fetch {
@@ -208,11 +219,27 @@ impl Fetch {
     pub fn into_path(self) -> PathBuf {
         self.path
     }
+
+    /// Whether Git LFS artifacts have been fetched and validated for this
+    /// checkout. Returns `false` if LFS was not requested for this fetch.
+    pub fn lfs_ready(&self) -> bool {
+        self.lfs_ready
+    }
 }
 
 pub fn cache_digest(url: &RepositoryUrl) -> String {
     let mut hasher = DefaultHasher::new();
     url.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("{hash:x}")
+}
+
+/// Hash digest for a full `GitUrl`, used to namespace the checkout dir when
+/// LFS is enabled (so LFS-vs-non-LFS checkouts of the same revision don't
+/// share a directory).
+fn cache_digest_git_url(git: &GitUrl) -> String {
+    let mut hasher = DefaultHasher::new();
+    git.hash(&mut hasher);
     let hash = hasher.finish();
     format!("{hash:x}")
 }

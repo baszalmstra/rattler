@@ -1,5 +1,5 @@
 /// Derived from `uv-git` implementation
-/// Source: <https://github.com/astral-sh/uv/blob/4b8cc3e29e4c2a6417479135beaa9783b05195d3/crates/uv-git/src/git.rs>
+/// Source: <https://github.com/astral-sh/uv/blob/main/crates/uv-git/src/git.rs>
 /// This module represents all necessary git types and operations to interact with git repositories.
 /// Example:
 ///   * `GitReference` that can represent a branch, tag, commit, or named ref.
@@ -13,12 +13,12 @@ use std::{
     sync::LazyLock,
 };
 
+use rattler_networking::LazyClient;
 use reqwest::StatusCode;
-use reqwest_middleware::ClientWithMiddleware;
 use url::Url;
 
 use crate::{
-    GitError,
+    GitError, GitLfs, Submodules,
     sha::{GitOid, GitSha},
 };
 
@@ -41,6 +41,21 @@ pub static GIT: LazyLock<Result<PathBuf, GitBinaryError>> = LazyLock::new(|| {
         which::Error::CannotFindBinaryPath => GitBinaryError::GitNotFound,
         e => GitBinaryError::Other(e),
     })
+});
+
+/// A global cache of the result of `git lfs version` (whether `git-lfs` is
+/// installed on the host).
+///
+/// Mirrors uv's `GIT_LFS`. Named with the `Cli` suffix so it doesn't collide
+/// with the `GitLfs` enum that lives on `GitUrl` and describes whether LFS is
+/// requested for a particular URL.
+pub static GIT_LFS_CLI: LazyLock<Result<PathBuf, GitBinaryError>> = LazyLock::new(|| {
+    let git = GIT.as_ref().map_err(Clone::clone)?;
+    let output = Command::new(git).args(["lfs", "version"]).output();
+    match output {
+        Ok(out) if out.status.success() => Ok(git.clone()),
+        _ => Err(GitBinaryError::GitNotFound),
+    }
 });
 
 /// Strategy when fetching refspecs for a [`GitReference`]
@@ -223,7 +238,8 @@ impl GitRemote {
         db: Option<GitDatabase>,
         reference: &GitReference,
         locked_rev: Option<GitOid>,
-        client: &ClientWithMiddleware,
+        lfs: GitLfs,
+        client: &LazyClient,
     ) -> Result<(GitDatabase, GitOid), GitError> {
         let locked_ref = locked_rev.map(|oid| GitReference::FullCommit(oid.to_string()));
         let reference = locked_ref.as_ref().unwrap_or(reference);
@@ -236,6 +252,10 @@ impl GitRemote {
             };
 
             if let Some(rev) = resolved_commit_hash {
+                if lfs.enabled() {
+                    let lfs_ready = fetch_lfs(&db.repo, &self.url, rev)?;
+                    db = db.with_lfs_ready(Some(lfs_ready));
+                }
                 return Ok((db, rev));
             }
         }
@@ -255,33 +275,27 @@ impl GitRemote {
             None => reference.resolve(&repo)?,
         };
 
-        Ok((GitDatabase { repo }, rev))
+        let lfs_ready = if lfs.enabled() {
+            Some(fetch_lfs(&repo, &self.url, rev)?)
+        } else {
+            None
+        };
+
+        Ok((GitDatabase { repo, lfs_ready }, rev))
     }
 
     /// Creates a [`GitDatabase`] of this remote at `db_path`.
     #[allow(clippy::unused_self)]
     pub(crate) fn db_at(&self, db_path: &Path) -> Result<GitDatabase, GitError> {
         let repo = GitRepository::open(db_path)?;
-        Ok(GitDatabase { repo })
+        Ok(GitDatabase {
+            repo,
+            lfs_ready: None,
+        })
     }
 
     pub fn url(&self) -> &Url {
         &self.url
-    }
-}
-
-/// Options controlling checkout behavior (submodules, etc.).
-#[derive(Debug, Clone)]
-pub struct CheckoutOptions {
-    /// Whether to recursively initialize and update submodules.
-    pub update_submodules: bool,
-}
-
-impl Default for CheckoutOptions {
-    fn default() -> Self {
-        Self {
-            update_submodules: true,
-        }
     }
 }
 
@@ -290,6 +304,8 @@ impl Default for CheckoutOptions {
 pub(crate) struct GitDatabase {
     /// Underlying Git repository instance for this database.
     repo: GitRepository,
+    /// Git LFS artifacts have been initialized (if requested).
+    lfs_ready: Option<bool>,
 }
 
 impl GitDatabase {
@@ -299,7 +315,8 @@ impl GitDatabase {
         rev: GitOid,
         destination: &Path,
         source_url: &Url,
-        options: &CheckoutOptions,
+        lfs: GitLfs,
+        submodules: Submodules,
     ) -> Result<GitCheckout, GitError> {
         // If the existing checkout exists, and it is fresh, use it.
         // A non-fresh checkout can happen if the checkout operation was
@@ -310,8 +327,8 @@ impl GitDatabase {
             .map(|repo| GitCheckout::new(rev, repo))
             .filter(GitCheckout::is_fresh)
         {
-            Some(co) => co,
-            None => GitCheckout::clone_into(destination, self, rev, source_url, options)?,
+            Some(co) => co.with_lfs_ready(self.lfs_ready),
+            None => GitCheckout::clone_into(destination, self, rev, source_url, lfs, submodules)?,
         };
         Ok(checkout)
     }
@@ -335,6 +352,18 @@ impl GitDatabase {
     /// Checks if `oid` resolves to a commit in this database.
     pub(crate) fn contains(&self, oid: GitOid) -> bool {
         self.repo.rev_parse(&format!("{oid}^0")).is_ok()
+    }
+
+    /// Checks if the LFS artifacts for `oid` are present and pass `git lfs fsck`.
+    pub(crate) fn contains_lfs_artifacts(&self, oid: GitOid) -> bool {
+        self.repo.lfs_fsck_objects(&format!("{oid}^0"))
+    }
+
+    /// Set the Git LFS validation state (if any).
+    #[must_use]
+    pub(crate) fn with_lfs_ready(mut self, lfs: Option<bool>) -> Self {
+        self.lfs_ready = lfs;
+        self
     }
 }
 
@@ -392,6 +421,53 @@ impl GitRepository {
         result.truncate(result.trim_end().len());
         result.parse().map_err(GitError::OidParse)
     }
+
+    /// Verifies LFS artifacts have been initialized for a given `refname`.
+    ///
+    /// Returns `true` if `git lfs fsck --objects <refname>` succeeds, `false`
+    /// if it fails or if `git-lfs` is not installed. Requires Git LFS 3.x for
+    /// the `--objects` flag; older versions are treated as "validation
+    /// unavailable" and assumed-good.
+    pub(crate) fn lfs_fsck_objects(&self, refname: &str) -> bool {
+        let Ok(lfs) = GIT_LFS_CLI.as_ref() else {
+            tracing::warn!("Git LFS is not available, skipping LFS validation");
+            return false;
+        };
+        let lfs = lfs.clone();
+
+        // Requires Git LFS 3.x (2021 release) for `--objects`.
+        let output = Command::new(lfs)
+            .arg("lfs")
+            .arg("fsck")
+            .arg("--objects")
+            .arg(refname)
+            .current_dir(&self.path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stderr.contains("unknown flag: --objects")
+                    || stderr.contains("unknown option `--objects'")
+                {
+                    tracing::warn!(
+                        "Skipping Git LFS validation as the installed `git-lfs` is too old. \
+                         Upgrade to `git-lfs >= 3.0.2` to enable validation."
+                    );
+                    true
+                } else {
+                    tracing::debug!("Git LFS validation failed: {stderr}");
+                    false
+                }
+            }
+            Err(err) => {
+                tracing::debug!("Git LFS validation failed to spawn: {err}");
+                false
+            }
+        }
+    }
 }
 
 /// A local checkout of a particular revision from a [`GitRepository`].
@@ -400,6 +476,8 @@ pub(crate) struct GitCheckout {
     revision: GitOid,
     /// Underlying Git repository instance for this checkout.
     repo: GitRepository,
+    /// Git LFS artifacts have been initialized (if requested).
+    lfs_ready: Option<bool>,
 }
 
 impl GitCheckout {
@@ -408,7 +486,23 @@ impl GitCheckout {
     ///
     /// * The `repo` will be the checked out Git repository.
     fn new(revision: GitOid, repo: GitRepository) -> Self {
-        Self { revision, repo }
+        Self {
+            revision,
+            repo,
+            lfs_ready: None,
+        }
+    }
+
+    /// Whether Git LFS artifacts have been validated for this checkout.
+    pub(crate) fn lfs_ready(&self) -> Option<bool> {
+        self.lfs_ready
+    }
+
+    /// Set the Git LFS validation state (if any).
+    #[must_use]
+    pub(crate) fn with_lfs_ready(mut self, lfs: Option<bool>) -> Self {
+        self.lfs_ready = lfs;
+        self
     }
 
     /// Clone a repo for a `revision` into a local path from a `database`.
@@ -418,7 +512,8 @@ impl GitCheckout {
         database: &GitDatabase,
         revision: GitOid,
         source_url: &Url,
-        options: &CheckoutOptions,
+        lfs: GitLfs,
+        submodules: Submodules,
     ) -> Result<Self, GitError> {
         tracing::debug!("cloning into {:?} from {:?}", database.repo.path, into);
         let dirname = into.parent().expect("into path must have a parent");
@@ -449,8 +544,8 @@ impl GitCheckout {
 
         let repo = GitRepository::open(into)?;
         let checkout = GitCheckout::new(revision, repo);
-        checkout.reset(source_url, options)?;
-        Ok(checkout)
+        let lfs_ready = checkout.reset(source_url, lfs, submodules)?;
+        Ok(checkout.with_lfs_ready(lfs_ready))
     }
 
     /// Checks if the `HEAD` of this checkout points to the expected revision.
@@ -468,7 +563,7 @@ impl GitCheckout {
     /// additional interrupt protection by a dummy file [`CHECKOUT_READY_LOCK`].
     ///
     /// If we're interrupted while performing a `git reset` (e.g., we die
-    /// because of a signal) Cargo needs to be sure to try to check out this
+    /// because of a signal) we need to be sure to try to check out this
     /// repo again on the next go-round.
     ///
     /// To enable this we have a dummy file in our checkout, [`.ok`],
@@ -476,51 +571,217 @@ impl GitCheckout {
     /// ready to go. Hence if we start to do a reset, we make sure this file
     /// *doesn't* exist, and then once we're done we create the file.
     ///
+    /// When Git LFS is requested, the `.ok` file is only written once
+    /// `git lfs fsck --objects <rev>` succeeds. An interrupted LFS fetch
+    /// otherwise leaves the checkout looking fresh but with pointer files
+    /// where smudged blobs should be.
+    ///
+    /// `git reset --hard` can break relative submodule URLs, so submodules are
+    /// updated in two passes (uv PR astral-sh/uv#12156, fixing issue
+    /// astral-sh/uv#9822):
+    ///   * Pass 1: direct submodules only (no `--recursive`), with
+    ///     command-local `remote.origin.url` overridden to the original
+    ///     credential-stripped source URL so relative submodule paths resolve
+    ///     against the right base.
+    ///   * Pass 2: `--recursive`, **without** the origin override, so nested
+    ///     relative submodule URLs resolve against their immediate parent
+    ///     submodule, not the top-level remote.
+    ///
+    /// Both passes also keep a `url.<credentialed>.insteadOf=<safe>` transient
+    /// auth rewrite (when credentials were present), and
+    /// `-c protocol.file.allow=always` so `file://` and local-mirror remotes
+    /// work on modern Git (>= 2.38.1).
+    ///
     /// [`.ok`]: CHECKOUT_READY_LOCK
-    fn reset(&self, source_url: &Url, options: &CheckoutOptions) -> Result<(), GitError> {
+    fn reset(
+        &self,
+        source_url: &Url,
+        lfs: GitLfs,
+        submodules: Submodules,
+    ) -> Result<Option<bool>, GitError> {
         let ok_file = self.repo.path.join(CHECKOUT_READY_LOCK);
         let _ = fs_err::remove_file(&ok_file);
 
         tracing::debug!("reset {} to {}", self.repo.path.display(), self.revision);
 
+        // We want to skip smudge if LFS was disabled for the repository, as
+        // smudge filters can trigger on a reset even if LFS artifacts were not
+        // originally fetched.
+        let lfs_skip_smudge = if lfs.enabled() { "0" } else { "1" };
+
         // Perform the hard reset.
-        // Skip LFS smudge filter during reset because the checkout's origin
-        // points to the local database which doesn't have LFS objects.
-        // LFS files are handled separately after checkout.
         Command::new(GIT.as_ref().map_err(Clone::clone)?)
             .arg("reset")
             .arg("--hard")
             .arg(self.revision.as_str())
             .current_dir(&self.repo.path)
-            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .env("GIT_LFS_SKIP_SMUDGE", lfs_skip_smudge)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()?;
 
-        if options.update_submodules {
-            // The checkout's origin points to the local bare cache database
-            // (set by `git clone --local`). Submodules with relative URLs
-            // would resolve against that local path and fail. Resolve them
-            // against the real source URL first.
-            resolve_submodule_urls(&self.repo.path, source_url)?;
-
-            // Update submodules (`git submodule update --recursive`).
-            // Also skip LFS smudge here — submodules may contain LFS files.
-            // Allow file:// protocol so local clones and file-based
-            // submodule URLs work on modern Git (>= 2.38.1).
-            Command::new(GIT.as_ref().map_err(Clone::clone)?)
-                .args(["-c", "protocol.file.allow=always"])
-                .arg("submodule")
+        if submodules.should_update() {
+            // Pass 1: initialize direct submodules (non-recursive) with the
+            // original remote URL set as a command-local override. Git resolves
+            // relative submodule URLs against `remote.origin.url`, but the
+            // checkout's `origin` points to the local bare cache database.
+            // We pass it via `-c remote.origin.url=...` so the override is
+            // command-local and Git doesn't persist a credentialed URL into
+            // any newly-initialized submodule remotes.
+            let mut cmd = Command::new(GIT.as_ref().map_err(Clone::clone)?);
+            cmd.args(["-c", "protocol.file.allow=always"]);
+            for config in submodule_update_config(source_url) {
+                cmd.arg("-c").arg(config);
+            }
+            cmd.arg("submodule")
                 .arg("update")
-                .arg("--recursive")
                 .arg("--init")
                 .current_dir(&self.repo.path)
-                .env("GIT_LFS_SKIP_SMUDGE", "1")
+                .env("GIT_LFS_SKIP_SMUDGE", lfs_skip_smudge)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .map(drop)?;
+
+            // Pass 2: recursive update, **without** the origin override, so
+            // each nested relative submodule URL resolves against its
+            // immediate parent submodule, not the top-level remote. The
+            // transient credential rewrite is safe to inherit because it
+            // only affects transport, not URL resolution.
+            let mut cmd = Command::new(GIT.as_ref().map_err(Clone::clone)?);
+            cmd.args(["-c", "protocol.file.allow=always"]);
+            for config in submodule_auth_config(source_url) {
+                cmd.arg("-c").arg(config);
+            }
+            cmd.arg("submodule")
+                .arg("update")
+                .arg("--init")
+                .arg("--recursive")
+                .current_dir(&self.repo.path)
+                .env("GIT_LFS_SKIP_SMUDGE", lfs_skip_smudge)
+                .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
                 .map(drop)?;
         }
 
-        fs_err::File::create(ok_file)?;
-        Ok(())
+        // Validate Git LFS objects (if requested) after the reset. We only
+        // mark the checkout "ready" (`.ok` lock) when validation passes.
+        let lfs_validation = if lfs.enabled() {
+            Some(self.repo.lfs_fsck_objects(self.revision.as_str()))
+        } else {
+            None
+        };
+
+        if lfs_validation.unwrap_or(true) {
+            fs_err::File::create(ok_file)?;
+        }
+
+        Ok(lfs_validation)
     }
+}
+
+/// Return command-local Git configuration for initializing direct submodules
+/// in a checkout.
+///
+/// Relative submodule URLs are resolved from `remote.origin.url`, but writing
+/// the original remote URL into checkout configuration can persist credentials
+/// in the parent repository or submodule remotes. Instead, callers pass these
+/// values via `git -c`, using a credential-stripped origin URL for resolution
+/// and a transient `url.*.insteadOf` rewrite when credentials are needed for
+/// transport.
+fn submodule_update_config(original_remote_url: &Url) -> Vec<String> {
+    let remote_url = without_credentials(original_remote_url);
+    let mut config = vec![format!("remote.origin.url={}", remote_url.as_str())];
+
+    config.extend(submodule_auth_config(original_remote_url));
+    config
+}
+
+/// Return command-local Git authentication configuration for updating
+/// submodules.
+///
+/// Unlike `remote.origin.url`, these rewrites are safe to inherit during
+/// recursive submodule updates: they rewrite transport URLs for authentication,
+/// but do not change the base URL that Git uses to resolve nested relative
+/// submodule URLs.
+fn submodule_auth_config(original_remote_url: &Url) -> Vec<String> {
+    let remote_url = without_credentials(original_remote_url);
+    let mut config = Vec::new();
+
+    if remote_url.as_str() != original_remote_url.as_str() {
+        let safe_root = remote_url_root(&remote_url);
+        let credentialed_root = remote_url_root(original_remote_url);
+
+        if safe_root.as_str() != credentialed_root.as_str() {
+            config.push(format!(
+                "url.{}.insteadOf={}",
+                credentialed_root.as_str(),
+                safe_root.as_str()
+            ));
+        }
+    }
+
+    config
+}
+
+/// Return a copy of `url` with username and password stripped, except that
+/// `ssh://git@...` URLs retain the `git` username (without a password) since
+/// the `git` username is part of the SSH convention.
+fn without_credentials(url: &Url) -> Url {
+    let mut url = url.clone();
+    crate::url::redact_credentials(&mut url);
+    url
+}
+
+/// Return the scheme, authority, and root path of a remote URL.
+///
+/// This is used as the rewrite prefix for `url.*.insteadOf`, so a credentialed
+/// parent URL can authenticate sibling submodule URLs without making the
+/// credentials part of any persisted submodule URL.
+fn remote_url_root(url: &Url) -> Url {
+    let mut root = url.clone();
+    root.set_path("/");
+    root.set_query(None);
+    root.set_fragment(None);
+    root
+}
+
+/// Attempts to use `git-lfs` to fetch required LFS objects for a given
+/// revision, then validates them with `git lfs fsck --objects <rev>`.
+///
+/// * Missing `git-lfs` binary → log a warning and return `Ok(false)`.
+/// * Non-zero exit from `git lfs fetch` → return `Err(GitError::LfsFetch)`.
+/// * Success → run `lfs_fsck_objects(rev)`, return its boolean result.
+fn fetch_lfs(repo: &GitRepository, url: &Url, revision: GitOid) -> Result<bool, GitError> {
+    let Ok(lfs) = GIT_LFS_CLI.as_ref() else {
+        tracing::warn!("Git LFS is not available, skipping LFS fetch");
+        return Ok(false);
+    };
+    let lfs = lfs.clone();
+
+    tracing::debug!("fetching Git LFS objects for {} at {}", url, revision);
+
+    let output = Command::new(lfs)
+        .arg("lfs")
+        .arg("fetch")
+        .arg(url.as_str())
+        .arg(revision.as_str())
+        .current_dir(&repo.path)
+        // We should not support requesting LFS artifacts with skip smudge
+        // being set. Force-unset it for our LFS calls so callers' shells
+        // can't suppress the fetch.
+        .env_remove("GIT_LFS_SKIP_SMUDGE")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(GitError::LfsFetch(url.clone(), stderr));
+    }
+
+    // Validate Git LFS objects explicitly (if supported). This avoids issues
+    // where `git-lfs` isn't configured on the system but the fetch returned
+    // success anyway, giving the wrong impression that artifacts were
+    // initialized correctly.
+    Ok(repo.lfs_fsck_objects(revision.as_str()))
 }
 
 /// Attempts to fetch the given git `reference` for a Git repository.
@@ -535,7 +796,7 @@ pub(crate) fn fetch(
     repo: &mut GitRepository,
     remote_url: &str,
     reference: &GitReference,
-    client: &ClientWithMiddleware,
+    client: &LazyClient,
 ) -> Result<(), GitError> {
     let oid_to_fetch = match github_fast_path(repo, remote_url, reference, client) {
         Ok(FastPathRev::UpToDate) => return Ok(()),
@@ -678,16 +939,20 @@ fn fetch_with_cli(
         .arg("--update-head-ok") // see discussion in #2078
         .arg(url)
         .args(refspecs)
-        //     // If cargo is run by git (for example, the `exec` command in `git
-        //     // rebase`), the GIT_DIR is set by git and will point to the wrong
-        //     // location (this takes precedence over the cwd). Make sure this is
-        //     // unset so git will look at cwd for the repo.
+        // If we're run by git (for example, the `exec` command in `git
+        // rebase`), the GIT_DIR is set by git and will point to the wrong
+        // location (this takes precedence over the cwd). Make sure this is
+        // unset so git will look at cwd for the repo.
         .env_remove(GIT_DIR)
+        // Disable interactive prompts in the terminal, because they would be
+        // erased by any progress bar animation and the process would appear
+        // to hang. GUI-based askpass (SSH_ASKPASS, etc.) still works.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(&repo.path);
 
-    // // We capture the output to avoid streaming it to the user's console during clones.
-    // // The required `on...line` callbacks currently do nothing.
-    // // The output appears to be included in error messages by default.
+    // We capture the output to avoid streaming it to the user's console during clones.
+    // The required `on...line` callbacks currently do nothing.
+    // The output appears to be included in error messages by default.
     let output = cmd.output()?;
     if !output.status.success() {
         let stderr = String::from_utf8(output.stderr)?;
@@ -727,7 +992,7 @@ fn github_fast_path(
     repo: &mut GitRepository,
     url: &str,
     reference: &GitReference,
-    client: &ClientWithMiddleware,
+    client: &LazyClient,
 ) -> Result<FastPathRev, GitError> {
     let url = Url::parse(url)?;
     if !is_github(&url) {
@@ -811,7 +1076,7 @@ fn github_fast_path(
 
     runtime.block_on(async move {
         tracing::debug!("Attempting GitHub fast path for: {url}");
-        let mut request = client.get(&url);
+        let mut request = client.client().get(&url);
         request = request.header("Accept", "application/vnd.github.3.sha");
         request = request.header("User-Agent", "pixi");
         if let Some(local_object) = local_object {
@@ -849,178 +1114,58 @@ fn is_short_hash_of(rev: &str, oid: GitOid) -> bool {
     }
 }
 
-/// Resolve a relative submodule URL against a base URL.
-///
-/// This mirrors Cargo's `absolute_submodule_url`: if the base URL is
-/// parseable (http, https, file, ssh, etc.) we use `Url::join` which
-/// handles `../` normalization. The base URL gets a trailing `/`
-/// appended to its path so that `join` resolves relative to the
-/// directory rather than replacing the last path segment.
-pub fn resolve_relative_url(base: &Url, relative: &str) -> Result<String, GitError> {
-    let mut base = base.clone();
-
-    // Ensure the base path ends with `/` so `join` treats it as a directory.
-    if !base.path().ends_with('/') {
-        base.set_path(&format!("{}/", base.path()));
-    }
-
-    let resolved = base.join(relative)?;
-    Ok(resolved.to_string())
-}
-
-/// Resolve relative submodule URLs against the source URL.
-///
-/// Reads `.gitmodules`, finds entries with relative URLs (`./` or `../`),
-/// resolves them against `source_url`, and writes the absolute URL into
-/// the repo-level git config so that `git submodule update` uses it.
-fn resolve_submodule_urls(repo_path: &Path, source_url: &Url) -> Result<(), GitError> {
-    let gitmodules_path = repo_path.join(".gitmodules");
-    if !gitmodules_path.exists() {
-        return Ok(());
-    }
-
-    // List all submodule URLs from .gitmodules
-    let output = Command::new(GIT.as_ref().map_err(Clone::clone)?)
-        .current_dir(repo_path)
-        .args([
-            "config",
-            "--file",
-            ".gitmodules",
-            "--get-regexp",
-            r"submodule\..*\.url",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        // No submodule entries — nothing to resolve
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8(output.stdout)?;
-    for line in stdout.lines() {
-        // Each line is: submodule.<name>.url <url>
-        let Some((key, submodule_url)) = line.split_once(' ') else {
-            continue;
-        };
-
-        if !submodule_url.starts_with("./") && !submodule_url.starts_with("../") {
-            continue;
-        }
-
-        let resolved = resolve_relative_url(source_url, submodule_url)?;
-
-        // Write the resolved URL into the repo config (not .gitmodules).
-        // `git submodule update --init` reads from the repo config,
-        // falling back to .gitmodules only for `submodule init`.
-        let output = Command::new(GIT.as_ref().map_err(Clone::clone)?)
-            .current_dir(repo_path)
-            .args(["config", key, &resolved])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8(output.stderr)?;
-            return Err(GitError::SubmoduleUrl(key.to_string(), stderr));
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_relative_url() {
-        let base = Url::parse("https://github.com/owner/repo.git").unwrap();
+    fn submodule_update_config_strips_credentials_from_origin_override() {
+        let url = Url::parse("https://user:password@example.com/org/repo.git").unwrap();
 
         assert_eq!(
-            resolve_relative_url(&base, "../sibling.git").unwrap(),
-            "https://github.com/owner/sibling.git"
-        );
-
-        assert_eq!(
-            resolve_relative_url(&base, "./child.git").unwrap(),
-            "https://github.com/owner/repo.git/child.git"
-        );
-
-        let file_base = Url::parse("file:///tmp/repos/main.git").unwrap();
-        assert_eq!(
-            resolve_relative_url(&file_base, "../sub.git").unwrap(),
-            "file:///tmp/repos/sub.git"
+            submodule_update_config(&url),
+            vec![
+                "remote.origin.url=https://example.com/org/repo.git".to_string(),
+                "url.https://user:password@example.com/.insteadOf=https://example.com/"
+                    .to_string(),
+            ],
         );
     }
 
     #[test]
-    fn test_resolve_submodule_urls_no_gitmodules() {
-        let tmp = tempfile::tempdir().unwrap();
-        // No .gitmodules file — should succeed as a no-op
-        let url = Url::parse("https://github.com/owner/repo.git").unwrap();
-        resolve_submodule_urls(tmp.path(), &url).unwrap();
+    fn submodule_update_config_uncredentialed_origin_has_no_auth_rewrite() {
+        let url = Url::parse("https://example.com/org/repo.git").unwrap();
+
+        assert_eq!(
+            submodule_update_config(&url),
+            vec!["remote.origin.url=https://example.com/org/repo.git".to_string()],
+        );
     }
 
-    /// Integration test: create a git repo with a `.gitmodules` containing
-    /// relative URLs, then verify that `resolve_submodule_urls` rewrites
-    /// them to absolute URLs in the repo config.
     #[test]
-    fn test_resolve_submodule_urls_rewrites_relative() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("repo");
+    fn submodule_auth_config_skips_when_no_credentials() {
+        let url = Url::parse("https://example.com/org/repo.git").unwrap();
+        assert!(submodule_auth_config(&url).is_empty());
+    }
 
-        // Initialize a git repo
-        Command::new("git")
-            .args(["init"])
-            .arg(&repo_path)
-            .output()
-            .unwrap();
-
-        // Write a .gitmodules file with relative URLs
-        let gitmodules = r#"
-[submodule "sub-relative"]
-	path = sub-relative
-	url = ../sibling.git
-[submodule "sub-absolute"]
-	path = sub-absolute
-	url = https://github.com/other/absolute.git
-[submodule "sub-child"]
-	path = sub-child
-	url = ./child.git
-"#;
-        std::fs::write(repo_path.join(".gitmodules"), gitmodules.trim_ascii_start()).unwrap();
-
-        let source_url = Url::from_file_path(&repo_path).unwrap();
-        resolve_submodule_urls(&repo_path, &source_url).unwrap();
-
-        // Verify relative URLs were resolved
-        let output = Command::new("git")
-            .current_dir(&repo_path)
-            .args(["config", "submodule.sub-relative.url"])
-            .output()
-            .unwrap();
-        let expected_sibling = Url::from_file_path(tmp.path().join("sibling.git")).unwrap();
+    #[test]
+    fn submodule_auth_config_emits_insteadof_with_credentials() {
+        let url = Url::parse("https://user:password@example.com/org/repo.git").unwrap();
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            expected_sibling.as_str()
+            submodule_auth_config(&url),
+            vec![
+                "url.https://user:password@example.com/.insteadOf=https://example.com/"
+                    .to_string()
+            ],
         );
+    }
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
-            .args(["config", "submodule.sub-child.url"])
-            .output()
-            .unwrap();
-        let expected_child = Url::from_file_path(repo_path.join("child.git")).unwrap();
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            expected_child.as_str()
-        );
-
-        // Verify absolute URL was NOT written to repo config
-        let output = Command::new("git")
-            .current_dir(&repo_path)
-            .args(["config", "submodule.sub-absolute.url"])
-            .output()
-            .unwrap();
-        // Should fail (exit code 1) because absolute URLs are not rewritten
-        assert!(!output.status.success());
+    #[test]
+    fn ssh_git_username_is_retained_for_root() {
+        // ssh://git@... URLs keep the `git` user (SSH convention), so the
+        // safe URL equals the original URL, and no insteadOf rewrite is
+        // emitted.
+        let url = Url::parse("ssh://git@example.com/org/repo.git").unwrap();
+        assert!(submodule_auth_config(&url).is_empty());
     }
 }

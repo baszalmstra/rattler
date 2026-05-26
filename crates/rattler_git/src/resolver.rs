@@ -1,22 +1,22 @@
 /// Derived from `uv-git` implementation
-/// Source: <https://github.com/astral-sh/uv/blob/4b8cc3e29e4c2a6417479135beaa9783b05195d3/crates/uv-git/src/resolver.rs>
+/// Source: <https://github.com/astral-sh/uv/blob/main/crates/uv-git/src/resolver.rs>
 /// This module expose types and functions to interact with Git repositories.
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rattler_networking::LazyClient;
 use rattler_prefix_guard::AsyncPrefixGuard;
 use tracing::debug;
 
 use crate::{
     GitError, GitUrl, Reporter,
-    git::{CheckoutOptions, GitReference},
+    git::GitReference,
     sha::GitSha,
     source::{Fetch, GitSource, cache_digest},
     url::RepositoryUrl,
 };
 use dashmap::DashMap;
 use dashmap::mapref::one::Ref;
-use reqwest_middleware::ClientWithMiddleware;
 use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -50,10 +50,9 @@ impl GitResolver {
     pub async fn fetch(
         &self,
         url: GitUrl,
-        client: ClientWithMiddleware,
+        client: impl Into<LazyClient>,
         cache: PathBuf,
         reporter: Option<Arc<dyn Reporter>>,
-        checkout_options: CheckoutOptions,
     ) -> Result<Fetch, GitError> {
         debug!("Fetching source distribution from Git: {url}");
 
@@ -81,8 +80,7 @@ impl GitResolver {
         write_guard.begin().await?;
 
         // Fetch the Git repository.
-        let source =
-            GitSource::new(url.clone(), client, cache).with_checkout_options(checkout_options);
+        let source = GitSource::new(url.clone(), client, cache);
         let source = if let Some(reporter) = reporter {
             source.with_reporter(reporter)
         } else {

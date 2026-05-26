@@ -10,6 +10,7 @@ description = "Git operations support for rattler-build"
 dashmap = { workspace = true }
 dunce = { workspace = true }
 fs-err = { workspace = true, features = ["tokio"] }
+rattler_networking = { workspace = true }
 rattler_prefix_guard = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
@@ -22,4 +23,5 @@ urlencoding = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+fs-err = { workspace = true }
 tempfile = { workspace = true }
