@@ -9,7 +9,8 @@ use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResult, Python, pyclas
 use pyo3_async_runtimes::tokio::future_into_py;
 use rattler_repodata_gateway::fetch::{CacheAction, FetchRepoDataOptions, Variant};
 use rattler_repodata_gateway::{
-    CacheClearMode, ChannelConfig, Gateway, Source, SourceConfig, SubdirSelection,
+    CacheClearMode, ChannelConfig, ChannelRelationsMode, Gateway, Source, SourceConfig,
+    SubdirSelection,
 };
 use url::Url;
 
@@ -19,6 +20,7 @@ use crate::networking::client::PyClientWithMiddleware;
 use crate::package_name::PyPackageName;
 use crate::platform::PyPlatform;
 use crate::record::PyRecord;
+use crate::repo_data::PyChannelRelations;
 use crate::repo_data::source::PyRepoDataSource;
 use crate::{PyChannel, Wrap};
 
@@ -55,6 +57,24 @@ impl<'a, 'source> FromPyObject<'a, 'source> for Wrap<SubdirSelection> {
                     .collect(),
             ),
             None => SubdirSelection::All,
+        };
+        Ok(Wrap(parsed))
+    }
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for Wrap<ChannelRelationsMode> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let as_py_str: PyBackedStr = ob.extract()?;
+        let parsed = match as_py_str.as_ref() {
+            "disabled" => ChannelRelationsMode::Disabled,
+            "warn" => ChannelRelationsMode::Warn,
+            "strict" => ChannelRelationsMode::Strict,
+            v => {
+                return Err(PyValueError::new_err(format!(
+                    "channel_relations must be one of {{'disabled', 'warn', 'strict'}}, got {v}",
+                )));
+            }
         };
         Ok(Wrap(parsed))
     }
@@ -149,6 +169,33 @@ impl PyGateway {
         Ok(())
     }
 
+    /// Returns the CEP-42 `channel_relations` declared by the given
+    /// `(channel, platform)` subdirectory, or `None` if absent.
+    pub fn channel_relations<'a>(
+        &self,
+        py: Python<'a>,
+        channel: PyChannel,
+        platform: PyPlatform,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let gateway = self.inner.clone();
+        future_into_py(py, async move {
+            let relations = gateway
+                .channel_relations(&channel.inner, platform.inner)
+                .await
+                .map_err(PyRattlerError::from)?;
+            Ok(relations.map(PyChannelRelations::from))
+        })
+    }
+
+    #[pyo3(signature = (
+        sources,
+        platforms,
+        specs,
+        recursive,
+        channel_relations=None,
+        channel_relations_max_depth=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn query<'a>(
         &self,
         py: Python<'a>,
@@ -156,6 +203,8 @@ impl PyGateway {
         platforms: Vec<PyPlatform>,
         specs: Vec<PyMatchSpec>,
         recursive: bool,
+        channel_relations: Option<Wrap<ChannelRelationsMode>>,
+        channel_relations_max_depth: Option<usize>,
     ) -> PyResult<Bound<'a, PyAny>> {
         // Convert Python sources to Rust Source enum
         let rust_sources: Vec<Source> = sources
@@ -169,6 +218,13 @@ impl PyGateway {
             let mut query = gateway
                 .query(rust_sources, platforms.into_iter().map(|p| p.inner), specs)
                 .recursive(recursive);
+
+            if let Some(mode) = channel_relations {
+                query = query.channel_relations(mode.0);
+            }
+            if let Some(depth) = channel_relations_max_depth {
+                query = query.channel_relations_max_depth(depth);
+            }
 
             if show_progress {
                 query = query
@@ -189,11 +245,19 @@ impl PyGateway {
         })
     }
 
+    #[pyo3(signature = (
+        sources,
+        platforms,
+        channel_relations=None,
+        channel_relations_max_depth=None,
+    ))]
     pub fn names<'a>(
         &self,
         py: Python<'a>,
         sources: Vec<Bound<'a, PyAny>>,
         platforms: Vec<PyPlatform>,
+        channel_relations: Option<Wrap<ChannelRelationsMode>>,
+        channel_relations_max_depth: Option<usize>,
     ) -> PyResult<Bound<'a, PyAny>> {
         // Convert Python sources to Rust Source enum
         let rust_sources: Vec<Source> = sources
@@ -224,6 +288,13 @@ impl PyGateway {
 
             if !channels.is_empty() {
                 let mut query = gateway.names(channels, platforms_vec.iter().copied());
+
+                if let Some(mode) = channel_relations {
+                    query = query.channel_relations(mode.0);
+                }
+                if let Some(depth) = channel_relations_max_depth {
+                    query = query.channel_relations_max_depth(depth);
+                }
 
                 if show_progress {
                     query = query.with_reporter(
