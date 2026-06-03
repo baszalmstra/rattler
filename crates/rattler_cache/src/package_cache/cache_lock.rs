@@ -8,7 +8,9 @@ use std::{
 
 use fs4::fs_std::FileExt;
 use rattler_conda_types::package::{IndexJson, PathsJson};
+use rattler_digest::serde::SerializableHash;
 use rattler_digest::{Md5Hash, Sha256Hash};
+use serde_with::serde_as;
 
 use crate::package_cache::PackageCacheLayerError;
 
@@ -170,20 +172,16 @@ impl CacheMetadataFile {
     }
 }
 
-/// Versioned on-disk metadata format: a fixed `MAGIC` prefix, a version byte,
-/// then a `MessagePack`-encoded [`StoredMetadataV1`] body.
+/// Versioned on-disk metadata: a fixed `MAGIC` prefix, a version byte, then a
+/// `MessagePack`-encoded [`StoredMetadataV1`] body.
 ///
-/// The framing exists so [`StoredMetadata::decode`] can, with a cheap byte
-/// compare, tell this format apart from the legacy raw `revision (+ sha256)`
-/// layout — the first `MAGIC` byte is nonzero, which can never collide with a
-/// legacy file (whose leading bytes are the high, zero bytes of a big-endian
-/// revision). Decoding tries the versioned body, then the legacy layout (so
-/// existing caches keep reading back unchanged), and finally falls back to
-/// empty metadata for anything unrecognized (corruption, a newer version),
-/// which makes the caller re-fetch and rewrite rather than trust it.
-///
-/// The version byte gates the body: a future layout bumps `VERSION` (and adds
-/// a `StoredMetadataV2`); binaries that don't know that version fall back
+/// The frame lets [`StoredMetadata::decode`] tell this apart from the legacy
+/// raw `revision (+ sha256)` layout with one byte compare: the first `MAGIC`
+/// byte is nonzero, so it never collides with a legacy file (whose leading
+/// bytes are the zero high bytes of a big-endian revision). Decoding tries the
+/// versioned body, then the legacy layout (so existing caches still read), and
+/// otherwise falls back to empty metadata, forcing a safe re-fetch. A future
+/// layout bumps `VERSION` (with a `StoredMetadataV2`); older binaries fall back
 /// instead of misreading it.
 const MAGIC: [u8; 4] = *b"RCM1";
 const VERSION: u8 = 1;
@@ -218,14 +216,17 @@ impl RecordedDigests {
     }
 }
 
-/// `MessagePack` body of the versioned metadata format. Digests are stored as
-/// raw byte arrays. New fields can be added in a future `StoredMetadataV2`
-/// guarded by a bumped [`VERSION`].
+/// `MessagePack` body of the versioned format. Digests serialize as raw bytes
+/// via [`SerializableHash`]. New fields can go in a future `StoredMetadataV2`
+/// behind a bumped [`VERSION`].
+#[serde_as]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredMetadataV1 {
     revision: u64,
-    sha256: Option<[u8; 32]>,
-    md5: Option<[u8; 16]>,
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Sha256>>")]
+    sha256: Option<Sha256Hash>,
+    #[serde_as(as = "Option<SerializableHash::<rattler_digest::Md5>>")]
+    md5: Option<Md5Hash>,
 }
 
 /// The parsed contents of a cache metadata file: a revision counter plus the
@@ -239,15 +240,10 @@ pub(super) struct StoredMetadata {
 impl StoredMetadata {
     /// Serializes `revision` and `digests` in the current versioned format.
     fn encode(revision: u64, digests: RequestedDigests) -> Vec<u8> {
-        fn to_array<const N: usize>(hash: impl AsRef<[u8]>) -> [u8; N] {
-            let mut out = [0u8; N];
-            out.copy_from_slice(hash.as_ref());
-            out
-        }
         let body = StoredMetadataV1 {
             revision,
-            sha256: digests.sha256.map(to_array),
-            md5: digests.md5.map(to_array),
+            sha256: digests.sha256,
+            md5: digests.md5,
         };
         let mut bytes = Vec::with_capacity(MAGIC.len() + 1 + 64);
         bytes.extend_from_slice(&MAGIC);
@@ -258,9 +254,9 @@ impl StoredMetadata {
     }
 
     /// Parses metadata bytes. Tries the current versioned format, then the
-    /// legacy `revision (+ sha256)` layout, and finally falls back to empty
-    /// metadata (revision 0, no digests) — which makes the caller re-fetch and
-    /// rewrite the entry rather than trust unparseable bytes.
+    /// legacy `revision (+ sha256)` layout, then falls back to empty metadata
+    /// (revision 0, no digests), which makes the caller re-fetch rather than
+    /// trust unparseable bytes.
     fn decode(bytes: &[u8]) -> Self {
         Self::decode_versioned(bytes)
             .or_else(|| Self::decode_legacy(bytes))
@@ -278,8 +274,8 @@ impl StoredMetadata {
         Some(Self {
             revision: body.revision,
             digests: RecordedDigests {
-                sha256: body.sha256.map(Sha256Hash::from),
-                md5: body.md5.map(Md5Hash::from),
+                sha256: body.sha256,
+                md5: body.md5,
             },
         })
     }
