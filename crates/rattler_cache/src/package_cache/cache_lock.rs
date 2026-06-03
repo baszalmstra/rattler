@@ -373,7 +373,37 @@ mod tests {
 
     use rattler_digest::{Md5, Sha256, parse_digest_from_hex};
 
-    use super::{CacheMetadataFile, REVISION_LEN, RequestedDigests, SHA256_LEN};
+    use super::{
+        CacheMetadataFile, MD5_LEN, REVISION_LEN, RecordedDigests, RequestedDigests, SHA256_LEN,
+    };
+
+    /// `encode` then `decode` must reproduce the original digests, and the
+    /// encoded length must match the layout the readers rely on.
+    #[test]
+    fn requested_digests_encode_decode_roundtrip() {
+        let sha = parse_digest_from_hex::<Sha256>(
+            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
+        );
+        let md5 = parse_digest_from_hex::<Md5>("d41d8cd98f00b204e9800998ecf8427e");
+
+        for (sha_in, md5_in, expected_len) in [
+            (None, None, 0),
+            (None, md5, MD5_LEN),
+            (sha, None, SHA256_LEN),
+            (sha, md5, SHA256_LEN + MD5_LEN),
+        ] {
+            let encoded = RequestedDigests {
+                sha256: sha_in,
+                md5: md5_in,
+            }
+            .encode();
+            assert_eq!(encoded.len() as u64, expected_len);
+
+            let decoded = RecordedDigests::decode(&encoded);
+            assert_eq!(decoded.sha256, sha_in);
+            assert_eq!(decoded.md5, md5_in);
+        }
+    }
 
     #[tokio::test]
     async fn cache_metadata_serialize_deserialize() {
