@@ -12,15 +12,15 @@ use std::{
 };
 
 pub use cache_key::CacheKey;
-use cache_lock::CacheMetadataFile;
 pub use cache_lock::{CacheGlobalLock, CacheMetadata};
+use cache_lock::{CacheMetadataFile, RequestedDigests};
 use dashmap::DashMap;
 use fs_err::tokio as tokio_fs;
 use futures::TryFutureExt;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use rattler_conda_types::package::CondaArchiveIdentifier;
-use rattler_digest::{Md5Hash, Sha256Hash};
+use rattler_digest::Sha256Hash;
 use rattler_networking::{
     LazyClient,
     retry_policies::{DoNotRetryPolicy, RetryDecision, RetryPolicy},
@@ -188,8 +188,10 @@ impl PackageCacheLayer {
         >(
             cache_path,
             cache_entry.last_revision,
-            cache_key.sha256.as_ref(),
-            cache_key.md5.as_ref(),
+            RequestedDigests {
+                sha256: cache_key.sha256,
+                md5: cache_key.md5,
+            },
             None,
             None,
             self.validation_mode,
@@ -229,8 +231,10 @@ impl PackageCacheLayer {
         match validate_package_common(
             cache_path,
             cache_entry.last_revision,
-            cache_key.sha256.as_ref(),
-            cache_key.md5.as_ref(),
+            RequestedDigests {
+                sha256: cache_key.sha256,
+                md5: cache_key.md5,
+            },
             Some(fetch),
             reporter,
             self.validation_mode,
@@ -684,8 +688,7 @@ fn is_transient_rename_error(err: &std::io::Error) -> bool {
 async fn validate_package_common<F, Fut, E>(
     path: PathBuf,
     known_valid_revision: Option<u64>,
-    given_sha: Option<&Sha256Hash>,
-    given_md5: Option<&Md5Hash>,
+    requested: RequestedDigests,
     fetch: Option<F>,
     reporter: Option<Arc<dyn CacheReporter>>,
     validation_mode: ValidationMode,
@@ -718,23 +721,12 @@ where
 
     let mut metadata = CacheMetadataFile::acquire(&lock_file_path).await?;
     let cache_revision = metadata.read_revision()?;
-    let locked_sha256 = metadata.read_sha256()?;
-    let locked_md5 = metadata.read_md5()?;
+    let recorded = metadata.read_recorded_digests()?;
 
-    // A checksum-pinned request must only be satisfied by a cache entry that is
-    // bound to that same checksum. In particular a cache entry that recorded no
-    // digest (e.g. populated by an earlier no-checksum request for the same
-    // package coordinate) must NOT satisfy a later sha256/md5-pinned request:
-    // the safe behavior is to re-fetch and verify (GHSA digest-binding issue).
-    //
-    // sha256 takes precedence over md5 (mirroring the download verification,
-    // which only checks one hash). When only an md5 is requested it is enforced
-    // against the recorded md5.
-    let hash_mismatch = match (given_sha, given_md5) {
-        (Some(given_sha), _) => locked_sha256.as_ref() != Some(given_sha),
-        (None, Some(given_md5)) => locked_md5.as_ref() != Some(given_md5),
-        (None, None) => false,
-    };
+    // A no-digest entry must not satisfy a later checksum-pinned request; the
+    // safe behavior is to re-fetch and verify (digest-binding issue).
+    let hash_mismatch = !recorded.satisfies(requested);
+    let locked_sha256 = recorded.sha256;
 
     let cache_dir_exists = path.is_dir();
     if cache_dir_exists && !hash_mismatch {
@@ -799,10 +791,14 @@ where
         tracing::warn!(
             "hash mismatch, wanted a package at location {} with sha256 {} / md5 {} but the cached package has sha256 {} / md5 {}, fetching package",
             path.display(),
-            given_sha.map_or(String::from("<unknown>"), hex::encode),
-            given_md5.map_or(String::from("<unknown>"), hex::encode),
-            locked_sha256.map_or(String::from("<unknown>"), hex::encode),
-            locked_md5.map_or(String::from("<unknown>"), hex::encode),
+            requested
+                .sha256
+                .map_or(String::from("<unknown>"), hex::encode),
+            requested.md5.map_or(String::from("<unknown>"), hex::encode),
+            recorded
+                .sha256
+                .map_or(String::from("<unknown>"), hex::encode),
+            recorded.md5.map_or(String::from("<unknown>"), hex::encode),
         );
     }
 
@@ -813,7 +809,7 @@ where
         // Write the new revision
         let new_revision = cache_revision + 1;
         metadata
-            .write_revision_and_digests(new_revision, given_sha, given_md5)
+            .write_revision_and_digests(new_revision, requested)
             .await?;
 
         // Create a temporary directory in the same parent folder for atomic extraction.
@@ -876,7 +872,7 @@ where
                 // We don't need to re-validate since we just fetched it.
                 Ok(CacheMetadata {
                     revision: new_revision,
-                    sha256: given_sha.copied(),
+                    sha256: requested.sha256,
                     path,
                     index_json: None,
                     paths_json: None,
@@ -1928,9 +1924,7 @@ mod test {
         );
     }
 
-    /// Extracts a local test package into `destination`, mirroring what the
-    /// real fetch closures do. Used by the digest-binding regression tests so
-    /// they do not depend on the network.
+    /// Extracts a local test package into `destination` (offline fetch stand-in).
     async fn extract_test_package(destination: PathBuf) -> Result<(), std::io::Error> {
         let package_path = get_test_data_dir().join("clobber/clobber-python-0.1.0-cpython.conda");
         rattler_package_streaming::tokio::fs::extract(&package_path, &destination)
@@ -1939,8 +1933,7 @@ mod test {
             .map_err(std::io::Error::other)
     }
 
-    /// Runs `get_or_fetch` for `cache_key`, recording whether the fetch closure
-    /// actually executed (i.e. whether the cache was refreshed from source).
+    /// Runs `get_or_fetch`, returning whether the fetch closure actually ran.
     async fn fetch_and_record(cache: &PackageCache, cache_key: CacheKey) -> bool {
         let fetched = Arc::new(AtomicBool::new(false));
         let fetched_inner = fetched.clone();
@@ -1961,10 +1954,8 @@ mod test {
         fetched.load(Ordering::Acquire)
     }
 
-    /// A cache entry that was populated without a recorded sha256 must NOT
-    /// satisfy a later sha256-pinned request for the same coordinate: the
-    /// pinned request has to re-fetch and verify instead of trusting the
-    /// earlier unverified bytes (digest-binding regression).
+    /// A no-sha entry must not satisfy a later sha256-pinned request for the
+    /// same coordinate; the pinned request re-fetches instead.
     #[tokio::test]
     async fn test_package_cache_sha_entry_refetches_previous_no_sha_cache() {
         let packages_dir = tempdir().unwrap();
@@ -1975,14 +1966,13 @@ mod test {
             .unwrap()
             .into();
 
-        // Phase 1: low-trust request with no checksum populates the cache.
+        // No checksum: populates the cache.
         assert!(
             fetch_and_record(&cache, base_key.clone()).await,
             "the first request must populate the cache"
         );
 
-        // Phase 2: a later sha256-pinned request for the same coordinate must
-        // not be satisfied by the no-digest entry; it has to re-fetch.
+        // sha-pinned: must re-fetch, not trust the no-digest entry.
         let sha = parse_digest_from_hex::<Sha256>(
             "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
         )
@@ -1993,17 +1983,15 @@ mod test {
             "sha-pinned request must re-fetch instead of trusting the previous no-sha cache entry"
         );
 
-        // Phase 3: now that the entry is bound to this sha256, a matching
-        // request must be served from cache without re-fetching.
+        // Now bound to this sha: a matching request is served from cache.
         assert!(
             !fetch_and_record(&cache, sha_key).await,
             "a matching sha-pinned request must be served from cache"
         );
     }
 
-    /// The md5 analogue: a no-digest cache entry must not satisfy a later
-    /// md5-pinned request, but once the entry is bound to that md5 it must be
-    /// reusable (md5-only caching is preserved, not regressed).
+    /// The md5 analogue: a no-digest entry must not satisfy a later md5-pinned
+    /// request, but once bound to that md5 it must be reusable (no regression).
     #[tokio::test]
     async fn test_package_cache_md5_entry_refetches_previous_no_digest_cache() {
         use rattler_digest::Md5;
@@ -2016,14 +2004,13 @@ mod test {
             .unwrap()
             .into();
 
-        // Phase 1: low-trust request with no checksum populates the cache.
+        // No checksum: populates the cache.
         assert!(
             fetch_and_record(&cache, base_key.clone()).await,
             "the first request must populate the cache"
         );
 
-        // Phase 2: an md5-pinned request must re-fetch rather than trust the
-        // previous no-digest entry.
+        // md5-pinned: must re-fetch, not trust the no-digest entry.
         let md5 = parse_digest_from_hex::<Md5>("d41d8cd98f00b204e9800998ecf8427e").unwrap();
         let md5_key = base_key.clone().with_md5(md5);
         assert!(
@@ -2031,8 +2018,7 @@ mod test {
             "md5-pinned request must re-fetch instead of trusting the previous no-digest cache entry"
         );
 
-        // Phase 3: the entry is now bound to this md5, so a matching md5-only
-        // request must be served from cache (no perpetual re-fetch).
+        // Now bound to this md5: a matching request is served from cache.
         assert!(
             !fetch_and_record(&cache, md5_key).await,
             "a matching md5-pinned request must be served from cache"

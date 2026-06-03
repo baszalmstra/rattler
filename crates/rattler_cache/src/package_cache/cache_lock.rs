@@ -170,40 +170,58 @@ impl CacheMetadataFile {
     }
 }
 
-/// On-disk layout of the cache metadata file.
+/// On-disk metadata layout. Digest presence is derived from total length, so
+/// the four states map to distinct lengths and can't be confused:
 ///
-/// The file is a flat sequence of fixed-width fields. Which optional digests
-/// are present is recovered purely from the total file length, so the four
-/// possible states map to four distinct lengths and can never be confused:
+/// | length | contents                |
+/// |--------|-------------------------|
+/// | 8      | revision only           |
+/// | 24     | revision + md5          |
+/// | 40     | revision + sha256       |
+/// | 56     | revision + sha256 + md5 |
 ///
-/// | length | contents                              |
-/// |--------|---------------------------------------|
-/// | 8      | revision only (no digest recorded)    |
-/// | 24     | revision + md5 (no sha256)            |
-/// | 40     | revision + sha256 (no md5)            |
-/// | 56     | revision + sha256 + md5               |
-///
-/// This is backwards compatible with the previous format, which wrote either
-/// 8 bytes (revision only) or 40 bytes (revision + sha256): those files keep
-/// reading back the exact same revision/sha256 they did before, so existing
-/// caches stay valid and are *not* re-fetched on upgrade. The md5 field is a
-/// pure addition that older binaries simply ignore (they only ever read the
-/// first 40 bytes).
+/// Backwards compatible: the legacy 8/40-byte files read back unchanged, so
+/// existing caches stay valid. md5 is an append older binaries ignore.
 const REVISION_LEN: u64 = 8;
 const SHA256_LEN: u64 = 32;
 const MD5_LEN: u64 = 16;
+
+/// Content digests a caller pinned for a package request.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RequestedDigests {
+    pub(super) sha256: Option<Sha256Hash>,
+    pub(super) md5: Option<Md5Hash>,
+}
+
+/// Content digests recorded for an existing cache entry.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RecordedDigests {
+    pub(super) sha256: Option<Sha256Hash>,
+    pub(super) md5: Option<Md5Hash>,
+}
+
+impl RecordedDigests {
+    /// Whether this entry may satisfy a checksum-pinned `requested`. A pinned
+    /// digest must match the recorded one; sha256 takes precedence over md5
+    /// (mirroring download verification). An unpinned request matches anything.
+    pub(super) fn satisfies(self, requested: RequestedDigests) -> bool {
+        match (requested.sha256, requested.md5) {
+            (Some(sha256), _) => self.sha256 == Some(sha256),
+            (None, Some(md5)) => self.md5 == Some(md5),
+            (None, None) => true,
+        }
+    }
+}
 
 impl CacheMetadataFile {
     pub async fn write_revision_and_digests(
         &mut self,
         revision: u64,
-        sha256: Option<&Sha256Hash>,
-        md5: Option<&Md5Hash>,
+        digests: RequestedDigests,
     ) -> Result<(), PackageCacheLayerError> {
         let file = self.file.clone();
 
-        let sha256 = sha256.cloned();
-        let md5 = md5.cloned();
+        let RequestedDigests { sha256, md5 } = digests;
         simple_spawn_blocking::tokio::run_blocking_task(move || {
             // Ensure we write from the start of the file
             (&*file).rewind().map_err(|e| {
@@ -222,8 +240,7 @@ impl CacheMetadataFile {
                 )
             })?;
 
-            // Write the bytes of the sha256 hash (if any). Keeping sha256
-            // directly after the revision preserves the legacy on-disk layout.
+            // sha256 directly after the revision: preserves the legacy layout.
             let sha_bytes = if let Some(sha) = sha256 {
                 (&*file).write_all(&sha[..]).map_err(|e| {
                     PackageCacheLayerError::LockError(
@@ -236,7 +253,7 @@ impl CacheMetadataFile {
                 0
             };
 
-            // Write the bytes of the md5 hash (if any), after the sha256 slot.
+            // md5 after the sha256 slot.
             let md5_bytes = if let Some(md5) = md5 {
                 (&*file).write_all(&md5[..]).map_err(|e| {
                     PackageCacheLayerError::LockError(
@@ -271,8 +288,7 @@ impl CacheMetadataFile {
         .await
     }
 
-    /// Returns the total length of the metadata file in bytes, used to
-    /// determine which optional digest fields are present.
+    /// Total file length in bytes; determines which digest fields are present.
     fn len(&self) -> Result<u64, PackageCacheLayerError> {
         self.file.metadata().map(|m| m.len()).map_err(|e| {
             PackageCacheLayerError::LockError("failed to stat cache lock".to_string(), e)
@@ -303,12 +319,7 @@ impl CacheMetadataFile {
         Ok(u64::from_be_bytes(buf))
     }
 
-    /// Reads the sha256 hash from the cache metadata file.
-    ///
-    /// The sha256 is present only when the file is long enough to hold a
-    /// revision followed by a full sha256 (see the layout table on
-    /// [`REVISION_LEN`]). A shorter file (e.g. revision-only, or
-    /// revision + md5) reports no sha256.
+    /// Reads the sha256, present only when the file holds revision + sha256.
     pub fn read_sha256(&mut self) -> Result<Option<Sha256Hash>, PackageCacheLayerError> {
         if self.len()? < REVISION_LEN + SHA256_LEN {
             return Ok(None);
@@ -337,16 +348,10 @@ impl CacheMetadataFile {
         Ok(Some(Sha256Hash::from(buf)))
     }
 
-    /// Reads the md5 hash from the cache metadata file.
-    ///
-    /// The md5 is stored after the (optional) sha256, so its offset depends on
-    /// whether a sha256 is present: it lives at `REVISION_LEN + SHA256_LEN`
-    /// when a sha256 was recorded, and directly at `REVISION_LEN` otherwise.
-    /// Presence is again derived from the total file length.
+    /// Reads the md5, stored after the optional sha256.
     pub fn read_md5(&mut self) -> Result<Option<Md5Hash>, PackageCacheLayerError> {
         let len = self.len()?;
-        // If a sha256 is present the md5 follows it; otherwise it sits right
-        // after the revision.
+        // md5 follows the sha256 if present, else sits right after the revision.
         let offset = if len >= REVISION_LEN + SHA256_LEN {
             REVISION_LEN + SHA256_LEN
         } else {
@@ -373,6 +378,14 @@ impl CacheMetadataFile {
         }
         Ok(Some(Md5Hash::from(buf)))
     }
+
+    /// Reads both recorded digests for this cache entry.
+    pub fn read_recorded_digests(&mut self) -> Result<RecordedDigests, PackageCacheLayerError> {
+        Ok(RecordedDigests {
+            sha256: self.read_sha256()?,
+            md5: self.read_md5()?,
+        })
+    }
 }
 
 async fn warn_timeout_future(message: String) {
@@ -388,7 +401,7 @@ mod tests {
 
     use rattler_digest::{Md5, Sha256, parse_digest_from_hex};
 
-    use super::{CacheMetadataFile, REVISION_LEN, SHA256_LEN};
+    use super::{CacheMetadataFile, REVISION_LEN, RequestedDigests, SHA256_LEN};
 
     #[tokio::test]
     async fn cache_metadata_serialize_deserialize() {
@@ -402,7 +415,13 @@ mod tests {
             "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
         );
         metadata
-            .write_revision_and_digests(1, sha.as_ref(), None)
+            .write_revision_and_digests(
+                1,
+                RequestedDigests {
+                    sha256: sha,
+                    md5: None,
+                },
+            )
             .await
             .unwrap();
         // Read back the revision and sha from the metadata file
@@ -414,8 +433,7 @@ mod tests {
         assert_eq!(metadata.read_md5().unwrap(), None);
     }
 
-    /// Every combination of present/absent sha256 and md5 must round-trip,
-    /// since presence is recovered from the file length alone.
+    /// Every sha256/md5 present/absent combination must round-trip.
     #[tokio::test]
     async fn cache_metadata_roundtrips_all_digest_combinations() {
         let sha = parse_digest_from_hex::<Sha256>(
@@ -428,7 +446,13 @@ mod tests {
             let metadata_file = temp_dir.path().join("foo.lock");
             let mut metadata = CacheMetadataFile::acquire(&metadata_file).await.unwrap();
             metadata
-                .write_revision_and_digests(7, sha_in.as_ref(), md5_in.as_ref())
+                .write_revision_and_digests(
+                    7,
+                    RequestedDigests {
+                        sha256: sha_in,
+                        md5: md5_in,
+                    },
+                )
                 .await
                 .unwrap();
 
@@ -438,8 +462,7 @@ mod tests {
         }
     }
 
-    /// A metadata file written by an older rattler (revision + raw sha256, no
-    /// md5 field) must still read back its revision and sha256 unchanged, so
+    /// The legacy revision + sha256 layout must read back unchanged, so
     /// upgrading does not invalidate existing caches.
     #[tokio::test]
     async fn cache_metadata_reads_legacy_revision_and_sha_layout() {
