@@ -42,7 +42,9 @@ digest = { workspace = true }
 hex = { workspace = true }
 simple_spawn_blocking = { workspace = true, features = ["tokio"] }
 rayon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
