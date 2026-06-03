@@ -1954,10 +1954,13 @@ mod test {
         fetched.load(Ordering::Acquire)
     }
 
-    /// A no-sha entry must not satisfy a later sha256-pinned request for the
-    /// same coordinate; the pinned request re-fetches instead.
-    #[tokio::test]
-    async fn test_package_cache_sha_entry_refetches_previous_no_sha_cache() {
+    /// Populates the cache with a no-digest request, then asserts that a
+    /// checksum-pinned request for the same coordinate (`pin` adds the digest)
+    /// re-fetches instead of trusting the unverified entry, and is served from
+    /// cache once the entry is bound to that digest.
+    async fn assert_pinned_request_refetches_no_digest_entry(
+        pin: impl FnOnce(CacheKey) -> CacheKey,
+    ) {
         let packages_dir = tempdir().unwrap();
         let cache = PackageCache::new(packages_dir.path());
 
@@ -1972,56 +1975,36 @@ mod test {
             "the first request must populate the cache"
         );
 
-        // sha-pinned: must re-fetch, not trust the no-digest entry.
+        // Pinned: must re-fetch, not trust the no-digest entry.
+        let pinned = pin(base_key);
+        assert!(
+            fetch_and_record(&cache, pinned.clone()).await,
+            "pinned request must re-fetch instead of trusting the previous no-digest cache entry"
+        );
+
+        // Now bound to this digest: a matching request is served from cache.
+        assert!(
+            !fetch_and_record(&cache, pinned).await,
+            "a matching pinned request must be served from cache"
+        );
+    }
+
+    /// A no-sha entry must not satisfy a later sha256-pinned request.
+    #[tokio::test]
+    async fn test_package_cache_sha_entry_refetches_previous_no_sha_cache() {
         let sha = parse_digest_from_hex::<Sha256>(
             "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
         )
         .unwrap();
-        let sha_key = base_key.clone().with_sha256(sha);
-        assert!(
-            fetch_and_record(&cache, sha_key.clone()).await,
-            "sha-pinned request must re-fetch instead of trusting the previous no-sha cache entry"
-        );
-
-        // Now bound to this sha: a matching request is served from cache.
-        assert!(
-            !fetch_and_record(&cache, sha_key).await,
-            "a matching sha-pinned request must be served from cache"
-        );
+        assert_pinned_request_refetches_no_digest_entry(|key| key.with_sha256(sha)).await;
     }
 
-    /// The md5 analogue: a no-digest entry must not satisfy a later md5-pinned
-    /// request, but once bound to that md5 it must be reusable (no regression).
+    /// The md5 analogue; once bound to that md5 the entry is reusable (no regression).
     #[tokio::test]
     async fn test_package_cache_md5_entry_refetches_previous_no_digest_cache() {
         use rattler_digest::Md5;
 
-        let packages_dir = tempdir().unwrap();
-        let cache = PackageCache::new(packages_dir.path());
-
-        let package_path = get_test_data_dir().join("clobber/clobber-python-0.1.0-cpython.conda");
-        let base_key: CacheKey = CondaArchiveIdentifier::try_from_path(&package_path)
-            .unwrap()
-            .into();
-
-        // No checksum: populates the cache.
-        assert!(
-            fetch_and_record(&cache, base_key.clone()).await,
-            "the first request must populate the cache"
-        );
-
-        // md5-pinned: must re-fetch, not trust the no-digest entry.
         let md5 = parse_digest_from_hex::<Md5>("d41d8cd98f00b204e9800998ecf8427e").unwrap();
-        let md5_key = base_key.clone().with_md5(md5);
-        assert!(
-            fetch_and_record(&cache, md5_key.clone()).await,
-            "md5-pinned request must re-fetch instead of trusting the previous no-digest cache entry"
-        );
-
-        // Now bound to this md5: a matching request is served from cache.
-        assert!(
-            !fetch_and_record(&cache, md5_key).await,
-            "a matching md5-pinned request must be served from cache"
-        );
+        assert_pinned_request_refetches_no_digest_entry(|key| key.with_md5(md5)).await;
     }
 }

@@ -374,17 +374,35 @@ mod tests {
     use rattler_digest::{Md5, Sha256, parse_digest_from_hex};
 
     use super::{
-        CacheMetadataFile, MD5_LEN, REVISION_LEN, RecordedDigests, RequestedDigests, SHA256_LEN,
+        CacheMetadataFile, MD5_LEN, Md5Hash, REVISION_LEN, RecordedDigests, RequestedDigests,
+        SHA256_LEN, Sha256Hash,
     };
+
+    fn sample_sha() -> Sha256Hash {
+        parse_digest_from_hex::<Sha256>(
+            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
+        )
+        .unwrap()
+    }
+
+    fn sample_md5() -> Md5Hash {
+        parse_digest_from_hex::<Md5>("d41d8cd98f00b204e9800998ecf8427e").unwrap()
+    }
+
+    async fn temp_metadata() -> (tempfile::TempDir, CacheMetadataFile) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = CacheMetadataFile::acquire(&dir.path().join("meta.lock"))
+            .await
+            .unwrap();
+        (dir, file)
+    }
 
     /// `encode` then `decode` must reproduce the original digests, and the
     /// encoded length must match the layout the readers rely on.
     #[test]
     fn requested_digests_encode_decode_roundtrip() {
-        let sha = parse_digest_from_hex::<Sha256>(
-            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
-        );
-        let md5 = parse_digest_from_hex::<Md5>("d41d8cd98f00b204e9800998ecf8427e");
+        let sha = Some(sample_sha());
+        let md5 = Some(sample_md5());
 
         for (sha_in, md5_in, expected_len) in [
             (None, None, 0),
@@ -405,47 +423,15 @@ mod tests {
         }
     }
 
+    /// The file path preserves the revision and round-trips every digest
+    /// combination through the length-discriminated layout.
     #[tokio::test]
-    async fn cache_metadata_serialize_deserialize() {
-        // Temporarily create a metadata file and write a revision and sha to it
-        let temp_dir = tempfile::tempdir().unwrap();
-        let metadata_file = temp_dir.path().join("foo.lock");
-        // Acquire a handle on the file
-        let mut metadata = CacheMetadataFile::acquire(&metadata_file).await.unwrap();
-        // Write a revision and sha to the lock file
-        let sha = parse_digest_from_hex::<Sha256>(
-            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
-        );
-        metadata
-            .write_revision_and_digests(
-                1,
-                RequestedDigests {
-                    sha256: sha,
-                    md5: None,
-                },
-            )
-            .await
-            .unwrap();
-        // Read back the revision and sha from the metadata file
-        let revision = metadata.read_revision().unwrap();
-        assert_eq!(revision, 1);
-        let recorded = metadata.read_recorded_digests().unwrap();
-        assert_eq!(recorded.sha256, sha);
-        assert_eq!(recorded.md5, None);
-    }
-
-    /// Every sha256/md5 present/absent combination must round-trip.
-    #[tokio::test]
-    async fn cache_metadata_roundtrips_all_digest_combinations() {
-        let sha = parse_digest_from_hex::<Sha256>(
-            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
-        );
-        let md5 = parse_digest_from_hex::<Md5>("d41d8cd98f00b204e9800998ecf8427e");
+    async fn cache_metadata_file_roundtrip() {
+        let sha = Some(sample_sha());
+        let md5 = Some(sample_md5());
 
         for (sha_in, md5_in) in [(None, None), (sha, None), (None, md5), (sha, md5)] {
-            let temp_dir = tempfile::tempdir().unwrap();
-            let metadata_file = temp_dir.path().join("foo.lock");
-            let mut metadata = CacheMetadataFile::acquire(&metadata_file).await.unwrap();
+            let (_dir, mut metadata) = temp_metadata().await;
             metadata
                 .write_revision_and_digests(
                     7,
@@ -468,27 +454,18 @@ mod tests {
     /// upgrading does not invalidate existing caches.
     #[tokio::test]
     async fn cache_metadata_reads_legacy_revision_and_sha_layout() {
-        let sha = parse_digest_from_hex::<Sha256>(
-            "4dd9893f1eee45e1579d1a4f5533ef67a84b5e4b7515de7ed0db1dd47adc6bc8",
-        )
-        .unwrap();
+        let sha = sample_sha();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.lock");
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let metadata_file = temp_dir.path().join("legacy.lock");
+        // Hand-write the legacy 40-byte layout: revision + sha256, no md5.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&3u64.to_be_bytes()).unwrap();
+        f.write_all(&sha[..]).unwrap();
+        f.flush().unwrap();
+        assert_eq!(f.metadata().unwrap().len(), REVISION_LEN + SHA256_LEN);
 
-        // Hand-write the legacy 40-byte layout: 8-byte revision + 32-byte sha256.
-        {
-            let mut f = std::fs::File::create(&metadata_file).unwrap();
-            f.write_all(&3u64.to_be_bytes()).unwrap();
-            f.write_all(&sha[..]).unwrap();
-            f.flush().unwrap();
-        }
-        assert_eq!(
-            std::fs::metadata(&metadata_file).unwrap().len(),
-            REVISION_LEN + SHA256_LEN
-        );
-
-        let mut metadata = CacheMetadataFile::acquire(&metadata_file).await.unwrap();
+        let mut metadata = CacheMetadataFile::acquire(&path).await.unwrap();
         assert_eq!(metadata.read_revision().unwrap(), 3);
         let recorded = metadata.read_recorded_digests().unwrap();
         assert_eq!(recorded.sha256, Some(sha));
