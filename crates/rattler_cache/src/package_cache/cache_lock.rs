@@ -170,25 +170,24 @@ impl CacheMetadataFile {
     }
 }
 
-/// Versioned on-disk metadata format:
+/// Versioned on-disk metadata format: a fixed `MAGIC` prefix, a version byte,
+/// then a `MessagePack`-encoded [`StoredMetadataV1`] body.
 ///
-/// ```text
-/// MAGIC (4) | version (1) | flags (1) | revision (8, big-endian) | [sha256 (32)] | [md5 (16)]
-/// ```
+/// The framing exists so [`StoredMetadata::decode`] can, with a cheap byte
+/// compare, tell this format apart from the legacy raw `revision (+ sha256)`
+/// layout — the first `MAGIC` byte is nonzero, which can never collide with a
+/// legacy file (whose leading bytes are the high, zero bytes of a big-endian
+/// revision). Decoding tries the versioned body, then the legacy layout (so
+/// existing caches keep reading back unchanged), and finally falls back to
+/// empty metadata for anything unrecognized (corruption, a newer version),
+/// which makes the caller re-fetch and rewrite rather than trust it.
 ///
-/// `flags` records which digests follow, so parsing is a fixed-offset read.
-/// The first `MAGIC` byte is nonzero, which can never collide with a legacy
-/// file (whose leading bytes are the high, zero bytes of a big-endian
-/// revision), so [`StoredMetadata::decode`] can cheaply tell the two apart and
-/// fall back to the legacy `revision (+ sha256)` layout for existing caches.
-/// Unrecognized content (corruption, a newer version) falls back to empty
-/// metadata, which makes the caller re-fetch rather than trust it.
+/// The version byte gates the body: a future layout bumps `VERSION` (and adds
+/// a `StoredMetadataV2`); binaries that don't know that version fall back
+/// instead of misreading it.
 const MAGIC: [u8; 4] = *b"RCM1";
 const VERSION: u8 = 1;
-const FLAG_SHA256: u8 = 0b01;
-const FLAG_MD5: u8 = 0b10;
 const SHA256_LEN: usize = 32;
-const MD5_LEN: usize = 16;
 /// Length of the legacy layout's leading big-endian revision counter.
 const LEGACY_REVISION_LEN: usize = 8;
 
@@ -219,6 +218,16 @@ impl RecordedDigests {
     }
 }
 
+/// `MessagePack` body of the versioned metadata format. Digests are stored as
+/// raw byte arrays. New fields can be added in a future `StoredMetadataV2`
+/// guarded by a bumped [`VERSION`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredMetadataV1 {
+    revision: u64,
+    sha256: Option<[u8; 32]>,
+    md5: Option<[u8; 16]>,
+}
+
 /// The parsed contents of a cache metadata file: a revision counter plus the
 /// digests recorded for the entry.
 #[derive(Debug, Default, Clone, Copy)]
@@ -230,25 +239,21 @@ pub(super) struct StoredMetadata {
 impl StoredMetadata {
     /// Serializes `revision` and `digests` in the current versioned format.
     fn encode(revision: u64, digests: RequestedDigests) -> Vec<u8> {
-        let mut flags = 0u8;
-        if digests.sha256.is_some() {
-            flags |= FLAG_SHA256;
+        fn to_array<const N: usize>(hash: impl AsRef<[u8]>) -> [u8; N] {
+            let mut out = [0u8; N];
+            out.copy_from_slice(hash.as_ref());
+            out
         }
-        if digests.md5.is_some() {
-            flags |= FLAG_MD5;
-        }
-
-        let mut bytes = Vec::with_capacity(MAGIC.len() + 2 + 8 + SHA256_LEN + MD5_LEN);
+        let body = StoredMetadataV1 {
+            revision,
+            sha256: digests.sha256.map(to_array),
+            md5: digests.md5.map(to_array),
+        };
+        let mut bytes = Vec::with_capacity(MAGIC.len() + 1 + 64);
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
-        bytes.push(flags);
-        bytes.extend_from_slice(&revision.to_be_bytes());
-        if let Some(sha256) = digests.sha256 {
-            bytes.extend_from_slice(&sha256[..]);
-        }
-        if let Some(md5) = digests.md5 {
-            bytes.extend_from_slice(&md5[..]);
-        }
+        rmp_serde::encode::write(&mut bytes, &body)
+            .expect("serializing cache metadata to a Vec cannot fail");
         bytes
     }
 
@@ -264,26 +269,19 @@ impl StoredMetadata {
 
     fn decode_versioned(bytes: &[u8]) -> Option<Self> {
         let rest = bytes.strip_prefix(&MAGIC)?;
-        let (&version, rest) = rest.split_first()?;
+        let (&version, body) = rest.split_first()?;
         if version != VERSION {
             // A future version we don't understand: let the caller fall back.
             return None;
         }
-        let (&flags, rest) = rest.split_first()?;
-        let (revision, mut rest) = rest.split_at_checked(8)?;
-        let revision = u64::from_be_bytes(revision.try_into().ok()?);
-
-        let mut digests = RecordedDigests::default();
-        if flags & FLAG_SHA256 != 0 {
-            let (sha256, tail) = rest.split_at_checked(SHA256_LEN)?;
-            digests.sha256 = Some(Sha256Hash::from(<[u8; SHA256_LEN]>::try_from(sha256).ok()?));
-            rest = tail;
-        }
-        if flags & FLAG_MD5 != 0 {
-            let (md5, _) = rest.split_at_checked(MD5_LEN)?;
-            digests.md5 = Some(Md5Hash::from(<[u8; MD5_LEN]>::try_from(md5).ok()?));
-        }
-        Some(Self { revision, digests })
+        let body: StoredMetadataV1 = rmp_serde::from_slice(body).ok()?;
+        Some(Self {
+            revision: body.revision,
+            digests: RecordedDigests {
+                sha256: body.sha256.map(Sha256Hash::from),
+                md5: body.md5.map(Md5Hash::from),
+            },
+        })
     }
 
     fn decode_legacy(bytes: &[u8]) -> Option<Self> {
@@ -372,8 +370,8 @@ mod tests {
     use rattler_digest::{Md5, Sha256, parse_digest_from_hex};
 
     use super::{
-        CacheMetadataFile, LEGACY_REVISION_LEN, MAGIC, MD5_LEN, Md5Hash, RequestedDigests,
-        SHA256_LEN, Sha256Hash, StoredMetadata, VERSION,
+        CacheMetadataFile, LEGACY_REVISION_LEN, MAGIC, Md5Hash, RequestedDigests, SHA256_LEN,
+        Sha256Hash, StoredMetadata, VERSION,
     };
 
     fn sample_sha() -> Sha256Hash {
@@ -487,10 +485,7 @@ mod tests {
     fn decode_unknown_version_falls_back_to_empty() {
         let mut bytes = MAGIC.to_vec();
         bytes.push(VERSION + 1); // a version this binary does not understand
-        bytes.push(0b11); // flags claiming both sha256 and md5 follow
-        bytes.extend_from_slice(&5u64.to_be_bytes());
-        bytes.extend_from_slice(&[0xab; SHA256_LEN]);
-        bytes.extend_from_slice(&[0xcd; MD5_LEN]);
+        bytes.extend_from_slice(&[0xab; 48]); // arbitrary body we must not trust
 
         let decoded = StoredMetadata::decode(&bytes);
         assert_eq!(decoded.revision, 0);
