@@ -216,6 +216,25 @@ pub(super) struct RecordedDigests {
 }
 
 impl RecordedDigests {
+    /// Parses digest bytes written by [`RequestedDigests::encode`] (the file
+    /// contents after the revision). Presence is recovered from the length:
+    /// a leading 32 bytes is the sha256, a trailing 16 bytes is the md5.
+    fn decode(mut bytes: &[u8]) -> Self {
+        let mut digests = RecordedDigests::default();
+        if bytes.len() >= SHA256_LEN as usize {
+            let mut sha256 = [0u8; SHA256_LEN as usize];
+            sha256.copy_from_slice(&bytes[..SHA256_LEN as usize]);
+            digests.sha256 = Some(Sha256Hash::from(sha256));
+            bytes = &bytes[SHA256_LEN as usize..];
+        }
+        if bytes.len() >= MD5_LEN as usize {
+            let mut md5 = [0u8; MD5_LEN as usize];
+            md5.copy_from_slice(&bytes[..MD5_LEN as usize]);
+            digests.md5 = Some(Md5Hash::from(md5));
+        }
+        digests
+    }
+
     /// Whether this entry may satisfy a checksum-pinned `requested`. A pinned
     /// digest must match the recorded one; sha256 takes precedence over md5
     /// (mirroring download verification). An unpinned request matches anything.
@@ -315,72 +334,29 @@ impl CacheMetadataFile {
         Ok(u64::from_be_bytes(buf))
     }
 
-    /// Reads the sha256, present only when the file holds revision + sha256.
-    pub fn read_sha256(&mut self) -> Result<Option<Sha256Hash>, PackageCacheLayerError> {
-        if self.len()? < REVISION_LEN + SHA256_LEN {
-            return Ok(None);
-        }
+    /// Reads the digests recorded for this cache entry, i.e. everything after
+    /// the revision, parsed by [`RecordedDigests::decode`].
+    pub fn read_recorded_digests(&mut self) -> Result<RecordedDigests, PackageCacheLayerError> {
+        let digest_len = self.len()?.saturating_sub(REVISION_LEN);
+        let mut buf = vec![0u8; digest_len as usize];
         (&*self.file)
             .seek(SeekFrom::Start(REVISION_LEN))
             .map_err(|e| {
                 PackageCacheLayerError::LockError(
-                    "failed to seek to sha256 in cache lock".to_string(),
+                    "failed to seek to digests in cache lock".to_string(),
                     e,
                 )
             })?;
-        let mut buf = [0; SHA256_LEN as usize];
-        match (&*self.file).read_exact(&mut buf) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None);
-            }
-            Err(e) => {
+        if let Err(e) = (&*self.file).read_exact(&mut buf) {
+            // A truncated/short file simply records fewer digests.
+            if e.kind() != std::io::ErrorKind::UnexpectedEof {
                 return Err(PackageCacheLayerError::LockError(
-                    "failed to read sha256 from cache lock".to_string(),
+                    "failed to read digests from cache lock".to_string(),
                     e,
                 ));
             }
         }
-        Ok(Some(Sha256Hash::from(buf)))
-    }
-
-    /// Reads the md5, stored after the optional sha256.
-    pub fn read_md5(&mut self) -> Result<Option<Md5Hash>, PackageCacheLayerError> {
-        let len = self.len()?;
-        // md5 follows the sha256 if present, else sits right after the revision.
-        let offset = if len >= REVISION_LEN + SHA256_LEN {
-            REVISION_LEN + SHA256_LEN
-        } else {
-            REVISION_LEN
-        };
-        if len < offset + MD5_LEN {
-            return Ok(None);
-        }
-        (&*self.file).seek(SeekFrom::Start(offset)).map_err(|e| {
-            PackageCacheLayerError::LockError("failed to seek to md5 in cache lock".to_string(), e)
-        })?;
-        let mut buf = [0; MD5_LEN as usize];
-        match (&*self.file).read_exact(&mut buf) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(PackageCacheLayerError::LockError(
-                    "failed to read md5 from cache lock".to_string(),
-                    e,
-                ));
-            }
-        }
-        Ok(Some(Md5Hash::from(buf)))
-    }
-
-    /// Reads both recorded digests for this cache entry.
-    pub fn read_recorded_digests(&mut self) -> Result<RecordedDigests, PackageCacheLayerError> {
-        Ok(RecordedDigests {
-            sha256: self.read_sha256()?,
-            md5: self.read_md5()?,
-        })
+        Ok(RecordedDigests::decode(&buf))
     }
 }
 
@@ -423,10 +399,9 @@ mod tests {
         // Read back the revision and sha from the metadata file
         let revision = metadata.read_revision().unwrap();
         assert_eq!(revision, 1);
-        let read_sha = metadata.read_sha256().unwrap();
-        assert_eq!(sha, read_sha);
-        // No md5 was written.
-        assert_eq!(metadata.read_md5().unwrap(), None);
+        let recorded = metadata.read_recorded_digests().unwrap();
+        assert_eq!(recorded.sha256, sha);
+        assert_eq!(recorded.md5, None);
     }
 
     /// Every sha256/md5 present/absent combination must round-trip.
@@ -453,8 +428,9 @@ mod tests {
                 .unwrap();
 
             assert_eq!(metadata.read_revision().unwrap(), 7);
-            assert_eq!(metadata.read_sha256().unwrap(), sha_in);
-            assert_eq!(metadata.read_md5().unwrap(), md5_in);
+            let recorded = metadata.read_recorded_digests().unwrap();
+            assert_eq!(recorded.sha256, sha_in);
+            assert_eq!(recorded.md5, md5_in);
         }
     }
 
@@ -484,7 +460,8 @@ mod tests {
 
         let mut metadata = CacheMetadataFile::acquire(&metadata_file).await.unwrap();
         assert_eq!(metadata.read_revision().unwrap(), 3);
-        assert_eq!(metadata.read_sha256().unwrap(), Some(sha));
-        assert_eq!(metadata.read_md5().unwrap(), None);
+        let recorded = metadata.read_recorded_digests().unwrap();
+        assert_eq!(recorded.sha256, Some(sha));
+        assert_eq!(recorded.md5, None);
     }
 }
