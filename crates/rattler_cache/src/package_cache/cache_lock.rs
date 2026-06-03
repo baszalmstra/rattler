@@ -193,6 +193,21 @@ pub(super) struct RequestedDigests {
     pub(super) md5: Option<Md5Hash>,
 }
 
+impl RequestedDigests {
+    /// Serializes the present digests in on-disk order: sha256 (if any)
+    /// followed by md5 (if any). See the layout table on [`REVISION_LEN`].
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity((SHA256_LEN + MD5_LEN) as usize);
+        if let Some(sha256) = self.sha256 {
+            bytes.extend_from_slice(&sha256[..]);
+        }
+        if let Some(md5) = self.md5 {
+            bytes.extend_from_slice(&md5[..]);
+        }
+        bytes
+    }
+}
+
 /// Content digests recorded for an existing cache entry.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct RecordedDigests {
@@ -221,7 +236,9 @@ impl CacheMetadataFile {
     ) -> Result<(), PackageCacheLayerError> {
         let file = self.file.clone();
 
-        let RequestedDigests { sha256, md5 } = digests;
+        // revision followed by the digests in their on-disk order.
+        let revision_bytes = revision.to_be_bytes();
+        let digest_bytes = digests.encode();
         simple_spawn_blocking::tokio::run_blocking_task(move || {
             // Ensure we write from the start of the file
             (&*file).rewind().map_err(|e| {
@@ -231,8 +248,6 @@ impl CacheMetadataFile {
                 )
             })?;
 
-            // Write the bytes of the revision
-            let revision_bytes = revision.to_be_bytes();
             (&*file).write_all(&revision_bytes).map_err(|e| {
                 PackageCacheLayerError::LockError(
                     "failed to write revision from cache lock".to_string(),
@@ -240,31 +255,12 @@ impl CacheMetadataFile {
                 )
             })?;
 
-            // sha256 directly after the revision: preserves the legacy layout.
-            let sha_bytes = if let Some(sha) = sha256 {
-                (&*file).write_all(&sha[..]).map_err(|e| {
-                    PackageCacheLayerError::LockError(
-                        "failed to write sha256 from cache lock".to_string(),
-                        e,
-                    )
-                })?;
-                sha.len()
-            } else {
-                0
-            };
-
-            // md5 after the sha256 slot.
-            let md5_bytes = if let Some(md5) = md5 {
-                (&*file).write_all(&md5[..]).map_err(|e| {
-                    PackageCacheLayerError::LockError(
-                        "failed to write md5 from cache lock".to_string(),
-                        e,
-                    )
-                })?;
-                md5.len()
-            } else {
-                0
-            };
+            (&*file).write_all(&digest_bytes).map_err(|e| {
+                PackageCacheLayerError::LockError(
+                    "failed to write digests from cache lock".to_string(),
+                    e,
+                )
+            })?;
 
             // Ensure all bytes are written to disk
             (&*file).flush().map_err(|e| {
@@ -275,7 +271,7 @@ impl CacheMetadataFile {
             })?;
 
             // Update the length of the file
-            let file_length = revision_bytes.len() + sha_bytes + md5_bytes;
+            let file_length = revision_bytes.len() + digest_bytes.len();
             file.set_len(file_length as u64).map_err(|e| {
                 PackageCacheLayerError::LockError(
                     "failed to truncate cache lock after writing revision".to_string(),
