@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Formatter},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -170,42 +170,33 @@ impl CacheMetadataFile {
     }
 }
 
-/// On-disk metadata layout. Digest presence is derived from total length, so
-/// the four states map to distinct lengths and can't be confused:
+/// Versioned on-disk metadata format:
 ///
-/// | length | contents                |
-/// |--------|-------------------------|
-/// | 8      | revision only           |
-/// | 24     | revision + md5          |
-/// | 40     | revision + sha256       |
-/// | 56     | revision + sha256 + md5 |
+/// ```text
+/// MAGIC (4) | version (1) | flags (1) | revision (8, big-endian) | [sha256 (32)] | [md5 (16)]
+/// ```
 ///
-/// Backwards compatible: the legacy 8/40-byte files read back unchanged, so
-/// existing caches stay valid. md5 is an append older binaries ignore.
-const REVISION_LEN: u64 = 8;
-const SHA256_LEN: u64 = 32;
-const MD5_LEN: u64 = 16;
+/// `flags` records which digests follow, so parsing is a fixed-offset read.
+/// The first `MAGIC` byte is nonzero, which can never collide with a legacy
+/// file (whose leading bytes are the high, zero bytes of a big-endian
+/// revision), so [`StoredMetadata::decode`] can cheaply tell the two apart and
+/// fall back to the legacy `revision (+ sha256)` layout for existing caches.
+/// Unrecognized content (corruption, a newer version) falls back to empty
+/// metadata, which makes the caller re-fetch rather than trust it.
+const MAGIC: [u8; 4] = *b"RCM1";
+const VERSION: u8 = 1;
+const FLAG_SHA256: u8 = 0b01;
+const FLAG_MD5: u8 = 0b10;
+const SHA256_LEN: usize = 32;
+const MD5_LEN: usize = 16;
+/// Length of the legacy layout's leading big-endian revision counter.
+const LEGACY_REVISION_LEN: usize = 8;
 
 /// Content digests a caller pinned for a package request.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct RequestedDigests {
     pub(super) sha256: Option<Sha256Hash>,
     pub(super) md5: Option<Md5Hash>,
-}
-
-impl RequestedDigests {
-    /// Serializes the present digests in on-disk order: sha256 (if any)
-    /// followed by md5 (if any). See the layout table on [`REVISION_LEN`].
-    fn encode(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity((SHA256_LEN + MD5_LEN) as usize);
-        if let Some(sha256) = self.sha256 {
-            bytes.extend_from_slice(&sha256[..]);
-        }
-        if let Some(md5) = self.md5 {
-            bytes.extend_from_slice(&md5[..]);
-        }
-        bytes
-    }
 }
 
 /// Content digests recorded for an existing cache entry.
@@ -216,25 +207,6 @@ pub(super) struct RecordedDigests {
 }
 
 impl RecordedDigests {
-    /// Parses digest bytes written by [`RequestedDigests::encode`] (the file
-    /// contents after the revision). Presence is recovered from the length:
-    /// a leading 32 bytes is the sha256, a trailing 16 bytes is the md5.
-    fn decode(mut bytes: &[u8]) -> Self {
-        let mut digests = RecordedDigests::default();
-        if bytes.len() >= SHA256_LEN as usize {
-            let mut sha256 = [0u8; SHA256_LEN as usize];
-            sha256.copy_from_slice(&bytes[..SHA256_LEN as usize]);
-            digests.sha256 = Some(Sha256Hash::from(sha256));
-            bytes = &bytes[SHA256_LEN as usize..];
-        }
-        if bytes.len() >= MD5_LEN as usize {
-            let mut md5 = [0u8; MD5_LEN as usize];
-            md5.copy_from_slice(&bytes[..MD5_LEN as usize]);
-            digests.md5 = Some(Md5Hash::from(md5));
-        }
-        digests
-    }
-
     /// Whether this entry may satisfy a checksum-pinned `requested`. A pinned
     /// digest must match the recorded one; sha256 takes precedence over md5
     /// (mirroring download verification). An unpinned request matches anything.
@@ -247,116 +219,142 @@ impl RecordedDigests {
     }
 }
 
+/// The parsed contents of a cache metadata file: a revision counter plus the
+/// digests recorded for the entry.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct StoredMetadata {
+    pub(super) revision: u64,
+    pub(super) digests: RecordedDigests,
+}
+
+impl StoredMetadata {
+    /// Serializes `revision` and `digests` in the current versioned format.
+    fn encode(revision: u64, digests: RequestedDigests) -> Vec<u8> {
+        let mut flags = 0u8;
+        if digests.sha256.is_some() {
+            flags |= FLAG_SHA256;
+        }
+        if digests.md5.is_some() {
+            flags |= FLAG_MD5;
+        }
+
+        let mut bytes = Vec::with_capacity(MAGIC.len() + 2 + 8 + SHA256_LEN + MD5_LEN);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION);
+        bytes.push(flags);
+        bytes.extend_from_slice(&revision.to_be_bytes());
+        if let Some(sha256) = digests.sha256 {
+            bytes.extend_from_slice(&sha256[..]);
+        }
+        if let Some(md5) = digests.md5 {
+            bytes.extend_from_slice(&md5[..]);
+        }
+        bytes
+    }
+
+    /// Parses metadata bytes. Tries the current versioned format, then the
+    /// legacy `revision (+ sha256)` layout, and finally falls back to empty
+    /// metadata (revision 0, no digests) — which makes the caller re-fetch and
+    /// rewrite the entry rather than trust unparseable bytes.
+    fn decode(bytes: &[u8]) -> Self {
+        Self::decode_versioned(bytes)
+            .or_else(|| Self::decode_legacy(bytes))
+            .unwrap_or_default()
+    }
+
+    fn decode_versioned(bytes: &[u8]) -> Option<Self> {
+        let rest = bytes.strip_prefix(&MAGIC)?;
+        let (&version, rest) = rest.split_first()?;
+        if version != VERSION {
+            // A future version we don't understand: let the caller fall back.
+            return None;
+        }
+        let (&flags, rest) = rest.split_first()?;
+        let (revision, mut rest) = rest.split_at_checked(8)?;
+        let revision = u64::from_be_bytes(revision.try_into().ok()?);
+
+        let mut digests = RecordedDigests::default();
+        if flags & FLAG_SHA256 != 0 {
+            let (sha256, tail) = rest.split_at_checked(SHA256_LEN)?;
+            digests.sha256 = Some(Sha256Hash::from(<[u8; SHA256_LEN]>::try_from(sha256).ok()?));
+            rest = tail;
+        }
+        if flags & FLAG_MD5 != 0 {
+            let (md5, _) = rest.split_at_checked(MD5_LEN)?;
+            digests.md5 = Some(Md5Hash::from(<[u8; MD5_LEN]>::try_from(md5).ok()?));
+        }
+        Some(Self { revision, digests })
+    }
+
+    fn decode_legacy(bytes: &[u8]) -> Option<Self> {
+        // A versioned file starts with MAGIC; never misinterpret it as legacy.
+        if bytes.starts_with(&MAGIC) {
+            return None;
+        }
+        // Empty/short file: no recorded revision yet.
+        let Some((revision, rest)) = bytes.split_at_checked(LEGACY_REVISION_LEN) else {
+            return Some(Self::default());
+        };
+        let revision = u64::from_be_bytes(revision.try_into().ok()?);
+        let sha256 = rest
+            .get(..SHA256_LEN)
+            .and_then(|s| <[u8; SHA256_LEN]>::try_from(s).ok())
+            .map(Sha256Hash::from);
+        Some(Self {
+            revision,
+            digests: RecordedDigests { sha256, md5: None },
+        })
+    }
+}
+
 impl CacheMetadataFile {
-    pub async fn write_revision_and_digests(
+    /// Writes `revision` and `digests` in the current versioned format,
+    /// replacing any previous contents.
+    pub async fn write(
         &mut self,
         revision: u64,
         digests: RequestedDigests,
     ) -> Result<(), PackageCacheLayerError> {
         let file = self.file.clone();
-
-        // revision followed by the digests in their on-disk order.
-        let revision_bytes = revision.to_be_bytes();
-        let digest_bytes = digests.encode();
+        let bytes = StoredMetadata::encode(revision, digests);
         simple_spawn_blocking::tokio::run_blocking_task(move || {
-            // Ensure we write from the start of the file
             (&*file).rewind().map_err(|e| {
                 PackageCacheLayerError::LockError(
-                    "failed to rewind cache lock for reading revision".to_string(),
+                    "failed to rewind cache lock for writing".to_string(),
                     e,
                 )
             })?;
-
-            (&*file).write_all(&revision_bytes).map_err(|e| {
-                PackageCacheLayerError::LockError(
-                    "failed to write revision from cache lock".to_string(),
-                    e,
-                )
+            (&*file).write_all(&bytes).map_err(|e| {
+                PackageCacheLayerError::LockError("failed to write cache metadata".to_string(), e)
             })?;
-
-            (&*file).write_all(&digest_bytes).map_err(|e| {
-                PackageCacheLayerError::LockError(
-                    "failed to write digests from cache lock".to_string(),
-                    e,
-                )
-            })?;
-
-            // Ensure all bytes are written to disk
             (&*file).flush().map_err(|e| {
+                PackageCacheLayerError::LockError("failed to flush cache metadata".to_string(), e)
+            })?;
+            file.set_len(bytes.len() as u64).map_err(|e| {
                 PackageCacheLayerError::LockError(
-                    "failed to flush cache lock after writing revision".to_string(),
+                    "failed to truncate cache metadata".to_string(),
                     e,
                 )
             })?;
-
-            // Update the length of the file
-            let file_length = revision_bytes.len() + digest_bytes.len();
-            file.set_len(file_length as u64).map_err(|e| {
-                PackageCacheLayerError::LockError(
-                    "failed to truncate cache lock after writing revision".to_string(),
-                    e,
-                )
-            })?;
-
             Ok(())
         })
         .await
     }
 
-    /// Total file length in bytes; determines which digest fields are present.
-    fn len(&self) -> Result<u64, PackageCacheLayerError> {
-        self.file.metadata().map(|m| m.len()).map_err(|e| {
-            PackageCacheLayerError::LockError("failed to stat cache lock".to_string(), e)
-        })
-    }
-
-    /// Reads the revision from the cache metadata file.
-    pub fn read_revision(&mut self) -> Result<u64, PackageCacheLayerError> {
+    /// Reads and parses the metadata file. Unparseable content yields empty
+    /// metadata (revision 0, no digests) via [`StoredMetadata::decode`].
+    pub fn read(&mut self) -> Result<StoredMetadata, PackageCacheLayerError> {
         (&*self.file).rewind().map_err(|e| {
             PackageCacheLayerError::LockError(
-                "failed to rewind cache lock for reading revision".to_string(),
+                "failed to rewind cache lock for reading".to_string(),
                 e,
             )
         })?;
-        let mut buf = [0; 8];
-        match (&*self.file).read_exact(&mut buf) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(0);
-            }
-            Err(e) => {
-                return Err(PackageCacheLayerError::LockError(
-                    "failed to read revision from cache lock".to_string(),
-                    e,
-                ));
-            }
-        }
-        Ok(u64::from_be_bytes(buf))
-    }
-
-    /// Reads the digests recorded for this cache entry, i.e. everything after
-    /// the revision, parsed by [`RecordedDigests::decode`].
-    pub fn read_recorded_digests(&mut self) -> Result<RecordedDigests, PackageCacheLayerError> {
-        let digest_len = self.len()?.saturating_sub(REVISION_LEN);
-        let mut buf = vec![0u8; digest_len as usize];
-        (&*self.file)
-            .seek(SeekFrom::Start(REVISION_LEN))
-            .map_err(|e| {
-                PackageCacheLayerError::LockError(
-                    "failed to seek to digests in cache lock".to_string(),
-                    e,
-                )
-            })?;
-        if let Err(e) = (&*self.file).read_exact(&mut buf) {
-            // A truncated/short file simply records fewer digests.
-            if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                return Err(PackageCacheLayerError::LockError(
-                    "failed to read digests from cache lock".to_string(),
-                    e,
-                ));
-            }
-        }
-        Ok(RecordedDigests::decode(&buf))
+        let mut buf = Vec::new();
+        (&*self.file).read_to_end(&mut buf).map_err(|e| {
+            PackageCacheLayerError::LockError("failed to read cache metadata".to_string(), e)
+        })?;
+        Ok(StoredMetadata::decode(&buf))
     }
 }
 
@@ -374,8 +372,8 @@ mod tests {
     use rattler_digest::{Md5, Sha256, parse_digest_from_hex};
 
     use super::{
-        CacheMetadataFile, MD5_LEN, Md5Hash, REVISION_LEN, RecordedDigests, RequestedDigests,
-        SHA256_LEN, Sha256Hash,
+        CacheMetadataFile, LEGACY_REVISION_LEN, MAGIC, MD5_LEN, Md5Hash, RequestedDigests,
+        SHA256_LEN, Sha256Hash, StoredMetadata, VERSION,
     };
 
     fn sample_sha() -> Sha256Hash {
@@ -397,34 +395,32 @@ mod tests {
         (dir, file)
     }
 
-    /// `encode` then `decode` must reproduce the original digests, and the
-    /// encoded length must match the layout the readers rely on.
+    /// `encode` then `decode` reproduces the revision and digests for every
+    /// digest combination, and produces the current versioned format.
     #[test]
-    fn requested_digests_encode_decode_roundtrip() {
+    fn stored_metadata_encode_decode_roundtrip() {
         let sha = Some(sample_sha());
         let md5 = Some(sample_md5());
 
-        for (sha_in, md5_in, expected_len) in [
-            (None, None, 0),
-            (None, md5, MD5_LEN),
-            (sha, None, SHA256_LEN),
-            (sha, md5, SHA256_LEN + MD5_LEN),
-        ] {
-            let encoded = RequestedDigests {
-                sha256: sha_in,
-                md5: md5_in,
-            }
-            .encode();
-            assert_eq!(encoded.len() as u64, expected_len);
+        for (sha_in, md5_in) in [(None, None), (sha, None), (None, md5), (sha, md5)] {
+            let bytes = StoredMetadata::encode(
+                9,
+                RequestedDigests {
+                    sha256: sha_in,
+                    md5: md5_in,
+                },
+            );
+            assert!(bytes.starts_with(&MAGIC));
+            assert_eq!(bytes[MAGIC.len()], VERSION);
 
-            let decoded = RecordedDigests::decode(&encoded);
-            assert_eq!(decoded.sha256, sha_in);
-            assert_eq!(decoded.md5, md5_in);
+            let decoded = StoredMetadata::decode(&bytes);
+            assert_eq!(decoded.revision, 9);
+            assert_eq!(decoded.digests.sha256, sha_in);
+            assert_eq!(decoded.digests.md5, md5_in);
         }
     }
 
-    /// The file path preserves the revision and round-trips every digest
-    /// combination through the length-discriminated layout.
+    /// The file path preserves the revision and round-trips every digest combo.
     #[tokio::test]
     async fn cache_metadata_file_roundtrip() {
         let sha = Some(sample_sha());
@@ -433,7 +429,7 @@ mod tests {
         for (sha_in, md5_in) in [(None, None), (sha, None), (None, md5), (sha, md5)] {
             let (_dir, mut metadata) = temp_metadata().await;
             metadata
-                .write_revision_and_digests(
+                .write(
                     7,
                     RequestedDigests {
                         sha256: sha_in,
@@ -443,11 +439,21 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(metadata.read_revision().unwrap(), 7);
-            let recorded = metadata.read_recorded_digests().unwrap();
-            assert_eq!(recorded.sha256, sha_in);
-            assert_eq!(recorded.md5, md5_in);
+            let stored = metadata.read().unwrap();
+            assert_eq!(stored.revision, 7);
+            assert_eq!(stored.digests.sha256, sha_in);
+            assert_eq!(stored.digests.md5, md5_in);
         }
+    }
+
+    /// A freshly created (empty) metadata file reads back as the default.
+    #[tokio::test]
+    async fn cache_metadata_empty_file_is_default() {
+        let (_dir, mut metadata) = temp_metadata().await;
+        let stored = metadata.read().unwrap();
+        assert_eq!(stored.revision, 0);
+        assert_eq!(stored.digests.sha256, None);
+        assert_eq!(stored.digests.md5, None);
     }
 
     /// The legacy revision + sha256 layout must read back unchanged, so
@@ -463,12 +469,32 @@ mod tests {
         f.write_all(&3u64.to_be_bytes()).unwrap();
         f.write_all(&sha[..]).unwrap();
         f.flush().unwrap();
-        assert_eq!(f.metadata().unwrap().len(), REVISION_LEN + SHA256_LEN);
+        assert_eq!(
+            f.metadata().unwrap().len() as usize,
+            LEGACY_REVISION_LEN + SHA256_LEN
+        );
 
         let mut metadata = CacheMetadataFile::acquire(&path).await.unwrap();
-        assert_eq!(metadata.read_revision().unwrap(), 3);
-        let recorded = metadata.read_recorded_digests().unwrap();
-        assert_eq!(recorded.sha256, Some(sha));
-        assert_eq!(recorded.md5, None);
+        let stored = metadata.read().unwrap();
+        assert_eq!(stored.revision, 3);
+        assert_eq!(stored.digests.sha256, Some(sha));
+        assert_eq!(stored.digests.md5, None);
+    }
+
+    /// An unknown future version is not trusted: decode falls back to empty
+    /// metadata so the caller re-fetches instead of misreading the payload.
+    #[test]
+    fn decode_unknown_version_falls_back_to_empty() {
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(VERSION + 1); // a version this binary does not understand
+        bytes.push(0b11); // flags claiming both sha256 and md5 follow
+        bytes.extend_from_slice(&5u64.to_be_bytes());
+        bytes.extend_from_slice(&[0xab; SHA256_LEN]);
+        bytes.extend_from_slice(&[0xcd; MD5_LEN]);
+
+        let decoded = StoredMetadata::decode(&bytes);
+        assert_eq!(decoded.revision, 0);
+        assert_eq!(decoded.digests.sha256, None);
+        assert_eq!(decoded.digests.md5, None);
     }
 }

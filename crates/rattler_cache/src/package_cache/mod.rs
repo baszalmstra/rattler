@@ -720,8 +720,9 @@ where
     }
 
     let mut metadata = CacheMetadataFile::acquire(&lock_file_path).await?;
-    let cache_revision = metadata.read_revision()?;
-    let recorded = metadata.read_recorded_digests()?;
+    let stored = metadata.read()?;
+    let cache_revision = stored.revision;
+    let recorded = stored.digests;
 
     // A no-digest entry must not satisfy a later checksum-pinned request; the
     // safe behavior is to re-fetch and verify (digest-binding issue).
@@ -808,9 +809,7 @@ where
     if let Some(ref fetch_fn) = fetch {
         // Write the new revision
         let new_revision = cache_revision + 1;
-        metadata
-            .write_revision_and_digests(new_revision, requested)
-            .await?;
+        metadata.write(new_revision, requested).await?;
 
         // Create a temporary directory in the same parent folder for atomic extraction.
         // Using the same parent ensures the rename operation is atomic (same filesystem).
