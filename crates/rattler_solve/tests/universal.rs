@@ -465,6 +465,93 @@ fn test_universal_sorting_tie_break_on_environment_dependency() {
     );
 }
 
+/// Scenario (g): an archspec split. `gpu-tool` style packages on
+/// conda-forge ship microarchitecture variants via `__archspec` (usually
+/// transitively through `_x86_64-microarch-level`); the v1 symbolic set
+/// must treat `__archspec` symbolically so those variants split into cells
+/// instead of being silently excluded. Two builds of `simd-tool`: 2.0
+/// requires `__archspec 1 x86_64_v3`, 1.0 runs anywhere. The solve must
+/// produce the v3 cell with 2.0 first (preferred version) and the
+/// complement cell with 1.0. Per CEP 30 `__archspec` is always present
+/// (not absentable) and literals match the machine's single reported name
+/// EXACTLY, like conda does: an `x86_64_v4` machine does NOT satisfy the
+/// `x86_64_v3` literal and lands in the baseline cell, as does a machine
+/// that (out of spec) reports no archspec at all.
+#[test]
+fn test_universal_archspec_split() {
+    let repodata_json = r#"{
+        "info": { "subdir": "linux-64" },
+        "packages": {
+            "simd-tool-2.0-v3_0.tar.bz2": {
+                "build": "v3_0",
+                "build_number": 0,
+                "depends": ["__archspec 1 x86_64_v3"],
+                "license": "MIT",
+                "name": "simd-tool",
+                "size": 0,
+                "subdir": "linux-64",
+                "timestamp": 1716314536803,
+                "version": "2.0"
+            },
+            "simd-tool-1.0-generic_0.tar.bz2": {
+                "build": "generic_0",
+                "build_number": 0,
+                "depends": [],
+                "license": "MIT",
+                "name": "simd-tool",
+                "size": 0,
+                "subdir": "linux-64",
+                "timestamp": 1716314536804,
+                "version": "1.0"
+            }
+        },
+        "packages.conda": {}
+    }"#;
+    let repo_data: RepoData = serde_json::from_str(repodata_json).unwrap();
+    let records = repo_data
+        .into_repo_data_records(&Channel::from_str("conda-forge", &channel_config()).unwrap());
+
+    let solution = solve_universal(task(&records, &["simd-tool"], model(&[]))).unwrap();
+    assert!(solution.verify().is_ok());
+    insta::assert_snapshot!(render_cells(&solution), @r"
+    cell: __archspec ==1 x86_64_v3
+      simd-tool=2.0=v3_0
+    cell: not (__archspec ==1 x86_64_v3)
+      simd-tool=1.0=generic_0
+    ");
+
+    // Projection uses exact matching: only a machine reporting exactly
+    // x86_64_v3 selects the v3 cell; v4 and base x86_64 machines land in
+    // the baseline cell.
+    let machine = |build: &str| {
+        [GenericVirtualPackage {
+            name: PackageName::new_unchecked("__archspec"),
+            version: Version::from_str("1").unwrap(),
+            build_string: build.to_string(),
+        }]
+    };
+    assert_eq!(
+        solution.project(&machine("x86_64_v3")).expect("v3 cell"),
+        solution.cells[0].1.as_slice()
+    );
+    assert_eq!(
+        solution
+            .project(&machine("x86_64_v4"))
+            .expect("baseline cell for v4"),
+        solution.cells[1].1.as_slice()
+    );
+    assert_eq!(
+        solution.project(&machine("x86_64")).expect("baseline cell"),
+        solution.cells[1].1.as_slice()
+    );
+    assert_eq!(
+        solution
+            .project(&[])
+            .expect("baseline cell for a machine reporting no archspec"),
+        solution.cells[1].1.as_slice()
+    );
+}
+
 /// Scenario (f): projecting the cuda-split solution onto concrete machines.
 /// A machine with cuda >= 12.1 selects the cuda cell, a machine without
 /// cuda selects the baseline cell, and a machine with an older cuda is

@@ -452,7 +452,7 @@ fn run_universal_solve(
 ) -> miette::Result<()> {
     // Names of virtual packages that are treated symbolically in universal
     // mode. These are excluded from the concrete virtual_packages list.
-    let symbolic_names: &[&str] = &["__cuda", "__glibc", "__osx", "__win"];
+    let symbolic_names: &[&str] = &["__cuda", "__archspec", "__glibc", "__osx", "__win"];
 
     // Build the symbolic virtual package set for the target platform.
     // Only include packages relevant to the platform being modeled.
@@ -462,6 +462,14 @@ fn run_universal_solve(
     symbolic_virtual_packages.push(SymbolicVirtualPackage {
         name: PackageName::new_unchecked("__cuda"),
         can_be_absent: true,
+    });
+
+    // __archspec is always present per CEP 30, so it is not absentable. Its
+    // literals match the reported microarchitecture name exactly, so
+    // microarchitecture variants split into one cell per concrete name.
+    symbolic_virtual_packages.push(SymbolicVirtualPackage {
+        name: PackageName::new_unchecked("__archspec"),
+        can_be_absent: false,
     });
 
     // Platform-specific non-absentable virtual packages.

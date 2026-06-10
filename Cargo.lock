@@ -5514,7 +5514,6 @@ dependencies = [
 name = "rattler_solve"
 version = "7.1.2"
 dependencies = [
- "archspec",
  "criterion",
  "futures",
  "hex",

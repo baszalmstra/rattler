@@ -32,3 +32,4 @@ test-data/channels/conda-forge/
 
 # Insta pending snapshots
 *.pending-snap
+*.snap.new

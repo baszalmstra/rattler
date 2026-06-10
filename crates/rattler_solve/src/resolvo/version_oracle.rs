@@ -17,8 +17,7 @@
 use std::str::FromStr;
 
 use rattler_conda_types::{
-    Component, NamelessMatchSpec, PackageName, StringMatcher, Version, VersionBumpType,
-    VersionSpec,
+    Component, NamelessMatchSpec, StringMatcher, Version, VersionBumpType, VersionSpec,
     version_spec::{EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator},
 };
 use resolvo::VersionSetRelation;
@@ -46,9 +45,9 @@ use version_ranges::Ranges;
 /// Version parts compare through [`version_spec_to_ranges`]; an
 /// unrepresentable part degrades to syntactic equality or `Unknown`. Build
 /// parts compare as exact strings (case-insensitive, like
-/// [`StringMatcher::matches`]), except for the `__archspec` package whose
-/// exact build values compare through the archspec microarchitecture DAG
-/// (see below). Glob and regex build matchers are conservatively `Unknown`.
+/// [`StringMatcher::matches`]): an environment has a single build value, so
+/// two different exact strings are disjoint. Glob and regex build matchers
+/// are conservatively `Unknown`.
 ///
 /// Any other constraining field on either spec (build number, hashes,
 /// channel, ...) restricts that spec's set in ways this oracle does not
@@ -58,31 +57,24 @@ use version_ranges::Ranges;
 ///
 /// # `__archspec` semantics
 ///
-/// For the `__archspec` package an environment literal `__archspec X` means
-/// "the machine's microarchitecture lineage includes `X`", so the set for
-/// `X` is `X` together with all its descendants in the archspec DAG:
-///
-/// - `Y` a descendant of `X` means set(`Y`) is a subset of set(`X`),
-/// - microarchitectures from different families have no common descendant
-///   and are disjoint,
-/// - unrelated microarchitectures within one family may share descendants:
-///   `Unknown`,
-/// - names unknown to the archspec DAG are `Unknown`.
-///
-/// IMPORTANT: these DAG semantics define what an `__archspec` environment
-/// literal MEANS. The projection/evaluation helper that decides which cell
-/// applies to a concrete machine must use the same lineage semantics, and
-/// this deliberately differs from the exact-string matching used for
-/// concrete `__archspec` candidate records in `filter_candidates`.
+/// `__archspec` follows the same exact-string rule as every other package.
+/// Per CEP 30 a machine always reports exactly one microarchitecture name,
+/// and conda matches `__archspec` specs against it with plain string
+/// matching (the same semantics `filter_candidates` applies to concrete
+/// records), so literals for two distinct names are mutually exclusive even
+/// when the names are related in the archspec microarchitecture DAG. The
+/// conda-forge `_x86_64-microarch-level` metapackages encode the DAG by
+/// shipping one build per concrete microarchitecture name; modeling lineage
+/// in the oracle instead would make cells claim machines on which conda
+/// itself considers the chosen records unsatisfiable.
 pub(crate) fn match_spec_relation(
-    package: &PackageName,
     a: &NamelessMatchSpec,
     b: &NamelessMatchSpec,
 ) -> VersionSetRelation {
     use VersionSetRelation::{Equal, Subset, Superset, Unknown};
 
     let version_relation = version_part_relation(a.version.as_ref(), b.version.as_ref());
-    let build_relation = build_part_relation(package, a.build.as_ref(), b.build.as_ref());
+    let build_relation = build_part_relation(a.build.as_ref(), b.build.as_ref());
 
     // A disjoint part proves disjointness of the intersections regardless of
     // any other field: restricting disjoint sets keeps them disjoint.
@@ -146,11 +138,7 @@ fn version_part_relation(a: Option<&VersionSpec>, b: Option<&VersionSpec>) -> Ve
 
 /// The relation between two optional build parts; a missing part is the
 /// full set. See [`match_spec_relation`] for the `__archspec` semantics.
-fn build_part_relation(
-    package: &PackageName,
-    a: Option<&StringMatcher>,
-    b: Option<&StringMatcher>,
-) -> VersionSetRelation {
+fn build_part_relation(a: Option<&StringMatcher>, b: Option<&StringMatcher>) -> VersionSetRelation {
     match (a, b) {
         (None, None) => VersionSetRelation::Equal,
         (None, Some(_)) => VersionSetRelation::Superset,
@@ -158,40 +146,15 @@ fn build_part_relation(
         (Some(StringMatcher::Exact(a)), Some(StringMatcher::Exact(b))) => {
             if a.eq_ignore_ascii_case(b) {
                 VersionSetRelation::Equal
-            } else if package.as_normalized() == "__archspec" {
-                archspec_relation(a, b)
             } else {
                 // The environment has a single build value; two different
-                // exact strings cannot both match it.
+                // exact strings cannot both match it. This includes
+                // __archspec per CEP 30 (one reported name, exact match).
                 VersionSetRelation::Disjoint
             }
         }
         // Glob or regex matchers: conservatively unknown.
         _ => VersionSetRelation::Unknown,
-    }
-}
-
-/// The relation between two distinct microarchitecture names through the
-/// archspec DAG: the set of an `__archspec` literal for name `X` is `X`
-/// together with all its descendants (see [`match_spec_relation`]).
-fn archspec_relation(a: &str, b: &str) -> VersionSetRelation {
-    let targets = archspec::cpu::Microarchitecture::known_targets();
-    let (Some(a), Some(b)) = (targets.get(a), targets.get(b)) else {
-        return VersionSetRelation::Unknown;
-    };
-    if a.decendent_of(b) {
-        // Every machine whose lineage includes `a` also includes `b`.
-        VersionSetRelation::Subset
-    } else if b.decendent_of(a) {
-        VersionSetRelation::Superset
-    } else if a.family().name() != b.family().name() {
-        // Different families (x86_64, aarch64, ppc64le, ...) have no common
-        // descendant: no machine satisfies both.
-        VersionSetRelation::Disjoint
-    } else {
-        // Same family without an ancestor relation: common descendants may
-        // exist (the DAG is not a tree).
-        VersionSetRelation::Unknown
     }
 }
 
@@ -429,15 +392,11 @@ mod tests {
     }
 
     fn relation(
-        package: &str,
+        _package: &str,
         a: (Option<&str>, Option<&str>),
         b: (Option<&str>, Option<&str>),
     ) -> VersionSetRelation {
-        match_spec_relation(
-            &PackageName::new_unchecked(package),
-            &nameless(a.0, a.1),
-            &nameless(b.0, b.1),
-        )
+        match_spec_relation(&nameless(a.0, a.1), &nameless(b.0, b.1))
     }
 
     #[test]
@@ -491,28 +450,30 @@ mod tests {
         );
     }
 
+    /// Per CEP 30 a machine reports exactly one microarchitecture name and
+    /// `__archspec` specs match the build string exactly (the same
+    /// semantics `filter_candidates` applies to concrete records), so two
+    /// distinct names are mutually exclusive regardless of any lineage
+    /// between them in the archspec DAG.
     #[test]
-    fn test_relation_archspec_dag() {
+    fn test_relation_archspec_exact() {
         use VersionSetRelation::*;
         let arch = |a: &str, b: &str| relation("__archspec", (None, Some(a)), (None, Some(b)));
         // Equal names.
         assert_eq!(arch("x86_64", "x86_64"), Equal);
-        // x86_64_v3 descends from x86_64: machines whose lineage includes
-        // v3 are a subset of machines whose lineage includes x86_64.
-        assert_eq!(arch("x86_64_v3", "x86_64"), Subset);
-        assert_eq!(arch("x86_64", "x86_64_v3"), Superset);
-        assert_eq!(arch("x86_64_v4", "x86_64_v3"), Subset);
-        assert_eq!(arch("x86_64_v3", "x86_64_v4"), Superset);
-        // Different families never share a machine.
+        // Distinct names are disjoint, even along a DAG lineage: a machine
+        // detected as x86_64_v3 does not match an x86_64 literal and vice
+        // versa.
+        assert_eq!(arch("x86_64_v3", "x86_64"), Disjoint);
+        assert_eq!(arch("x86_64", "x86_64_v3"), Disjoint);
+        assert_eq!(arch("x86_64_v4", "x86_64_v3"), Disjoint);
+        assert_eq!(arch("sapphirerapids", "skylake_avx512"), Disjoint);
         assert_eq!(arch("x86_64", "aarch64"), Disjoint);
-        assert_eq!(arch("zen2", "m1"), Disjoint);
-        // Same family, neither an ancestor of the other: descendants may be
-        // shared, no definite answer.
-        assert_eq!(arch("haswell", "zen2"), Unknown);
-        // Unknown microarchitecture names.
-        assert_eq!(arch("notanarch", "x86_64"), Unknown);
-        // The DAG semantics only apply to __archspec; for other packages
-        // distinct exact builds are plain disjoint strings.
+        assert_eq!(arch("haswell", "zen2"), Disjoint);
+        // Names outside the archspec DAG are still just strings.
+        assert_eq!(arch("notanarch", "x86_64"), Disjoint);
+        assert_eq!(arch("notanarch", "notanarch"), Equal);
+        // The same rule applies to every package with exact build matchers.
         assert_eq!(
             relation("__cuda", (None, Some("x86_64")), (None, Some("x86_64_v3"))),
             Disjoint
@@ -607,28 +568,18 @@ mod tests {
         let plain = nameless(Some(">=11"), None);
         let mut with_build_number = nameless(Some(">=11"), None);
         with_build_number.build_number = Some("3".parse().expect("a valid build number spec"));
-        let cuda = PackageName::new_unchecked("__cuda");
         // An unmodeled constraining field forbids definite non-disjoint
         // answers in both directions.
+        assert_eq!(match_spec_relation(&plain, &with_build_number), Unknown);
+        assert_eq!(match_spec_relation(&with_build_number, &plain), Unknown);
         assert_eq!(
-            match_spec_relation(&cuda, &plain, &with_build_number),
-            Unknown
-        );
-        assert_eq!(
-            match_spec_relation(&cuda, &with_build_number, &plain),
-            Unknown
-        );
-        assert_eq!(
-            match_spec_relation(&cuda, &with_build_number, &with_build_number),
+            match_spec_relation(&with_build_number, &with_build_number),
             Unknown
         );
         // ... but a disjoint version part stays disjoint: restricting either
         // side further cannot create an overlap.
         let low = nameless(Some("<11"), None);
-        assert_eq!(
-            match_spec_relation(&cuda, &with_build_number, &low),
-            Disjoint
-        );
+        assert_eq!(match_spec_relation(&with_build_number, &low), Disjoint);
     }
 
     fn version(s: &str) -> Version {

@@ -23,7 +23,7 @@ use std::{
 
 use rattler_conda_types::{
     GenericVirtualPackage, MatchSpec, NamelessMatchSpec, PackageName, PackageNameMatcher,
-    RepoDataRecord, StringMatcher, Version,
+    RepoDataRecord, Version,
 };
 use resolvo::{
     ConditionalRequirement, EnvLiteral, EnvLiteralKind, NameId, SolvableId,
@@ -91,14 +91,13 @@ impl EnvironmentLiteral {
     /// present and its version matches the spec's version part and its build
     /// string matches the spec's build part.
     ///
-    /// For `__archspec`, an exact build matcher is evaluated with the same
-    /// archspec DAG semantics the relation oracle uses: the machine's
-    /// microarchitecture satisfies the literal when its lineage includes the
-    /// matcher's name (so an `x86_64_v4` machine satisfies an `x86_64_v3`
-    /// literal). This deliberately differs from the exact-string matching
-    /// used for concrete `__archspec` candidate records in
-    /// `filter_candidates`; the two semantics must not be mixed, see the
-    /// relation oracle docs.
+    /// Build matching is plain [`StringMatcher::matches`], the same
+    /// semantics `filter_candidates` applies to concrete records. This
+    /// includes `__archspec`: per CEP 30 a machine reports exactly one
+    /// microarchitecture name and specs match it exactly, so an
+    /// `x86_64_v4` machine does NOT satisfy an `x86_64_v3` literal (the
+    /// archspec DAG lineage does not count; conda-forge encodes lineage by
+    /// shipping one `_x86_64-microarch-level` build per concrete name).
     pub fn evaluate(&self, machine: &[GenericVirtualPackage]) -> bool {
         let value = machine.iter().find(|vp| vp.name == self.package);
         match (&self.kind, value) {
@@ -111,33 +110,11 @@ impl EnvironmentLiteral {
                     return false;
                 }
                 if let Some(build_matcher) = &spec.build {
-                    return match build_matcher {
-                        StringMatcher::Exact(name)
-                            if self.package.as_normalized() == "__archspec" =>
-                        {
-                            archspec_lineage_includes(&value.build_string, name)
-                        }
-                        matcher => matcher.matches(&value.build_string),
-                    };
+                    return build_matcher.matches(&value.build_string);
                 }
                 true
             }
         }
-    }
-}
-
-/// Whether the machine microarchitecture `value` satisfies the literal name
-/// `wanted` under the archspec DAG semantics: its lineage includes `wanted`.
-/// Names unknown to the DAG fall back to exact (case-insensitive) equality,
-/// which is the only lineage information available for them.
-fn archspec_lineage_includes(value: &str, wanted: &str) -> bool {
-    if value.eq_ignore_ascii_case(wanted) {
-        return true;
-    }
-    let targets = archspec::cpu::Microarchitecture::known_targets();
-    match (targets.get(value), targets.get(wanted)) {
-        (Some(value), Some(wanted)) => value.decendent_of(wanted),
-        _ => false,
     }
 }
 
@@ -940,22 +917,24 @@ mod tests {
         );
     }
 
-    /// `__archspec` literals evaluate with the archspec DAG semantics: a
-    /// machine microarchitecture satisfies a literal when its lineage
-    /// includes the literal's name, NOT only on exact equality (which is
-    /// what concrete candidate filtering uses).
+    /// `__archspec` literals evaluate with exact build-string matching, the
+    /// same semantics conda and `filter_candidates` apply: per CEP 30 a
+    /// machine reports exactly one microarchitecture name, and a literal is
+    /// satisfied only by that name. DAG lineage does NOT count (an
+    /// `x86_64_v4` machine does not satisfy an `x86_64_v3` literal); the
+    /// conda-forge `_x86_64-microarch-level` metapackages encode lineage by
+    /// shipping one build per concrete microarchitecture name instead.
     #[test]
-    fn test_evaluate_archspec_literal_uses_dag_lineage() {
+    fn test_evaluate_archspec_literal_exact() {
         let v4_machine = [virtual_package("__archspec", "1", "x86_64_v4")];
-        assert!(matches_literal("__archspec", "* x86_64_v3").evaluate(&v4_machine));
-        assert!(matches_literal("__archspec", "* x86_64").evaluate(&v4_machine));
         assert!(matches_literal("__archspec", "* x86_64_v4").evaluate(&v4_machine));
-        // The lineage does not go downward.
-        let v2_machine = [virtual_package("__archspec", "1", "x86_64_v2")];
-        assert!(!matches_literal("__archspec", "* x86_64_v3").evaluate(&v2_machine));
-        // Different families never satisfy each other.
+        assert!(!matches_literal("__archspec", "* x86_64_v3").evaluate(&v4_machine));
+        assert!(!matches_literal("__archspec", "* x86_64").evaluate(&v4_machine));
         assert!(!matches_literal("__archspec", "* aarch64").evaluate(&v4_machine));
-        // Unknown names fall back to exact equality.
+        let skylake_machine = [virtual_package("__archspec", "1", "skylake_avx512")];
+        assert!(!matches_literal("__archspec", "* sapphirerapids").evaluate(&skylake_machine));
+        assert!(matches_literal("__archspec", "* skylake_avx512").evaluate(&skylake_machine));
+        // Names outside the archspec DAG are still just strings.
         let unknown_machine = [virtual_package("__archspec", "1", "mysterychip")];
         assert!(matches_literal("__archspec", "* mysterychip").evaluate(&unknown_machine));
         assert!(!matches_literal("__archspec", "* x86_64").evaluate(&unknown_machine));

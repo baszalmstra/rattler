@@ -86,13 +86,21 @@ pub struct SymbolicVirtualPackage {
 
 impl SymbolicVirtualPackage {
     /// The v1 set of symbolic virtual packages: `__cuda` (machines without
-    /// a GPU driver exist, so it is absentable), and `__glibc`, `__osx` and
-    /// `__win` (always present on their respective platforms, so not
-    /// absentable). It is the caller's responsibility to only model the
-    /// packages that make sense for the platform being solved.
+    /// a GPU driver exist, so it is absentable), and `__archspec`, `__glibc`,
+    /// `__osx` and `__win` (not absentable: CEP 30 requires `__archspec` to
+    /// always be present, and the platform packages always exist on their
+    /// respective platforms). It is the caller's responsibility to only
+    /// model the packages that make sense for the platform being solved.
+    ///
+    /// `__archspec` literals match the machine's single reported
+    /// microarchitecture name exactly (CEP 30 semantics, identical to
+    /// concrete candidate filtering), so conda-forge microarchitecture
+    /// variants (e.g. via `_x86_64-microarch-level`) split into one cell
+    /// per concrete microarchitecture name.
     pub fn default_v1_set() -> Vec<SymbolicVirtualPackage> {
         [
             ("__cuda", true),
+            ("__archspec", false),
             ("__glibc", false),
             ("__osx", false),
             ("__win", false),
@@ -1060,10 +1068,12 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
     ) -> VersionSetRelation {
         // Only called for version sets of environment packages, which are
         // always base names (symbolic virtual packages).
-        let package = match self.pool.resolve_package_name(self.version_set_name(a)) {
-            NameType::Base(name) => PackageName::new_unchecked(name.clone()),
-            NameType::Extra { .. } => return VersionSetRelation::Unknown,
-        };
+        if matches!(
+            self.pool.resolve_package_name(self.version_set_name(a)),
+            NameType::Extra { .. }
+        ) {
+            return VersionSetRelation::Unknown;
+        }
         let (SolverMatchSpec::MatchSpec(spec_a), SolverMatchSpec::MatchSpec(spec_b)) = (
             self.pool.resolve_version_set(a),
             self.pool.resolve_version_set(b),
@@ -1071,7 +1081,7 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
             // Extra markers (or future variants) are defensively unknown.
             return VersionSetRelation::Unknown;
         };
-        version_oracle::match_spec_relation(&package, spec_a, spec_b)
+        version_oracle::match_spec_relation(spec_a, spec_b)
     }
 
     fn should_cancel_with_value(&self) -> Option<Box<dyn std::any::Any>> {
