@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod conda_sorting;
+mod version_oracle;
 
 type MatchSpecParseCache = HashMap<String, (Vec<VersionSetId>, Option<ConditionId>)>;
 
@@ -339,7 +340,7 @@ impl<'a> CondaDependencyProvider<'a> {
 
         // Add virtual packages to the records
         for virtual_package in virtual_packages {
-            let name = pool.intern_package_name(NameType::from(&virtual_package.name));
+            let name = pool.intern_package_name(&virtual_package.name);
             let solvable =
                 pool.intern_solvable(name, SolverPackageRecord::VirtualPackage(virtual_package));
             records.entry(name).or_default().candidates.push(solvable);
