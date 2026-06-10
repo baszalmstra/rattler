@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod conda_sorting;
+mod version_oracle;
 
 type MatchSpecParseCache = HashMap<String, (Vec<VersionSetId>, Option<ConditionId>)>;
 
@@ -425,7 +426,8 @@ impl<'a> CondaDependencyProvider<'a> {
             }
 
             for record in ordered_repodata {
-                let package_name = pool.intern_package_name(NameType::from(&record.package_record.name));
+                let package_name =
+                    pool.intern_package_name(NameType::from(&record.package_record.name));
                 let solvable_id =
                     pool.intern_solvable(package_name, SolverPackageRecord::Record(record));
 
@@ -532,7 +534,8 @@ impl<'a> CondaDependencyProvider<'a> {
 
         // Add favored packages to the records
         for &favored_record in favored_records {
-            let name = pool.intern_package_name(NameType::from(&favored_record.package_record.name));
+            let name =
+                pool.intern_package_name(NameType::from(&favored_record.package_record.name));
             let solvable = pool.intern_solvable(name, SolverPackageRecord::Record(favored_record));
             let candidates = records.entry(name).or_default();
             candidates.candidates.push(solvable);
@@ -1018,7 +1021,9 @@ impl super::SolverImpl for Solver {
 
         // Construct the requirements that the solver needs to satisfy.
         let virtual_package_requirements = task.virtual_packages.iter().map(|spec| {
-            let name_id = provider.pool.intern_package_name(NameType::from(&spec.name));
+            let name_id = provider
+                .pool
+                .intern_package_name(NameType::from(&spec.name));
             provider
                 .pool
                 .intern_version_set(name_id, NamelessMatchSpec::default().into())
