@@ -199,7 +199,7 @@ fn test_universal_cuda_unsolvable_region() {
     };
     insta::assert_snapshot!(
         condition,
-        @"__cuda >=11 AND not (__cuda >=12.1)"
+        @"__cuda >=11,<12.1"
     );
     // The rendered error mentions the witness region, and the scoped
     // conflict explains the package that cannot be satisfied there.
@@ -207,7 +207,7 @@ fn test_universal_cuda_unsolvable_region() {
     // by the positive `__cuda >=11` literal.)
     let message = error.to_string();
     assert!(
-        message.contains("__cuda >=11 AND not (__cuda >=12.1)"),
+        message.contains("__cuda >=11,<12.1"),
         "message should mention the witness region: {message}"
     );
     assert!(
@@ -274,7 +274,7 @@ fn test_universal_glibc_vacuous_region_fails() {
     };
     insta::assert_snapshot!(
         condition,
-        @"__glibc >=2.17 AND not (__glibc >=2.17,<3.0.a0)"
+        @"__glibc >=3.0.a0"
     );
 }
 

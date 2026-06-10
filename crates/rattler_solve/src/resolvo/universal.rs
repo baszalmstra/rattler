@@ -16,20 +16,24 @@
 //! The result is converted eagerly into owned conda data types so that it
 //! outlives the solver and can later be serialized into a lockfile.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    ops::Bound,
+};
 
 use rattler_conda_types::{
     GenericVirtualPackage, MatchSpec, NamelessMatchSpec, PackageName, PackageNameMatcher,
-    RepoDataRecord, StringMatcher,
+    RepoDataRecord, StringMatcher, Version,
 };
 use resolvo::{
     ConditionalRequirement, EnvLiteral, EnvLiteralKind, NameId, SolvableId,
     Solver as ResolvoSolver, UniversalFailure, UniversalProblem, UniversalSolution, VersionSetId,
 };
+use version_ranges::Ranges;
 
 use super::{
     CondaDependencyProvider, DependencyOverride, NameType, RepoData, SolverMatchSpec,
-    SolverPackageRecord, SymbolicVirtualPackage,
+    SolverPackageRecord, SymbolicVirtualPackage, version_oracle::version_spec_to_ranges,
 };
 use crate::{
     CancellationToken, ChannelPriority, ExcludeNewer, IntoRepoData, SolveError, SolveStrategy,
@@ -145,23 +149,169 @@ pub type EnvironmentCondition = Vec<(EnvironmentLiteral, bool)>;
 /// Renders an [`EnvironmentCondition`] in a human readable way, e.g.
 /// `__cuda >=12.1 AND not (__glibc <2.17)`. The empty conjunction renders as
 /// `<all environments>`.
+///
+/// Multiple version-only literals on the same package are combined into a
+/// single contiguous range when that is exactly equivalent: for example
+/// `__cuda >=12.0 AND not (__cuda >=13)` renders as `__cuda >=12.0,<13`.
+/// The combined range replaces the package's literals at the position of
+/// its first literal. Whenever a package's literals are not exactly
+/// representable as one contiguous interval (a build matcher or other
+/// non-version field, an `Absent` literal, no positive literal, an
+/// unconvertible version spec, or a disjoint/empty result), they fall back
+/// to the plain per-literal rendering.
 pub fn display_condition(condition: &EnvironmentCondition) -> String {
-    use std::fmt::Write;
     if condition.is_empty() {
         return "<all environments>".to_string();
     }
-    let mut buf = String::new();
-    for (index, (literal, positive)) in condition.iter().enumerate() {
-        if index > 0 {
-            buf.push_str(" AND ");
-        }
-        if *positive {
-            write!(buf, "{literal}").unwrap();
+
+    let combined = combinable_ranges(condition);
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut emitted: Vec<&PackageName> = Vec::new();
+    for (literal, positive) in condition {
+        if let Some((_, range)) = combined
+            .iter()
+            .find(|(package, _)| **package == literal.package)
+        {
+            // The combined range renders once, at the group's first literal.
+            if !emitted.contains(&&literal.package) {
+                emitted.push(&literal.package);
+                parts.push(format!("{} {range}", literal.package.as_normalized()));
+            }
+        } else if *positive {
+            parts.push(literal.to_string());
         } else {
-            write!(buf, "not ({literal})").unwrap();
+            parts.push(format!("not ({literal})"));
         }
     }
-    buf
+    parts.join(" AND ")
+}
+
+/// Computes, per package with more than one literal in the condition, the
+/// single contiguous version range exactly equivalent to all the package's
+/// signed literals, for the packages where that is possible (see
+/// [`display_condition`]). Packages whose literals cannot be combined are
+/// not in the result.
+fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, String)> {
+    // Group the literals by package, preserving first-appearance order.
+    let mut groups: Vec<(&PackageName, Vec<(&EnvironmentLiteral, bool)>)> = Vec::new();
+    for (literal, positive) in condition {
+        match groups
+            .iter_mut()
+            .find(|(package, _)| **package == literal.package)
+        {
+            Some((_, group)) => group.push((literal, *positive)),
+            None => groups.push((&literal.package, vec![(literal, *positive)])),
+        }
+    }
+
+    let mut combined = Vec::new();
+    for (package, group) in groups {
+        // A single literal already renders as well as it can; a group
+        // without a positive literal has no range to subtract from.
+        if group.len() < 2 || !group.iter().any(|(_, positive)| *positive) {
+            continue;
+        }
+        let Some(ranges) = group_ranges(&group) else {
+            continue;
+        };
+        let Some(rendered) = render_single_interval(&ranges) else {
+            continue;
+        };
+        combined.push((package, rendered));
+    }
+    combined
+}
+
+/// The exact version range set of a group of signed literals on one
+/// package: the intersection of the positive literals' ranges minus the
+/// negative literals' ranges. `None` when any literal is not a version-only
+/// match or its version spec is not exactly representable as ranges.
+fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>> {
+    let mut result = Ranges::full();
+    for (literal, positive) in group {
+        let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
+            return None;
+        };
+        if !spec_is_version_only(spec) {
+            return None;
+        }
+        let ranges = version_spec_to_ranges(spec.version.as_ref()?)?;
+        if *positive {
+            result = result.intersection(&ranges);
+        } else {
+            result = result.intersection(&ranges.complement());
+        }
+    }
+    Some(result)
+}
+
+/// Whether the spec constrains the version and nothing else. Strict by
+/// destructuring: a field added to [`NamelessMatchSpec`] fails to compile
+/// here and must be classified explicitly.
+fn spec_is_version_only(spec: &NamelessMatchSpec) -> bool {
+    let NamelessMatchSpec {
+        version,
+        build,
+        build_number,
+        file_name,
+        extras,
+        flags,
+        channel,
+        subdir,
+        namespace,
+        md5,
+        sha256,
+        url,
+        license,
+        license_family,
+        condition,
+        track_features,
+    } = spec;
+    version.is_some()
+        && build.is_none()
+        && build_number.is_none()
+        && file_name.is_none()
+        && extras.is_none()
+        && flags.is_none()
+        && channel.is_none()
+        && subdir.is_none()
+        && namespace.is_none()
+        && md5.is_none()
+        && sha256.is_none()
+        && url.is_none()
+        && license.is_none()
+        && license_family.is_none()
+        && condition.is_none()
+        && track_features.is_none()
+}
+
+/// Renders a range set as a conda-style version range when it is a single
+/// non-empty contiguous interval, `None` otherwise: `>=x` / `>x` for the
+/// lower bound and `<y` / `<=y` for the upper bound, joined by a comma; the
+/// full set renders as `*`.
+fn render_single_interval(ranges: &Ranges<Version>) -> Option<String> {
+    let mut segments = ranges.iter();
+    let (low, high) = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    let low = match low {
+        Bound::Included(version) => Some(format!(">={version}")),
+        Bound::Excluded(version) => Some(format!(">{version}")),
+        Bound::Unbounded => None,
+    };
+    let high = match high {
+        Bound::Excluded(version) => Some(format!("<{version}")),
+        Bound::Included(version) => Some(format!("<={version}")),
+        Bound::Unbounded => None,
+    };
+    Some(match (low, high) {
+        (Some(low), Some(high)) => format!("{low},{high}"),
+        (Some(low), None) => low,
+        (None, Some(high)) => high,
+        (None, None) => "*".to_string(),
+    })
 }
 
 /// Describes a universal resolution task: the regular solver task inputs
@@ -682,6 +832,112 @@ mod tests {
         assert!(!absent.evaluate(&machine));
         assert!(absent.evaluate(&[]));
         assert!(!matches_literal("__cuda", ">=12.1").evaluate(&[]));
+    }
+
+    fn absent_literal(package: &str) -> EnvironmentLiteral {
+        EnvironmentLiteral {
+            package: PackageName::new_unchecked(package),
+            kind: EnvironmentLiteralKind::Absent,
+        }
+    }
+
+    /// Same-package version-only literals combine into one contiguous
+    /// range: a positive floor with a negated higher floor becomes a
+    /// half-open interval.
+    #[test]
+    fn test_display_condition_combines_cuda_range() {
+        let condition = vec![
+            (matches_literal("__cuda", ">=12.0"), true),
+            (matches_literal("__cuda", ">=13"), false),
+        ];
+        assert_eq!(display_condition(&condition), "__cuda >=12.0,<13");
+    }
+
+    /// Shared `<3.0.a0` style upper bounds cancel exactly: the combined
+    /// range only keeps the bounds that actually differ.
+    #[test]
+    fn test_display_condition_combines_glibc_range() {
+        let condition = vec![
+            (matches_literal("__glibc", ">=2.17,<3.0.a0"), true),
+            (matches_literal("__glibc", ">=2.28,<3.0.a0"), false),
+        ];
+        assert_eq!(display_condition(&condition), "__glibc >=2.17,<2.28");
+    }
+
+    /// A literal with a build matcher is not version-only and must keep the
+    /// plain per-literal rendering for its whole group.
+    #[test]
+    fn test_display_condition_build_matcher_falls_back() {
+        let condition = vec![
+            (matches_literal("__archspec", "1 x86_64_v3"), true),
+            (matches_literal("__archspec", "1 x86_64_v2"), false),
+        ];
+        assert_eq!(
+            display_condition(&condition),
+            "__archspec ==1 x86_64_v3 AND not (__archspec ==1 x86_64_v2)"
+        );
+    }
+
+    /// A group containing an `Absent` literal is untouched.
+    #[test]
+    fn test_display_condition_absent_group_untouched() {
+        let condition = vec![
+            (matches_literal("__cuda", ">=12.0"), true),
+            (absent_literal("__cuda"), false),
+        ];
+        assert_eq!(
+            display_condition(&condition),
+            "__cuda >=12.0 AND not (__cuda absent)"
+        );
+    }
+
+    /// A group without any positive literal is untouched.
+    #[test]
+    fn test_display_condition_negative_only_group_untouched() {
+        let condition = vec![
+            (matches_literal("__cuda", ">=13"), false),
+            (matches_literal("__cuda", "<11"), false),
+        ];
+        assert_eq!(
+            display_condition(&condition),
+            "not (__cuda >=13) AND not (__cuda <11)"
+        );
+    }
+
+    /// An empty combined range (contradictory literals) is untouched, and
+    /// unrelated packages render per literal exactly as before.
+    #[test]
+    fn test_display_condition_empty_or_split_results_fall_back() {
+        // Contradictory positives: the intersection is empty.
+        let condition = vec![
+            (matches_literal("__cuda", ">=13"), true),
+            (matches_literal("__cuda", "<12"), true),
+        ];
+        assert_eq!(display_condition(&condition), "__cuda >=13 AND __cuda <12");
+        // A negation punching a hole splits the range in two intervals.
+        let condition = vec![
+            (matches_literal("__cuda", ">=11"), true),
+            (matches_literal("__cuda", "==12"), false),
+        ];
+        assert_eq!(
+            display_condition(&condition),
+            "__cuda >=11 AND not (__cuda ==12)"
+        );
+    }
+
+    /// Combining is per package: a combinable group renders at the position
+    /// of its first literal while other packages keep their rendering.
+    #[test]
+    fn test_display_condition_mixed_packages() {
+        let condition = vec![
+            (matches_literal("__cuda", ">=12.0"), true),
+            (absent_literal("__osx"), true),
+            (matches_literal("__cuda", ">=13"), false),
+        ];
+        assert_eq!(
+            display_condition(&condition),
+            "__cuda >=12.0,<13 AND __osx absent"
+        );
     }
 
     /// `__archspec` literals evaluate with the archspec DAG semantics: a
