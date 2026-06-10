@@ -18,9 +18,9 @@ use rattler_conda_types::{
 };
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, KnownDependencies, NameId, PackageCandidates, Problem,
-    SolvableId, Solver as LibSolvRsSolver, SolverCache, StringId, UnsolvableOrCancelled,
-    VersionSetId, VersionSetUnionId,
+    EnvironmentPackage, HintDependenciesAvailable, Interner, KnownDependencies, NameId,
+    PackageCandidates, Problem, SolvableId, Solver as LibSolvRsSolver, SolverCache, StringId,
+    UnsolvableOrCancelled, VersionSetId, VersionSetRelation, VersionSetUnionId,
     utils::{Pool, VersionSet},
 };
 
@@ -53,6 +53,49 @@ fn exclude_newer_reason(
         }
         None if !config.include_unknown_timestamp() => Some("the package has no timestamp".into()),
         _ => None,
+    }
+}
+
+/// A virtual package that the solver treats *symbolically*: instead of
+/// injecting a concrete record describing one machine's capability, the
+/// package becomes an *environment package* whose value is unknown at solve
+/// time (a [`resolvo::PackageCandidates::Environment`] declaration).
+///
+/// Symbolic virtual packages are the input of the universal solve: version
+/// sets used against them become environment literals, and the result is a
+/// partition of the environment space instead of a solution for one
+/// machine. They are not injected as candidate records and not added as
+/// root requirements.
+#[derive(Clone, Debug)]
+pub struct SymbolicVirtualPackage {
+    /// The virtual package name (e.g. `__cuda`).
+    pub name: PackageName,
+
+    /// Whether the environment may lack this package entirely. Controls the
+    /// creation of the absent literal: only absentable packages can appear
+    /// as "absent" in cell conditions and environment models.
+    pub can_be_absent: bool,
+}
+
+impl SymbolicVirtualPackage {
+    /// The v1 set of symbolic virtual packages: `__cuda` (machines without
+    /// a GPU driver exist, so it is absentable), and `__glibc`, `__osx` and
+    /// `__win` (always present on their respective platforms, so not
+    /// absentable). It is the caller's responsibility to only model the
+    /// packages that make sense for the platform being solved.
+    pub fn default_v1_set() -> Vec<SymbolicVirtualPackage> {
+        [
+            ("__cuda", true),
+            ("__glibc", false),
+            ("__osx", false),
+            ("__win", false),
+        ]
+        .into_iter()
+        .map(|(name, can_be_absent)| SymbolicVirtualPackage {
+            name: PackageName::new_unchecked(name),
+            can_be_absent,
+        })
+        .collect()
     }
 }
 
@@ -317,6 +360,10 @@ pub struct CondaDependencyProvider<'a> {
     direct_dependencies: HashSet<NameId>,
 
     dependency_overrides: HashMap<PackageName, Vec<PreparedDependencyOverride>>,
+
+    /// Virtual packages treated symbolically (environment packages), keyed
+    /// by their interned name. See [`SymbolicVirtualPackage`].
+    symbolic_virtual_packages: HashMap<NameId, EnvironmentPackage>,
 }
 
 impl<'a> CondaDependencyProvider<'a> {
@@ -334,13 +381,40 @@ impl<'a> CondaDependencyProvider<'a> {
         exclude_newer: Option<&ExcludeNewer>,
         strategy: SolveStrategy,
         dependency_overrides: Vec<DependencyOverride>,
+        symbolic_virtual_packages: Vec<SymbolicVirtualPackage>,
     ) -> Result<Self, SolveError> {
         let pool = Pool::default();
         let mut records: HashMap<NameId, Candidates> = HashMap::default();
 
+        // Register the symbolic virtual packages: these become environment
+        // packages (no candidate records).
+        let symbolic_virtual_packages: HashMap<NameId, EnvironmentPackage> =
+            symbolic_virtual_packages
+                .into_iter()
+                .map(|symbolic| {
+                    let name = pool.intern_package_name(NameType::from(&symbolic.name));
+                    (
+                        name,
+                        EnvironmentPackage {
+                            can_be_absent: symbolic.can_be_absent,
+                        },
+                    )
+                })
+                .collect();
+
         // Add virtual packages to the records
         for virtual_package in virtual_packages {
-            let name = pool.intern_package_name(&virtual_package.name);
+            let name = pool.intern_package_name(NameType::from(&virtual_package.name));
+            if symbolic_virtual_packages.contains_key(&name) {
+                // A symbolic declaration wins: injecting a concrete record
+                // would contradict "the value is unknown at solve time".
+                tracing::warn!(
+                    "ignoring concrete virtual package '{}' because it is configured as a \
+                     symbolic virtual package",
+                    virtual_package.name.as_normalized(),
+                );
+                continue;
+            }
             let solvable =
                 pool.intern_solvable(name, SolverPackageRecord::VirtualPackage(virtual_package));
             records.entry(name).or_default().candidates.push(solvable);
@@ -592,6 +666,7 @@ impl<'a> CondaDependencyProvider<'a> {
             strategy,
             direct_dependencies,
             dependency_overrides: override_map,
+            symbolic_virtual_packages,
         })
     }
 
@@ -753,6 +828,11 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
     }
 
     async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
+        // Symbolic virtual packages are environment packages: their value is
+        // unknown at solve time and they have no candidate records.
+        if let Some(&environment_package) = self.symbolic_virtual_packages.get(&name) {
+            return Some(PackageCandidates::Environment(environment_package));
+        }
         match self.pool.resolve_package_name(name) {
             NameType::Base(_) => self.records.get(&name).cloned().map(Into::into),
             NameType::Extra { package, extra } => {
@@ -976,6 +1056,27 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
         }
     }
 
+    fn environment_version_set_relation(
+        &self,
+        a: VersionSetId,
+        b: VersionSetId,
+    ) -> VersionSetRelation {
+        // Only called for version sets of environment packages, which are
+        // always base names (symbolic virtual packages).
+        let package = match self.pool.resolve_package_name(self.version_set_name(a)) {
+            NameType::Base(name) => PackageName::new_unchecked(name.clone()),
+            NameType::Extra { .. } => return VersionSetRelation::Unknown,
+        };
+        let (SolverMatchSpec::MatchSpec(spec_a), SolverMatchSpec::MatchSpec(spec_b)) = (
+            self.pool.resolve_version_set(a),
+            self.pool.resolve_version_set(b),
+        ) else {
+            // Extra markers (or future variants) are defensively unknown.
+            return VersionSetRelation::Unknown;
+        };
+        version_oracle::match_spec_relation(&package, spec_a, spec_b)
+    }
+
     fn should_cancel_with_value(&self) -> Option<Box<dyn std::any::Any>> {
         if let Some(token) = &self.cancellation_token
             && token.is_cancelled()
@@ -1033,6 +1134,7 @@ impl super::SolverImpl for Solver {
             task.exclude_newer.as_ref(),
             task.strategy,
             dependency_overrides,
+            Vec::new(),
         )?;
 
         // Construct the requirements that the solver needs to satisfy.
@@ -1271,5 +1373,151 @@ fn parse_condition(
             );
             pool.intern_condition(condition)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+    use rattler_conda_types::ParseStrictness;
+    use resolvo::VersionSetRelation;
+
+    use super::*;
+
+    /// Builds a provider over an empty repodata with one concrete virtual
+    /// package (`__unix`) and the given symbolic virtual packages.
+    fn provider_with_symbolic<'a>(
+        concrete: &'a [GenericVirtualPackage],
+        symbolic: &[SymbolicVirtualPackage],
+    ) -> CondaDependencyProvider<'a> {
+        CondaDependencyProvider::new(
+            std::iter::empty::<RepoData<'_>>(),
+            &[],
+            &[],
+            concrete,
+            &[],
+            None,
+            None,
+            ChannelPriority::default(),
+            None,
+            SolveStrategy::default(),
+            Vec::new(),
+            symbolic.to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn get_candidates(
+        provider: &CondaDependencyProvider<'_>,
+        name: &str,
+    ) -> Option<PackageCandidates> {
+        let name_id = provider
+            .pool
+            .intern_package_name(NameType::Base(name.to_owned()));
+        DependencyProvider::get_candidates(provider, name_id)
+            .now_or_never()
+            .expect("get_candidates is synchronous for this provider")
+    }
+
+    /// Symbolic virtual packages are declared as environment packages; they
+    /// are not backed by candidate records.
+    #[test]
+    fn test_symbolic_virtual_packages_are_environment_packages() {
+        let concrete = [GenericVirtualPackage {
+            name: PackageName::new_unchecked("__unix"),
+            version: "0".parse().unwrap(),
+            build_string: "0".to_string(),
+        }];
+        let symbolic = SymbolicVirtualPackage::default_v1_set();
+        let provider = provider_with_symbolic(&concrete, &symbolic);
+
+        // The concrete virtual package keeps its candidate record.
+        assert!(matches!(
+            get_candidates(&provider, "__unix"),
+            Some(PackageCandidates::Candidates(_))
+        ));
+
+        // __cuda can be absent (machines without a GPU exist); the others
+        // are always present on their platform.
+        for (name, can_be_absent) in [
+            ("__cuda", true),
+            ("__glibc", false),
+            ("__osx", false),
+            ("__win", false),
+        ] {
+            match get_candidates(&provider, name) {
+                Some(PackageCandidates::Environment(env)) => assert_eq!(
+                    env.can_be_absent, can_be_absent,
+                    "unexpected can_be_absent for {name}",
+                ),
+                other => panic!("expected {name} to be an environment package, got {other:?}"),
+            }
+        }
+
+        // Unknown packages stay unknown.
+        assert!(get_candidates(&provider, "__madeup").is_none());
+    }
+
+    /// The relation oracle is reachable through the resolvo trait method and
+    /// resolves version sets back to their match spec parts.
+    #[test]
+    fn test_environment_version_set_relation_delegates_to_oracle() {
+        let symbolic = SymbolicVirtualPackage::default_v1_set();
+        let provider = provider_with_symbolic(&[], &symbolic);
+
+        let cuda = provider
+            .pool
+            .intern_package_name(NameType::Base("__cuda".to_owned()));
+        let intern = |spec: &str| {
+            let spec = NamelessMatchSpec::from_str(spec, ParseStrictness::Lenient).unwrap();
+            provider.pool.intern_version_set(cuda, spec.into())
+        };
+
+        let ge_12_1 = intern(">=12.1");
+        let ge_11 = intern(">=11");
+        let lt_11 = intern("<11");
+        assert_eq!(
+            provider.environment_version_set_relation(ge_12_1, ge_11),
+            VersionSetRelation::Subset
+        );
+        assert_eq!(
+            provider.environment_version_set_relation(ge_11, ge_12_1),
+            VersionSetRelation::Superset
+        );
+        assert_eq!(
+            provider.environment_version_set_relation(ge_12_1, lt_11),
+            VersionSetRelation::Disjoint
+        );
+        assert_eq!(
+            provider.environment_version_set_relation(ge_11, ge_11),
+            VersionSetRelation::Equal
+        );
+
+        // A version set that is not a match spec (the extra marker) is
+        // defensively unknown.
+        let extra = provider
+            .pool
+            .intern_version_set(cuda, SolverMatchSpec::Extra);
+        assert_eq!(
+            provider.environment_version_set_relation(ge_11, extra),
+            VersionSetRelation::Unknown
+        );
+    }
+
+    /// A virtual package configured symbolically wins over a concrete
+    /// record for the same name: the concrete injection is skipped.
+    #[test]
+    fn test_symbolic_overrides_concrete_virtual_package() {
+        let concrete = [GenericVirtualPackage {
+            name: PackageName::new_unchecked("__cuda"),
+            version: "12.4".parse().unwrap(),
+            build_string: "0".to_string(),
+        }];
+        let symbolic = SymbolicVirtualPackage::default_v1_set();
+        let provider = provider_with_symbolic(&concrete, &symbolic);
+        assert!(matches!(
+            get_candidates(&provider, "__cuda"),
+            Some(PackageCandidates::Environment(_))
+        ));
     }
 }
