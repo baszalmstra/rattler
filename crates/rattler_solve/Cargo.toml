@@ -12,7 +12,6 @@ license.workspace = true
 readme.workspace = true
 
 [dependencies]
-archspec = { workspace = true, optional = true }
 rattler_conda_types = { workspace = true, default-features = false }
 rattler_digest = { workspace = true, default-features = false }
 hex = { workspace = true }
@@ -46,7 +45,7 @@ tools = { path = "../tools" }
 default = ["resolvo"]
 libsolv_c = ["dep:rattler_libsolv_c", "dep:libc"]
 resolvo_diagnostics = ["resolvo?/diagnostics"]
-resolvo = ["dep:resolvo", "dep:futures", "dep:version-ranges", "dep:archspec"]
+resolvo = ["dep:resolvo", "dep:futures", "dep:version-ranges"]
 
 [[bench]]
 name = "bench"
