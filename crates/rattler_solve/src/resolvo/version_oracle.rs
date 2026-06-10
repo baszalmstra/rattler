@@ -132,7 +132,95 @@ fn version_part_relation(a: Option<&VersionSpec>, b: Option<&VersionSpec>) -> Ve
         // At least one part is not representable as ranges; syntactically
         // identical specs still describe the same set.
         _ if a == b => VersionSetRelation::Equal,
-        _ => VersionSetRelation::Unknown,
+        // Disjointness needs no exact sets: disjoint SUPERSETS of the two
+        // matching sets prove the sets themselves disjoint. This covers
+        // literals like `11.0.*` (no exact interval form) next to `>=12.0`.
+        _ => {
+            let a_envelope = match a {
+                None => Some(Ranges::full()),
+                Some(spec) => version_spec_to_ranges_envelope(spec),
+            };
+            let b_envelope = match b {
+                None => Some(Ranges::full()),
+                Some(spec) => version_spec_to_ranges_envelope(spec),
+            };
+            match (a_envelope, b_envelope) {
+                (Some(a), Some(b)) if a.is_disjoint(&b) => VersionSetRelation::Disjoint,
+                _ => VersionSetRelation::Unknown,
+            }
+        }
+    }
+}
+
+/// Converts a [`VersionSpec`] into a SUPERSET of its matching set: every
+/// matching version is contained in the returned ranges, which may also
+/// contain non-matching versions. Returns `None` when no useful envelope
+/// exists.
+///
+/// The envelope is only sound for proving DISJOINTNESS (disjoint supersets
+/// imply disjoint sets); it must never feed subset or equality answers.
+/// Where the exact conversion succeeds the envelope is the exact set;
+/// otherwise:
+///
+/// - `prefix.*` (starts-with): every matching version sorts strictly below
+///   the dev floor of the bumped prefix (the upper-bound argument of
+///   [`starts_with_ranges`] does not depend on the prefix shape rules,
+///   which exist for the sake of the lower bound and `Ord`-closure), so
+///   the envelope is everything below `{bump(prefix)}dev`. Leaving the
+///   lower side unbounded also swallows the prefix-extension dev corner.
+/// - `~=limit` (compatible): `v >= limit` is part of the operator's exact
+///   semantics, and the same bumped-prefix upper bound applies when it is
+///   constructible.
+/// - negated starts-with and compatible: no envelope (that would require an
+///   under-approximation to complement).
+/// - `and` groups: intersection, skipping branches without an envelope
+///   (dropping a conjunct only enlarges the set).
+/// - `or` groups: union; no envelope if any branch lacks one.
+fn version_spec_to_ranges_envelope(spec: &VersionSpec) -> Option<Ranges<Version>> {
+    if let Some(exact) = version_spec_to_ranges(spec) {
+        return Some(exact);
+    }
+    Some(match spec {
+        VersionSpec::StrictRange(StrictRangeOperator::StartsWith, prefix) => {
+            Ranges::strictly_lower_than(dev_floor(&prefix.0.bump(VersionBumpType::Last).ok()?)?)
+        }
+        VersionSpec::StrictRange(StrictRangeOperator::Compatible, limit) => {
+            let lower = Ranges::higher_than(limit.0.clone());
+            match compatible_upper_bound(&limit.0) {
+                Some(high) => lower.intersection(&Ranges::strictly_lower_than(high)),
+                None => lower,
+            }
+        }
+        VersionSpec::Group(LogicalOperator::And, group) => {
+            let mut result = Ranges::full();
+            for sub in group {
+                if let Some(envelope) = version_spec_to_ranges_envelope(sub) {
+                    result = result.intersection(&envelope);
+                }
+            }
+            result
+        }
+        VersionSpec::Group(LogicalOperator::Or, group) => {
+            let mut result = Ranges::empty();
+            for sub in group {
+                result = result.union(&version_spec_to_ranges_envelope(sub)?);
+            }
+            result
+        }
+        _ => return None,
+    })
+}
+
+/// The upper bound of the [`version_spec_to_ranges_envelope`] for the
+/// compatible operator: the dev floor of the bumped all-but-last-segment
+/// prefix (next epoch for single-segment limits), without the prefix shape
+/// requirements of the exact conversion (which only matter for exactness,
+/// not for an upper bound).
+fn compatible_upper_bound(limit: &Version) -> Option<Version> {
+    if limit.segment_count() == 1 {
+        Version::from_str(&format!("{}!0dev", limit.epoch() + 1)).ok()
+    } else {
+        dev_floor(&limit.pop_segments(1)?.bump(VersionBumpType::Last).ok()?)
     }
 }
 
@@ -447,6 +535,47 @@ mod tests {
         assert_eq!(
             relation("__cuda", (Some("11.0.*"), None), (Some(">=11"), None)),
             Unknown
+        );
+    }
+
+    /// Version parts that are not exactly representable as ranges can still
+    /// prove DISJOINTNESS through a superset envelope: `==11.0|11.0.*` (the
+    /// lenient parse of `11.0.*`) has no exact interval form (trailing-zero
+    /// starts-with prefix), but every matching version sorts below `11.1`,
+    /// which is disjoint from `>=12.0`. Overlapping envelopes must NOT
+    /// produce definite answers.
+    #[test]
+    fn test_relation_superset_disjointness() {
+        use VersionSetRelation::*;
+        // The motivating case: a witness condition carried the literal
+        // `not (__cuda ==11.0|11.0.*)` next to `__cuda >=12.0` because the
+        // oracle answered Unknown for the pair.
+        assert_eq!(
+            relation("__cuda", (Some(">=12.0"), None), (Some("11.0.*"), None)),
+            Disjoint
+        );
+        assert_eq!(
+            relation("__cuda", (Some("11.0.*"), None), (Some(">=12.0"), None)),
+            Disjoint
+        );
+        // Compatible operator: every `~=11.0` version sorts below 12.
+        assert_eq!(
+            relation("__cuda", (Some("~=11.0"), None), (Some(">=12"), None)),
+            Disjoint
+        );
+        // Overlapping envelopes stay indefinite: `11.0.*` overlaps `>=11`.
+        assert_eq!(
+            relation("__cuda", (Some(">=11"), None), (Some("11.0.*"), None)),
+            Unknown
+        );
+        // An OR group with an unrepresentable branch still envelopes.
+        assert_eq!(
+            relation(
+                "__cuda",
+                (Some("11.0.*|10.2.*"), None),
+                (Some(">=12.0"), None)
+            ),
+            Disjoint
         );
     }
 

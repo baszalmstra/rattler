@@ -465,6 +465,58 @@ fn test_universal_sorting_tie_break_on_environment_dependency() {
     );
 }
 
+/// Scenario (h): an unsolvable witness region renders as a single combined
+/// range even when an unrelated old-cuda literal is in play. `gpu-app 3.0`
+/// requires `__cuda >=12.2` and `gpu-app 2.0` requires `__cuda 11.0.*`
+/// (whose lenient parse `==11.0|11.0.*` has no exact interval form); the
+/// model only covers cuda >=12.0, so the region [12.0, 12.2) is unsolvable.
+/// The witness must NOT read like `__cuda >=12.0 AND not (__cuda
+/// ==11.0|11.0.*) AND not (__cuda >=12.2)`: the superset envelope proves
+/// `11.0.*` disjoint from `>=12.0` so the literal is dropped, and the
+/// remaining pair combines into one range.
+#[test]
+fn test_universal_unsolvable_witness_combines_to_single_range() {
+    let repodata_json = r#"{
+        "info": { "subdir": "linux-64" },
+        "packages": {
+            "gpu-app-3.0-cuda122_0.tar.bz2": {
+                "build": "cuda122_0",
+                "build_number": 0,
+                "depends": ["__cuda >=12.2"],
+                "license": "MIT",
+                "name": "gpu-app",
+                "size": 0,
+                "subdir": "linux-64",
+                "timestamp": 1716314536803,
+                "version": "3.0"
+            },
+            "gpu-app-2.0-cuda110_0.tar.bz2": {
+                "build": "cuda110_0",
+                "build_number": 0,
+                "depends": ["__cuda 11.0.*"],
+                "license": "MIT",
+                "name": "gpu-app",
+                "size": 0,
+                "subdir": "linux-64",
+                "timestamp": 1716314536804,
+                "version": "2.0"
+            }
+        },
+        "packages.conda": {}
+    }"#;
+    let repo_data: RepoData = serde_json::from_str(repodata_json).unwrap();
+    let records = repo_data
+        .into_repo_data_records(&Channel::from_str("conda-forge", &channel_config()).unwrap());
+
+    let error =
+        solve_universal(task(&records, &["gpu-app"], model(&[&["__cuda >=12.0"]]))).unwrap_err();
+
+    let UniversalSolveError::Unsolvable { condition, .. } = &error else {
+        panic!("expected an unsolvable region, got {error}");
+    };
+    insta::assert_snapshot!(condition, @"__cuda >=12.0,<12.2");
+}
+
 /// Scenario (g): an archspec split. `gpu-tool` style packages on
 /// conda-forge ship microarchitecture variants via `__archspec` (usually
 /// transitively through `_x86_64-microarch-level`); the v1 symbolic set
