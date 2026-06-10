@@ -18,9 +18,9 @@ use rattler_conda_types::{
 };
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem, SolvableId,
-    Solver as LibSolvRsSolver, SolverCache, StringId, UnsolvableOrCancelled, VersionSetId,
-    VersionSetUnionId,
+    HintDependenciesAvailable, Interner, KnownDependencies, NameId, PackageCandidates, Problem,
+    SolvableId, Solver as LibSolvRsSolver, SolverCache, StringId, UnsolvableOrCancelled,
+    VersionSetId, VersionSetUnionId,
     utils::{Pool, VersionSet},
 };
 
@@ -751,9 +751,9 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
             .sort(solvables, &mut highest_version_spec);
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
         match self.pool.resolve_package_name(name) {
-            NameType::Base(_) => self.records.get(&name).cloned(),
+            NameType::Base(_) => self.records.get(&name).cloned().map(Into::into),
             NameType::Extra { package, extra } => {
                 // For extras, we need to create a new candidates object
                 // that contains only the extra solvable.
@@ -762,13 +762,16 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
                     PackageName::new_unchecked(package),
                     extra.clone(),
                 );
-                Some(Candidates {
-                    candidates: vec![extra_solvable],
-                    favored: None,
-                    locked: None,
-                    excluded: Vec::new(),
-                    hint_dependencies_available: HintDependenciesAvailable::All,
-                })
+                Some(
+                    Candidates {
+                        candidates: vec![extra_solvable],
+                        favored: None,
+                        locked: None,
+                        excluded: Vec::new(),
+                        hint_dependencies_available: HintDependenciesAvailable::All,
+                    }
+                    .into(),
+                )
             }
         }
     }
