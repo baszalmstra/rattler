@@ -174,6 +174,16 @@ pub struct UniversalSolverTask<TAvailablePackagesIterator> {
     /// Virtual packages that stay *concrete* (injected as records describing
     /// every modeled machine, e.g. `__unix`). Must be disjoint from the
     /// symbolic set.
+    ///
+    /// Every entry must hold on EVERY machine in the modeled space: derive
+    /// this set from the *target* platform (`__unix` and `__linux` for a
+    /// linux solve), never from host detection. A host-detected set
+    /// describes one machine, and for a cross-platform solve the wrong
+    /// operating system entirely; a missing always-true package such as
+    /// `__unix` silently excludes every build that depends on it, which
+    /// both degrades the solution (packages fall back to old builds without
+    /// the dependency) and blows up solve time (the search becomes
+    /// near-unsatisfiable).
     pub virtual_packages: Vec<GenericVirtualPackage>,
 
     /// The specs to solve for.
