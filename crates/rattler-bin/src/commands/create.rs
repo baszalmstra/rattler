@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     path::PathBuf,
     str::FromStr,
@@ -285,12 +285,18 @@ pub async fn create(opt: Opt) -> miette::Result<()> {
         }
     })?;
 
-    println!(
-        "Virtual packages:\n{}\n",
-        virtual_packages
-            .iter()
-            .format_with("\n", |i, f| f(&format_args!("  - {i}",)))
-    );
+    // In universal mode the host-detected virtual packages are not what the
+    // solve uses (it prints its own symbolic/concrete summary and the
+    // projection section reports the detected machine packages), so printing
+    // them here would only be confusing.
+    if !opt.universal {
+        println!(
+            "Virtual packages:\n{}\n",
+            virtual_packages
+                .iter()
+                .format_with("\n", |i, f| f(&format_args!("  - {i}",)))
+        );
+    }
 
     if opt.universal {
         return run_universal_solve(
@@ -328,11 +334,13 @@ pub async fn create(opt: Opt) -> miette::Result<()> {
     // Next, use a solver to solve this specific problem. This provides us with all
     // the operations we need to apply to our environment to bring it up to
     // date.
+    let solve_start = Instant::now();
     let solver_result = wrap_in_progress("solving", move || match opt.solver.unwrap_or_default() {
         Solver::Resolvo => resolvo::Solver.solve(solver_task),
         Solver::LibSolv => libsolv_c::Solver.solve(solver_task),
     })
     .into_diagnostic()?;
+    println!("Solved in {:?}", solve_start.elapsed());
 
     let mut required_packages: Vec<RepoDataRecord> = solver_result.records;
 
@@ -615,7 +623,10 @@ fn run_universal_solve(
         console::style("*").cyan().bold()
     );
 
-    let solution = match wrap_in_progress("solving (universal)", move || solve_universal(task)) {
+    let solve_start = Instant::now();
+    let solve_result = wrap_in_progress("solving (universal)", move || solve_universal(task));
+    let solve_elapsed = solve_start.elapsed();
+    let solution = match solve_result {
         Ok(sol) => sol,
         Err(UniversalSolveError::Unsolvable {
             condition,
@@ -647,6 +658,7 @@ fn run_universal_solve(
             return Err(miette::miette!("universal solve setup error: {e}"));
         }
     };
+    println!("Solved in {solve_elapsed:?}");
 
     // Print verification status.
     match solution.verify() {
@@ -719,24 +731,53 @@ fn run_universal_solve(
             console::style("ok").green().bold()
         );
     } else {
+        // Group the diverging records by package name so the variants of a
+        // single package are listed together. BTreeMap keeps the package
+        // names alphabetically sorted; within a group the records keep the
+        // (deterministic) order of `solution.merged`.
+        let mut by_name: BTreeMap<&str, Vec<(&RepoDataRecord, &Vec<EnvironmentCondition>)>> =
+            BTreeMap::new();
+        for (record, presence) in &diverging {
+            by_name
+                .entry(record.package_record.name.as_normalized())
+                .or_default()
+                .push((record, presence));
+        }
         println!(
             "{} Diverging packages ({} total):\n",
             console::style("divergence:").yellow().bold(),
-            diverging.len()
+            by_name.len()
         );
-        for (record, presence) in &diverging {
-            let presence_str = presence
+        for (name, records) in &by_name {
+            println!("  {} {}", console::style("~").yellow(), name);
+            // Align the "when:" column within the group for readability.
+            let width = records
                 .iter()
-                .map(|c| format!("({})", display_condition(c)))
-                .join(" OR ");
-            println!(
-                "  {} {}={}={} present when: {}",
-                console::style("~").yellow(),
-                record.package_record.name.as_normalized(),
-                record.package_record.version,
-                record.package_record.build,
-                console::style(&presence_str).dim(),
-            );
+                .map(|(record, _)| {
+                    record.package_record.version.to_string().len()
+                        + 1
+                        + record.package_record.build.len()
+                })
+                .max()
+                .unwrap_or(0);
+            for (record, presence) in records {
+                let presence_str = if presence.len() == 1 {
+                    display_condition(&presence[0])
+                } else {
+                    presence
+                        .iter()
+                        .map(|c| format!("({})", display_condition(c)))
+                        .join(" OR ")
+                };
+                let variant = format!(
+                    "{} {}",
+                    record.package_record.version, record.package_record.build
+                );
+                println!(
+                    "      {variant:<width$}  when: {}",
+                    console::style(&presence_str).dim(),
+                );
+            }
         }
         println!();
     }
