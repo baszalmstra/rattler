@@ -434,9 +434,10 @@ where
     let solution = match solver.solve_universal(problem) {
         Ok(solution) => solution,
         Err(UniversalFailure::Unsolvable { cell, conflict }) => {
+            let condition_literals = convert_condition(solver.provider(), &cell);
             return Err(UniversalSolveError::Unsolvable {
-                condition_literals: convert_condition(solver.provider(), &cell),
-                condition: cell.display(solver.provider()).to_string(),
+                condition: display_condition(&condition_literals),
+                condition_literals,
                 conflict: conflict.display_user_friendly(&solver).to_string(),
             });
         }
