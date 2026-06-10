@@ -25,7 +25,7 @@ use rattler_solve::{
     resolvo::{
         self, EnvironmentCondition, EnvironmentLiteral, EnvironmentLiteralKind,
         SymbolicVirtualPackage, UniversalSolveError, UniversalSolverTask, display_condition,
-        solve_universal,
+        display_presence, solve_universal,
     },
 };
 
@@ -769,14 +769,7 @@ fn run_universal_solve(
                 .max()
                 .unwrap_or(0);
             for (record, presence) in records {
-                let presence_str = if presence.len() == 1 {
-                    display_condition(&presence[0])
-                } else {
-                    presence
-                        .iter()
-                        .map(|c| format!("({})", display_condition(c)))
-                        .join(" OR ")
-                };
+                let presence_str = display_presence(presence);
                 let variant = format!(
                     "{} {}",
                     record.package_record.version, record.package_record.build
