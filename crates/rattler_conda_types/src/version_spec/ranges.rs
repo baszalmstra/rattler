@@ -180,6 +180,86 @@ impl VersionSpec {
             }
         })
     }
+
+    /// Converts this spec into a SUPERSET of its matching set: every
+    /// matching version is contained in the returned ranges, which may also
+    /// contain non-matching versions. Returns `None` when no useful envelope
+    /// exists.
+    ///
+    /// The envelope is only sound for proving DISJOINTNESS (disjoint
+    /// supersets imply disjoint sets); it must never feed subset or equality
+    /// reasoning. Where [`VersionSpec::to_ranges`] succeeds the envelope is
+    /// the exact set; otherwise:
+    ///
+    /// - `prefix.*` (starts-with): every matching version sorts strictly
+    ///   below the `dev` floor of the prefix bumped at its deepest non-zero
+    ///   pure-numeral segment (trailing zero and non-numeral segments are
+    ///   dropped first), or below the next epoch when no segment qualifies.
+    ///   Identifier segments cannot be bumped (`Version::bump` rewrites
+    ///   identifiers to `a`, so `10.rc2` bumps to `10.a3`, which sorts
+    ///   BELOW `10.rc2`) and trailing zero segments are skippable in the
+    ///   matching semantics (`1post` matches `1.0.*` yet sorts above
+    ///   `1.1dev`); the envelope superset property test found both corners.
+    ///   Leaving the lower side unbounded also swallows the
+    ///   prefix-extension dev corner.
+    /// - `~=limit` (compatible): `v >= limit` is part of the operator's
+    ///   exact semantics, and the same bumped-prefix upper bound applies
+    ///   when it is constructible.
+    /// - negated starts-with and compatible: no envelope (that would require
+    ///   an under-approximation to complement).
+    /// - `and` groups: intersection, skipping branches without an envelope
+    ///   (dropping a conjunct only enlarges the set).
+    /// - `or` groups: union; no envelope if any branch lacks one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rattler_conda_types::{ParseStrictness, VersionSpec};
+    ///
+    /// // `11.0.*` has no exact interval form (trailing zero prefix), but
+    /// // every version it matches sorts below `11.1dev`, so its envelope
+    /// // proves it disjoint from `>=12`.
+    /// let envelope = VersionSpec::from_str("11.0.*", ParseStrictness::Strict)?
+    ///     .to_ranges_envelope()
+    ///     .unwrap();
+    /// let other = VersionSpec::from_str(">=12", ParseStrictness::Strict)?.to_ranges()?;
+    /// assert!(envelope.is_disjoint(&other));
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn to_ranges_envelope(&self) -> Option<Ranges<Version>> {
+        if let Ok(exact) = self.to_ranges() {
+            return Some(exact);
+        }
+        Some(match self {
+            VersionSpec::StrictRange(StrictRangeOperator::StartsWith, prefix) => {
+                Ranges::strictly_lower_than(starts_with_envelope_bound(&prefix.0)?)
+            }
+            VersionSpec::StrictRange(StrictRangeOperator::Compatible, limit) => {
+                let lower = Ranges::higher_than(limit.0.clone());
+                match compatible_upper_bound(&limit.0) {
+                    Some(high) => lower.intersection(&Ranges::strictly_lower_than(high)),
+                    None => lower,
+                }
+            }
+            VersionSpec::Group(LogicalOperator::And, group) => {
+                let mut result = Ranges::full();
+                for sub in group {
+                    if let Some(envelope) = sub.to_ranges_envelope() {
+                        result = result.intersection(&envelope);
+                    }
+                }
+                result
+            }
+            VersionSpec::Group(LogicalOperator::Or, group) => {
+                let mut result = Ranges::empty();
+                for sub in group {
+                    result = result.union(&sub.to_ranges_envelope()?);
+                }
+                result
+            }
+            _ => return None,
+        })
+    }
 }
 
 /// Converts the `StartsWith` operator (`prefix.*`) into ranges.
@@ -286,6 +366,71 @@ fn compatible_ranges(limit: &Version) -> Result<Ranges<Version>, VersionSpecRang
             .expect("a bumped representable prefix ends in a numeral, so its dev floor is valid")
     };
     Ok(Ranges::higher_than(limit.clone()).intersection(&Ranges::strictly_lower_than(high)))
+}
+
+/// The upper bound of the envelope for the compatible operator (see
+/// [`VersionSpec::to_ranges_envelope`]): the starts-with envelope bound of
+/// the all-but-last-segment prefix, or the next epoch's dev floor for
+/// single-segment limits.
+fn compatible_upper_bound(limit: &Version) -> Option<Version> {
+    if limit.segment_count() == 1 {
+        Some(next_epoch_floor(limit))
+    } else {
+        starts_with_envelope_bound(&limit.pop_segments(1)?)
+    }
+}
+
+/// The upper bound of the envelope for the starts-with operator (see
+/// [`VersionSpec::to_ranges_envelope`]): the dev floor of the prefix bumped
+/// at its deepest non-zero pure-numeral segment, after dropping every
+/// trailing segment that does not qualify; the dev floor of the next epoch
+/// when no segment qualifies.
+///
+/// Two trailing shapes cannot be bumped where they stand, and both were
+/// found by the envelope superset property test:
+///
+/// - identifier-bearing segments: [`Version::bump`] rewrites identifier
+///   components to `a`, which can produce a SMALLER version (`10.rc2` bumps
+///   to `10.a3`, and `a` sorts below `rc`), so a bound built from it would
+///   cut matching versions out of the envelope.
+/// - zero segments (unless the prefix is a single segment): the matching
+///   semantics skip trailing zero prefix segments, which allows extra
+///   components one level up (`1post` matches `1.0.*`), and those sort
+///   above the zero segment's bumped dev floor (`1post > 1.1dev`).
+///
+/// Dropping trailing segments is sound because a version matching the
+/// original prefix agrees componentwise with every shorter prefix up to the
+/// shorter prefix's last segment, where it can only EXTEND the segment's
+/// numeral, so it still sorts strictly below that numeral's bumped dev
+/// floor. The epoch fallback is sound because matching versions share the
+/// prefix's epoch.
+fn starts_with_envelope_bound(prefix: &Version) -> Option<Version> {
+    let mut prefix = prefix.strip_local().into_owned();
+    loop {
+        // Note `segments().last()` rather than `next_back()`: the
+        // iterator returned by `Version::segments` computes component
+        // offsets in a stateful forward pass, so consuming it from the back
+        // yields segments with wrong offsets.
+        let last_segment = prefix
+            .segments()
+            .last()
+            .expect("a version has at least one segment");
+        let mut components = last_segment.components();
+        let pure_numeral =
+            matches!(components.next(), Some(Component::Numeral(_))) && components.next().is_none();
+        let bumpable = pure_numeral && (!last_segment.is_zero() || prefix.segment_count() == 1);
+        drop(components);
+        if bumpable {
+            let bumped = prefix
+                .bump(VersionBumpType::Last)
+                .expect("bumping a pure-numeral segment cannot fail");
+            return dev_floor(&bumped);
+        }
+        match prefix.pop_segments(1) {
+            Some(shorter) => prefix = shorter,
+            None => return Some(next_epoch_floor(&prefix)),
+        }
+    }
 }
 
 /// Checks that a `starts_with` prefix has the supported shape described in
@@ -613,6 +758,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_envelope_disjointness() {
+        // Where the exact conversion succeeds, the envelope is the exact
+        // set.
+        assert_eq!(
+            spec(">=1.2,<2").to_ranges_envelope().unwrap(),
+            spec(">=1.2,<2").to_ranges().unwrap()
+        );
+        // `11.0.*` has no exact interval form (trailing-zero prefix), but
+        // every matching version sorts below `11.1dev`, which is disjoint
+        // from `>=12.0`.
+        let envelope = spec("11.0.*").to_ranges_envelope().unwrap();
+        assert!(envelope.is_disjoint(&spec(">=12.0").to_ranges().unwrap()));
+        // Overlapping envelopes prove nothing: `>=11` overlaps it.
+        assert!(!envelope.is_disjoint(&spec(">=11").to_ranges().unwrap()));
+        // An OR group with an unrepresentable branch still envelopes.
+        let group = spec("11.0.*|10.2.*").to_ranges_envelope().unwrap();
+        assert!(group.is_disjoint(&spec(">=12.0").to_ranges().unwrap()));
+        // Compatible keeps its exact lower bound and the bumped-prefix upper
+        // bound even when the exact conversion refuses.
+        let compat = spec("~=1.0.3").to_ranges_envelope().unwrap();
+        assert!(compat.is_disjoint(&spec(">=2").to_ranges().unwrap()));
+        assert!(compat.is_disjoint(&spec("<1.0.3").to_ranges().unwrap()));
+        // `Version::bump` rewrites identifiers to `a`, so bumping `10.rc2`
+        // yields `10.a3`, which sorts BELOW the prefix. The envelope bound
+        // must therefore come from the deepest pure-numeral segment (`10`,
+        // giving `11dev`) for the superset property to hold.
+        let ident = VersionSpec::StrictRange(
+            StrictRangeOperator::StartsWith,
+            StrictVersion(version("10.rc2")),
+        );
+        assert!(version("10.a3") < version("10.rc2"));
+        let envelope = ident.to_ranges_envelope().unwrap();
+        assert!(envelope.contains(&version("10.rc2")));
+        assert!(envelope.contains(&version("10.rc2.5")));
+        assert!(envelope.is_disjoint(&spec(">=11").to_ranges().unwrap()));
+        // Trailing zero prefix segments are skippable in the matching
+        // semantics, so `1post` matches `1.0.*` yet sorts above `1.1dev`:
+        // the bound must come from the last non-zero segment (`1`, giving
+        // `2dev`).
+        let envelope = spec("1.0.*").to_ranges_envelope().unwrap();
+        assert!(envelope.contains(&version("1post")));
+        assert!(envelope.is_disjoint(&spec(">=2").to_ranges().unwrap()));
+        // Negated prefix operators have no envelope when not exactly
+        // representable (that would require an under-approximation to
+        // complement).
+        let negated = VersionSpec::StrictRange(
+            StrictRangeOperator::NotStartsWith,
+            StrictVersion(version("1.0")),
+        );
+        assert!(negated.to_ranges_envelope().is_none());
+    }
+
     // =======================================================================
     // The agreement property test: the soundness anchor of the conversion.
     // =======================================================================
@@ -846,6 +1044,37 @@ mod tests {
              ({convertible_strict} with prefix operators), {checks} checks",
             specs.len(),
             versions.len(),
+        );
+    }
+
+    /// The envelope must be a SUPERSET of the matching set for every spec
+    /// that has one: that containment is what makes disjointness proofs on
+    /// envelopes sound. (The reverse direction deliberately does not hold.)
+    #[test]
+    fn test_envelope_superset_property() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let versions = version_pool(&mut rng, 70);
+        let specs: Vec<VersionSpec> = (0..600).map(|_| gen_spec(&mut rng, &versions, 2)).collect();
+
+        let mut enveloped = 0usize;
+        for spec in &specs {
+            let Some(envelope) = spec.to_ranges_envelope() else {
+                continue;
+            };
+            enveloped += 1;
+            for v in &versions {
+                if spec.matches(v) {
+                    assert!(
+                        envelope.contains(v),
+                        "envelope of `{spec}` should contain matching version `{v}`",
+                    );
+                }
+            }
+        }
+        assert!(
+            enveloped * 100 >= specs.len() * 60,
+            "only {enveloped} of {} specs have an envelope",
+            specs.len(),
         );
     }
 }
