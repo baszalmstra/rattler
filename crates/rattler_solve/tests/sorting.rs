@@ -56,6 +56,7 @@ fn create_sorting_snapshot(package_name: &str, strategy: SolveStrategy) -> Strin
         None,
         strategy,
         Vec::new(), // dependency_overrides
+        Vec::new(), // symbolic_virtual_packages
     )
     .expect("failed to create dependency provider");
 

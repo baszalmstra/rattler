@@ -74,7 +74,6 @@ use version_ranges::Ranges;
 /// applies to a concrete machine must use the same lineage semantics, and
 /// this deliberately differs from the exact-string matching used for
 /// concrete `__archspec` candidate records in `filter_candidates`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn match_spec_relation(
     package: &PackageName,
     a: &NamelessMatchSpec,
@@ -221,8 +220,6 @@ fn has_unmodeled_fields(spec: &NamelessMatchSpec) -> bool {
 ///
 /// Returning `None` is always safe for the relation oracle: it degrades the
 /// answer to [`resolvo::VersionSetRelation::Unknown`].
-// The relation oracle that consumes this lands in a follow-up commit.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn version_spec_to_ranges(spec: &VersionSpec) -> Option<Ranges<Version>> {
     Some(match spec {
         VersionSpec::None => Ranges::empty(),
