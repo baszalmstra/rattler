@@ -876,15 +876,23 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
 
         // Add regular dependencies
         for depends in record.package_record.depends.iter() {
-            // Try to parse the dependency and check for overrides.
-            let dep_str = match MatchSpec::from_str(
-                depends,
-                ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
-            ) {
-                Ok(dep_spec) => self
-                    .apply_dependency_override(record, &dep_spec)
-                    .unwrap_or_else(|| depends.clone()),
-                Err(_) => depends.clone(),
+            // Check for dependency overrides. The check needs a parsed spec,
+            // which is expensive (it bypasses the parse cache below), so it
+            // is skipped entirely in the common case of no overrides.
+            let dep_str: std::borrow::Cow<'_, str> = if self.dependency_overrides.is_empty() {
+                std::borrow::Cow::Borrowed(depends)
+            } else {
+                match MatchSpec::from_str(
+                    depends,
+                    ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
+                ) {
+                    Ok(dep_spec) => self
+                        .apply_dependency_override(record, &dep_spec)
+                        .map_or(std::borrow::Cow::Borrowed(depends.as_str()), |overridden| {
+                            std::borrow::Cow::Owned(overridden)
+                        }),
+                    Err(_) => std::borrow::Cow::Borrowed(depends),
+                }
             };
             let specs = match parse_match_spec(&self.pool, &dep_str, &mut parse_match_spec_cache) {
                 Ok(version_set_id) => version_set_id,
