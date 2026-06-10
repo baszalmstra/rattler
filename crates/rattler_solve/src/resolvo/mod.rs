@@ -36,7 +36,7 @@ mod version_oracle;
 pub use universal::{
     CondaCellEdge, CondaUniversalSolution, EnvironmentCondition, EnvironmentLiteral,
     EnvironmentLiteralKind, UniversalSolveError, UniversalSolverTask, display_condition,
-    solve_universal,
+    display_presence, solve_universal,
 };
 
 type MatchSpecParseCache = HashMap<String, (Vec<VersionSetId>, Option<ConditionId>)>;

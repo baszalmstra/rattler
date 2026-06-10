@@ -1,4 +1,4 @@
-//! The universal solve entry point of the resolvo backend: a single solve
+﻿//! The universal solve entry point of the resolvo backend: a single solve
 //! whose output is valid for a whole family of environments (machines with
 //! or without CUDA, any glibc above a floor, any microarchitecture, ...)
 //! instead of one concrete machine.
@@ -23,7 +23,7 @@ use std::{
 
 use rattler_conda_types::{
     GenericVirtualPackage, MatchSpec, NamelessMatchSpec, PackageName, PackageNameMatcher,
-    RepoDataRecord, Version,
+    ParseStrictness, RepoDataRecord, StringMatcher, Version, VersionSpec,
 };
 use resolvo::{
     ConditionalRequirement, EnvLiteral, EnvLiteralKind, NameId, SolvableId,
@@ -142,6 +142,7 @@ pub fn display_condition(condition: &EnvironmentCondition) -> String {
     }
 
     let combined = combinable_ranges(condition);
+    let negation_sets = atom_negation_sets(condition);
 
     let mut parts: Vec<String> = Vec::new();
     let mut emitted: Vec<&PackageName> = Vec::new();
@@ -154,6 +155,16 @@ pub fn display_condition(condition: &EnvironmentCondition) -> String {
             if !emitted.contains(&&literal.package) {
                 emitted.push(&literal.package);
                 parts.push(format!("{} {range}", literal.package.as_normalized()));
+            }
+        } else if let Some((_, set)) = negation_sets
+            .iter()
+            .find(|(package, _)| **package == literal.package)
+        {
+            // The negated atom set renders once, at the group's first
+            // literal.
+            if !emitted.contains(&&literal.package) {
+                emitted.push(&literal.package);
+                parts.push(set.clone());
             }
         } else if *positive {
             parts.push(literal.to_string());
@@ -170,20 +181,8 @@ pub fn display_condition(condition: &EnvironmentCondition) -> String {
 /// [`display_condition`]). Packages whose literals cannot be combined are
 /// not in the result.
 fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, String)> {
-    // Group the literals by package, preserving first-appearance order.
-    let mut groups: Vec<(&PackageName, Vec<(&EnvironmentLiteral, bool)>)> = Vec::new();
-    for (literal, positive) in condition {
-        match groups
-            .iter_mut()
-            .find(|(package, _)| **package == literal.package)
-        {
-            Some((_, group)) => group.push((literal, *positive)),
-            None => groups.push((&literal.package, vec![(literal, *positive)])),
-        }
-    }
-
     let mut combined = Vec::new();
-    for (package, group) in groups {
+    for (package, group) in group_by_package(condition) {
         // A single literal already renders as well as it can; a group
         // without a positive literal has no range to subtract from.
         if group.len() < 2 || !group.iter().any(|(_, positive)| *positive) {
@@ -198,6 +197,24 @@ fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, Str
         combined.push((package, rendered));
     }
     combined
+}
+
+/// Groups the signed literals of a condition by package, preserving
+/// first-appearance order of both the packages and each package's literals.
+fn group_by_package(
+    condition: &EnvironmentCondition,
+) -> Vec<(&PackageName, Vec<(&EnvironmentLiteral, bool)>)> {
+    let mut groups: Vec<(&PackageName, Vec<(&EnvironmentLiteral, bool)>)> = Vec::new();
+    for (literal, positive) in condition {
+        match groups
+            .iter_mut()
+            .find(|(package, _)| **package == literal.package)
+        {
+            Some((_, group)) => group.push((literal, *positive)),
+            None => groups.push((&literal.package, vec![(literal, *positive)])),
+        }
+    }
+    groups
 }
 
 /// The exact version range set of a group of signed literals on one
@@ -263,6 +280,232 @@ fn spec_is_version_only(spec: &NamelessMatchSpec) -> bool {
         && track_features.is_none()
 }
 
+/// Extracts the exact-build atom form of a spec: an optional version part
+/// plus an exact build matcher, and nothing else. Such a literal describes
+/// a single atomic value (e.g. `__archspec 1.* skylake`), so groups of them
+/// render as name sets. Strict by destructuring, like
+/// [`spec_is_version_only`].
+fn spec_as_exact_atom(spec: &NamelessMatchSpec) -> Option<(Option<&VersionSpec>, &str)> {
+    let NamelessMatchSpec {
+        version,
+        build: Some(StringMatcher::Exact(name)),
+        build_number: None,
+        file_name: None,
+        extras: None,
+        flags: None,
+        channel: None,
+        subdir: None,
+        namespace: None,
+        md5: None,
+        sha256: None,
+        url: None,
+        license: None,
+        license_family: None,
+        condition: None,
+        track_features: None,
+    } = spec
+    else {
+        return None;
+    };
+    Some((version.as_ref(), name))
+}
+
+/// Renders an atom name set as `<package> <version> in {a, b, c}` (names
+/// alphabetical, deduplicated; the version part is omitted when absent).
+fn format_atom_set(package: &PackageName, version: Option<&str>, names: &mut Vec<&str>) -> String {
+    names.sort_unstable();
+    names.dedup();
+    match version {
+        Some(version) => format!(
+            "{} {version} in {{{}}}",
+            package.as_normalized(),
+            names.join(", ")
+        ),
+        None => format!("{} in {{{}}}", package.as_normalized(), names.join(", ")),
+    }
+}
+
+/// Computes, per package whose literals in the condition are two or more
+/// negated exact-build atoms sharing one version part, the compact
+/// `not (<package> <version> in {a, b, c})` rendering. Packages whose
+/// literals do not have that shape are not in the result.
+fn atom_negation_sets(condition: &EnvironmentCondition) -> Vec<(&PackageName, String)> {
+    let mut sets = Vec::new();
+    'packages: for (package, group) in group_by_package(condition) {
+        if group.len() < 2 || group.iter().any(|(_, positive)| *positive) {
+            continue;
+        }
+        let mut names: Vec<&str> = Vec::new();
+        let mut version_part: Option<Option<String>> = None;
+        for (literal, _) in &group {
+            let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
+                continue 'packages;
+            };
+            let Some((version, name)) = spec_as_exact_atom(spec) else {
+                continue 'packages;
+            };
+            let rendered = version.map(ToString::to_string);
+            match &version_part {
+                None => version_part = Some(rendered),
+                Some(existing) if *existing == rendered => {}
+                Some(_) => continue 'packages,
+            }
+            names.push(name);
+        }
+        let version = version_part.flatten();
+        let set = format_atom_set(package, version.as_deref(), &mut names);
+        sets.push((package, format!("not ({set})")));
+    }
+    sets
+}
+
+/// Renders a presence (a disjunction of conditions, as stored in
+/// [`CondaUniversalSolution::merged`] and edges) in a human readable way.
+/// Disjuncts that differ only in the name of a single positive exact-build
+/// atom literal merge into one disjunct with a name set: seventeen
+/// `__archspec` alternatives over the same glibc range render as
+/// `__glibc >=2.17,<3.0.a0 AND __archspec 1.* in {broadwell, ...}`.
+/// Remaining disjuncts render through [`display_condition`], joined with
+/// `OR`; multi-literal disjuncts are parenthesized when there is more than
+/// one. The empty disjunction renders as `<no environment>`.
+pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
+    struct Group<'a> {
+        base: &'a EnvironmentCondition,
+        rendered: Vec<(String, bool)>,
+        /// The merged atom slot: literal index in `base` plus the rendered
+        /// version part shared by all merged atoms.
+        slot: Option<(usize, Option<String>)>,
+        names: Vec<String>,
+    }
+
+    if presence.is_empty() {
+        return "<no environment>".to_string();
+    }
+
+    // The literal at `index` as a mergeable atom: positive, an exact-build
+    // atom, and the only literal of its package in the disjunct.
+    let atom_at =
+        |condition: &EnvironmentCondition, index: usize| -> Option<(Option<String>, String)> {
+            let (literal, positive) = &condition[index];
+            if !positive {
+                return None;
+            }
+            let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
+                return None;
+            };
+            let (version, name) = spec_as_exact_atom(spec)?;
+            let package_is_unique = condition
+                .iter()
+                .enumerate()
+                .all(|(other, (l, _))| other == index || l.package != literal.package);
+            package_is_unique.then(|| (version.map(ToString::to_string), name.to_string()))
+        };
+
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    'disjuncts: for condition in presence {
+        let rendered: Vec<(String, bool)> = condition
+            .iter()
+            .map(|(literal, positive)| (literal.to_string(), *positive))
+            .collect();
+        for group in &mut groups {
+            if group.rendered.len() != rendered.len() {
+                continue;
+            }
+            if let Some((index, version)) = &group.slot {
+                let index = *index;
+                let same_rest = rendered
+                    .iter()
+                    .enumerate()
+                    .all(|(i, part)| i == index || *part == group.rendered[i]);
+                if !same_rest {
+                    continue;
+                }
+                let Some((atom_version, name)) = atom_at(condition, index) else {
+                    continue;
+                };
+                if condition[index].0.package != group.base[index].0.package
+                    || atom_version != *version
+                {
+                    continue;
+                }
+                group.names.push(name);
+                continue 'disjuncts;
+            } else {
+                let differing: Vec<usize> = (0..rendered.len())
+                    .filter(|&i| rendered[i] != group.rendered[i])
+                    .collect();
+                let [index] = differing.as_slice() else {
+                    continue;
+                };
+                let index = *index;
+                let (Some((base_version, base_name)), Some((version, name))) =
+                    (atom_at(group.base, index), atom_at(condition, index))
+                else {
+                    continue;
+                };
+                if condition[index].0.package != group.base[index].0.package
+                    || base_version != version
+                {
+                    continue;
+                }
+                group.slot = Some((index, base_version));
+                group.names.push(base_name);
+                group.names.push(name);
+                continue 'disjuncts;
+            }
+        }
+        groups.push(Group {
+            base: condition,
+            rendered,
+            slot: None,
+            names: Vec::new(),
+        });
+    }
+
+    let rendered_groups: Vec<String> = groups
+        .iter()
+        .map(|group| match &group.slot {
+            None => display_condition(group.base),
+            Some((index, version)) => {
+                let mut names: Vec<&str> = group.names.iter().map(String::as_str).collect();
+                let set = format_atom_set(
+                    &group.base[*index].0.package,
+                    version.as_deref(),
+                    &mut names,
+                );
+                let rest: EnvironmentCondition = group
+                    .base
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i != index)
+                    .map(|(_, literal)| literal.clone())
+                    .collect();
+                if rest.is_empty() {
+                    set
+                } else {
+                    format!("{} AND {set}", display_condition(&rest))
+                }
+            }
+        })
+        .collect();
+
+    if rendered_groups.len() == 1 {
+        rendered_groups.into_iter().next().expect("one group")
+    } else {
+        rendered_groups
+            .iter()
+            .map(|part| {
+                if part.contains(" AND ") {
+                    format!("({part})")
+                } else {
+                    part.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+}
+
 /// Renders a range set as a conda-style version range when it is a single
 /// non-empty contiguous interval, `None` otherwise: `>=x` / `>x` for the
 /// lower bound and `<y` / `<=y` for the upper bound, joined by a comma; the
@@ -289,6 +532,271 @@ fn render_single_interval(ranges: &Ranges<Version>) -> Option<String> {
         (None, Some(high)) => high,
         (None, None) => "*".to_string(),
     })
+}
+
+/// The canonical form of one package's literals within a presence disjunct;
+/// see [`simplify_presence`].
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+enum CanonicalEntry {
+    /// The package's literals are exactly one `Absent` literal with the
+    /// given sign.
+    Absent(bool),
+
+    /// All the package's literals are version-only matches, at least one of
+    /// them positive (so the package is necessarily present): the exact
+    /// version interval set they describe.
+    Ranges(Ranges<Version>),
+
+    /// Anything else (a build matcher or other non-version field, a
+    /// negative-only group, an unconvertible version spec): the original
+    /// signed literals, compared verbatim.
+    Raw(Vec<(EnvironmentLiteral, bool)>),
+}
+
+/// One disjunct of a presence disjunction in canonical form: a map from
+/// package name to [`CanonicalEntry`], in first-appearance order.
+#[derive(Clone, Debug)]
+struct CanonicalDisjunct {
+    /// A semantically accurate rendering used verbatim when the canonical
+    /// entries cannot be rendered back into literals.
+    fallback: EnvironmentCondition,
+
+    /// The per-package entries, or `None` when the disjunct is structurally
+    /// uncanonicalizable (a package with both `Absent` and `Matches`
+    /// literals); such a disjunct only takes part in identical-disjunct
+    /// deduplication.
+    entries: Option<Vec<(PackageName, CanonicalEntry)>>,
+}
+
+impl CanonicalDisjunct {
+    /// Whether the disjunct describes an empty region (some package's
+    /// version interval set is empty). An empty region contributes nothing
+    /// to a disjunction.
+    fn is_empty_region(&self) -> bool {
+        self.entries.as_ref().is_some_and(|entries| {
+            entries.iter().any(|(_, entry)| {
+                matches!(entry, CanonicalEntry::Ranges(ranges) if ranges.iter().next().is_none())
+            })
+        })
+    }
+}
+
+/// Canonicalizes one disjunct; see [`CanonicalDisjunct`].
+fn canonicalize_disjunct(condition: EnvironmentCondition) -> CanonicalDisjunct {
+    let entries = canonical_entries(&condition);
+    CanonicalDisjunct {
+        fallback: condition,
+        entries,
+    }
+}
+
+/// Computes the per-package canonical entries of a disjunct, or `None` when
+/// some package's literals mix `Absent` with anything else.
+fn canonical_entries(
+    condition: &EnvironmentCondition,
+) -> Option<Vec<(PackageName, CanonicalEntry)>> {
+    let mut entries = Vec::new();
+    for (package, group) in group_by_package(condition) {
+        let has_absent = group
+            .iter()
+            .any(|(literal, _)| matches!(literal.kind, EnvironmentLiteralKind::Absent));
+        let entry = if has_absent {
+            // An `Absent` literal combined with any other literal on the
+            // same package is not a shape this canonicalization models.
+            if group.len() != 1 {
+                return None;
+            }
+            CanonicalEntry::Absent(group[0].1)
+        } else if group.iter().any(|(_, positive)| *positive)
+            && let Some(ranges) = group_ranges(&group)
+        {
+            // A positive literal implies the package is present, so the
+            // group is exactly a version interval set. A negative-only
+            // group also holds when the package is absent, which no
+            // interval set can express; it stays `Raw`.
+            CanonicalEntry::Ranges(ranges)
+        } else {
+            CanonicalEntry::Raw(
+                group
+                    .iter()
+                    .map(|(literal, positive)| ((*literal).clone(), *positive))
+                    .collect(),
+            )
+        };
+        entries.push((package.clone(), entry));
+    }
+    Some(entries)
+}
+
+/// Renders canonical entries back into an [`EnvironmentCondition`]:
+/// packages keep their first-appearance order; an `Absent` entry becomes
+/// the absent literal with its sign; a `Raw` entry keeps its original
+/// literals; a `Ranges` entry becomes one positive literal parsed
+/// (strictly) from the conda-style rendering of its interval. `None` when
+/// some `Ranges` entry is not a single contiguous interval or its rendering
+/// does not parse back.
+fn render_entries(entries: &[(PackageName, CanonicalEntry)]) -> Option<EnvironmentCondition> {
+    let mut condition = Vec::new();
+    for (package, entry) in entries {
+        match entry {
+            CanonicalEntry::Absent(sign) => condition.push((
+                EnvironmentLiteral {
+                    package: package.clone(),
+                    kind: EnvironmentLiteralKind::Absent,
+                },
+                *sign,
+            )),
+            CanonicalEntry::Raw(literals) => condition.extend(literals.iter().cloned()),
+            CanonicalEntry::Ranges(ranges) => {
+                let rendered = render_single_interval(ranges)?;
+                let spec = NamelessMatchSpec::from_str(&rendered, ParseStrictness::Strict).ok()?;
+                condition.push((
+                    EnvironmentLiteral {
+                        package: package.clone(),
+                        kind: EnvironmentLiteralKind::Matches(spec),
+                    },
+                    true,
+                ));
+            }
+        }
+    }
+    Some(condition)
+}
+
+/// Whether `x` describes a superset region of `y`, making `y` redundant in
+/// a disjunction: every package `x` constrains appears in `y` with an
+/// at-least-as-tight entry, and `x` constrains no package that `y` does not
+/// (extra constraints in `y` only shrink its region further). Disjuncts
+/// that failed to canonicalize only absorb, and are absorbed by, verbatim
+/// identical ones.
+fn absorbs(x: &CanonicalDisjunct, y: &CanonicalDisjunct) -> bool {
+    let (Some(xs), Some(ys)) = (&x.entries, &y.entries) else {
+        return x.entries.is_none() && y.entries.is_none() && x.fallback == y.fallback;
+    };
+    xs.iter().all(|(package, x_entry)| {
+        ys.iter()
+            .find(|(candidate, _)| candidate == package)
+            .is_some_and(|(_, y_entry)| match (x_entry, y_entry) {
+                (CanonicalEntry::Ranges(x_ranges), CanonicalEntry::Ranges(y_ranges)) => {
+                    y_ranges.subset_of(x_ranges)
+                }
+                (x_entry, y_entry) => x_entry == y_entry,
+            })
+    })
+}
+
+/// Merges two disjuncts that constrain the same packages and differ in
+/// exactly one package whose entries are both `Ranges`, provided the union
+/// of those ranges is a single contiguous interval: the pair describes
+/// `common AND (range1 OR range2)`, which the merged disjunct expresses as
+/// one range. Entries keep `x`'s order. `None` when the pair is not
+/// mergeable, including when the merged disjunct would not render back into
+/// literals (every surviving disjunct must stay renderable because a merged
+/// disjunct has no faithful original to fall back to).
+fn try_merge(x: &CanonicalDisjunct, y: &CanonicalDisjunct) -> Option<CanonicalDisjunct> {
+    let (Some(xs), Some(ys)) = (&x.entries, &y.entries) else {
+        return None;
+    };
+    if xs.len() != ys.len() {
+        return None;
+    }
+    let mut merged = Vec::with_capacity(xs.len());
+    let mut differing = 0_usize;
+    for (package, x_entry) in xs {
+        let (_, y_entry) = ys.iter().find(|(candidate, _)| candidate == package)?;
+        if x_entry == y_entry {
+            merged.push((package.clone(), x_entry.clone()));
+            continue;
+        }
+        let (CanonicalEntry::Ranges(x_ranges), CanonicalEntry::Ranges(y_ranges)) =
+            (x_entry, y_entry)
+        else {
+            return None;
+        };
+        let union = x_ranges.union(y_ranges);
+        {
+            let mut segments = union.iter();
+            if segments.next().is_none() || segments.next().is_some() {
+                return None;
+            }
+        }
+        differing += 1;
+        merged.push((package.clone(), CanonicalEntry::Ranges(union)));
+    }
+    if differing != 1 {
+        return None;
+    }
+    let fallback = render_entries(&merged)?;
+    Some(CanonicalDisjunct {
+        fallback,
+        entries: Some(merged),
+    })
+}
+
+/// Simplifies a presence disjunction (an OR of conjunctions of signed
+/// environment literals) into fewer, more readable disjuncts describing
+/// exactly the same region of the environment space:
+///
+/// - empty-region disjuncts are dropped;
+/// - a disjunct whose region lies inside another disjunct's region is
+///   absorbed (this also deduplicates identical disjuncts);
+/// - two disjuncts that differ in exactly one package by version ranges
+///   whose union is a single contiguous interval are merged into one.
+///
+/// The rules are applied as a fixpoint over all pairs (disjunction sizes
+/// are small, so the quadratic passes are cheap) and surviving disjuncts
+/// keep their first-appearance relative order. Each survivor is rendered
+/// back in canonical form: per package one positive range literal where the
+/// package's literals are exactly a contiguous version interval, the
+/// original literals otherwise.
+fn simplify_presence(presence: Vec<EnvironmentCondition>) -> Vec<EnvironmentCondition> {
+    let mut disjuncts: Vec<CanonicalDisjunct> = presence
+        .into_iter()
+        .map(canonicalize_disjunct)
+        .filter(|disjunct| !disjunct.is_empty_region())
+        .collect();
+
+    'fixpoint: loop {
+        // ABSORPTION: drop any disjunct whose region lies inside another's.
+        for i in 0..disjuncts.len() {
+            for j in 0..disjuncts.len() {
+                if i != j && absorbs(&disjuncts[i], &disjuncts[j]) {
+                    // Mutual absorption means equal regions: keep the
+                    // earlier disjunct.
+                    let drop = if absorbs(&disjuncts[j], &disjuncts[i]) {
+                        i.max(j)
+                    } else {
+                        j
+                    };
+                    disjuncts.remove(drop);
+                    continue 'fixpoint;
+                }
+            }
+        }
+        // MERGE: replace the first mergeable pair by its union.
+        for i in 0..disjuncts.len() {
+            for j in i + 1..disjuncts.len() {
+                if let Some(merged) = try_merge(&disjuncts[i], &disjuncts[j]) {
+                    disjuncts[i] = merged;
+                    disjuncts.remove(j);
+                    continue 'fixpoint;
+                }
+            }
+        }
+        break;
+    }
+
+    disjuncts
+        .into_iter()
+        .map(|disjunct| {
+            disjunct
+                .entries
+                .as_deref()
+                .and_then(render_entries)
+                .unwrap_or(disjunct.fallback)
+        })
+        .collect()
 }
 
 /// Describes a universal resolution task: the regular solver task inputs
@@ -686,16 +1194,19 @@ fn convert_condition(
 }
 
 /// Converts a resolvo presence (a disjunction of cell conditions) back into
-/// conda terms.
+/// conda terms and simplifies the disjunction into fewer equivalent
+/// disjuncts (see [`simplify_presence`]).
 fn convert_presence(
     provider: &CondaDependencyProvider<'_>,
     presence: &resolvo::Presence<NameId>,
 ) -> Vec<EnvironmentCondition> {
-    presence
-        .0
-        .iter()
-        .map(|condition| convert_condition(provider, condition))
-        .collect()
+    simplify_presence(
+        presence
+            .0
+            .iter()
+            .map(|condition| convert_condition(provider, condition))
+            .collect(),
+    )
 }
 
 /// Converts a resolvo environment literal back into conda terms.
@@ -818,6 +1329,98 @@ mod tests {
         }
     }
 
+    /// Two or more negated exact-build atoms of one package render as a
+    /// single negated name set instead of a chain of `not (...)` literals
+    /// (the complement region of an archspec partition).
+    #[test]
+    fn test_display_condition_renders_negated_atom_set() {
+        let condition = vec![
+            (matches_literal("__glibc", ">=2.17,<3.0.a0"), true),
+            (matches_literal("__archspec", "1 zen4"), false),
+            (matches_literal("__archspec", "1 haswell"), false),
+            (matches_literal("__archspec", "1 core2"), false),
+        ];
+        insta::assert_snapshot!(
+            display_condition(&condition),
+            @"__glibc >=2.17,<3.0.a0 AND not (__archspec ==1 in {core2, haswell, zen4})"
+        );
+    }
+
+    /// A single negated atom keeps the plain rendering, and atoms with
+    /// differing version parts do not collapse into a set.
+    #[test]
+    fn test_display_condition_negated_atom_set_fallbacks() {
+        let single = vec![
+            (matches_literal("__glibc", ">=2.17"), true),
+            (matches_literal("__archspec", "1 zen4"), false),
+        ];
+        insta::assert_snapshot!(
+            display_condition(&single),
+            @"__glibc >=2.17 AND not (__archspec ==1 zen4)"
+        );
+
+        let mixed_versions = vec![
+            (matches_literal("__archspec", "1 zen4"), false),
+            (matches_literal("__archspec", "2 haswell"), false),
+        ];
+        insta::assert_snapshot!(
+            display_condition(&mixed_versions),
+            @"not (__archspec ==1 zen4) AND not (__archspec ==2 haswell)"
+        );
+    }
+
+    /// Presence disjuncts that differ only in the name of one positive
+    /// exact-build atom merge into a single disjunct with a name set.
+    #[test]
+    fn test_display_presence_merges_atom_alternatives() {
+        let disjunct = |name: &str| {
+            vec![
+                (matches_literal("__glibc", ">=2.17,<3.0.a0"), true),
+                (matches_literal("__archspec", &format!("1 {name}")), true),
+            ]
+        };
+        let presence = vec![disjunct("zen4"), disjunct("haswell"), disjunct("core2")];
+        insta::assert_snapshot!(
+            display_presence(&presence),
+            @"__glibc >=2.17,<3.0.a0 AND __archspec ==1 in {core2, haswell, zen4}"
+        );
+    }
+
+    /// Disjuncts that differ in more than the atom name stay separate, and
+    /// multi-literal disjuncts are parenthesized when more than one remains.
+    #[test]
+    fn test_display_presence_keeps_distinct_disjuncts() {
+        let presence = vec![
+            vec![(matches_literal("__cuda", ">=12.0"), true)],
+            vec![
+                (absent_literal("__cuda"), true),
+                (matches_literal("__glibc", ">=2.17"), true),
+            ],
+        ];
+        insta::assert_snapshot!(
+            display_presence(&presence),
+            @"__cuda >=12.0 OR (__cuda absent AND __glibc >=2.17)"
+        );
+    }
+
+    /// Atom merging composes with the per-disjunct range combining: the
+    /// non-atom literals render through display_condition.
+    #[test]
+    fn test_display_presence_merges_atoms_and_combines_ranges() {
+        let disjunct = |name: &str| {
+            vec![
+                (matches_literal("__cuda", ">=12.0"), true),
+                (matches_literal("__cuda", ">=13"), false),
+                (matches_literal("__archspec", &format!("1 {name}")), true),
+            ]
+        };
+        let presence = vec![disjunct("zen4"), disjunct("haswell")];
+        insta::assert_snapshot!(
+            display_presence(&presence),
+            @"__cuda >=12.0,<13 AND __archspec ==1 in {haswell, zen4}"
+        );
+    }
+
     /// Same-package version-only literals combine into one contiguous
     /// range: a positive floor with a negated higher floor becomes a
     /// half-open interval.
@@ -938,5 +1541,205 @@ mod tests {
         let unknown_machine = [virtual_package("__archspec", "1", "mysterychip")];
         assert!(matches_literal("__archspec", "* mysterychip").evaluate(&unknown_machine));
         assert!(!matches_literal("__archspec", "* x86_64").evaluate(&unknown_machine));
+    }
+
+    /// Renders a simplified presence for assertion.
+    fn simplified(presence: Vec<EnvironmentCondition>) -> Vec<String> {
+        simplify_presence(presence)
+            .iter()
+            .map(display_condition)
+            .collect()
+    }
+
+    /// Whether a presence disjunction holds on a concrete machine.
+    fn presence_holds(
+        presence: &[EnvironmentCondition],
+        machine: &[GenericVirtualPackage],
+    ) -> bool {
+        presence.iter().any(|condition| {
+            condition
+                .iter()
+                .all(|(literal, sign)| literal.evaluate(machine) == *sign)
+        })
+    }
+
+    /// The real-world 12-disjunct `__glibc` x `__cuda` grid: the glibc bands
+    /// `2.17..2.28`, `2.28..2.34` and `2.34..3.0.a0` partition
+    /// `[2.17, 3.0.a0)` and the cuda bands stack up likewise, so the grid
+    /// collapses to three disjuncts describing exactly the same region
+    /// (checked by evaluation below): per glibc band one contiguous cuda
+    /// range, plus the cuda-absent band over all of glibc.
+    #[test]
+    fn test_simplify_presence_collapses_cuda_glibc_grid() {
+        let g = |spec: &str| (matches_literal("__glibc", spec), true);
+        let c = |spec: &str| (matches_literal("__cuda", spec), true);
+        let presence = vec![
+            vec![g(">=2.34,<3.0.a0"), c(">=12.4,<12.8")],
+            vec![g(">=2.28,<2.34"), c(">=12.4")],
+            vec![g(">=2.17,<2.28"), c(">=12.4")],
+            vec![g(">=2.34,<3.0.a0"), c(">=12.2,<12.4")],
+            vec![g(">=2.28,<2.34"), c(">=12.2,<12.4")],
+            vec![c(">=12.0,<12.2"), g(">=2.34,<3.0.a0")],
+            vec![c(">=12.0,<12.2"), g(">=2.28,<2.34")],
+            vec![g(">=2.17,<2.28"), c(">=12.2,<12.4")],
+            vec![c(">=12.0,<12.2"), g(">=2.17,<2.28")],
+            vec![(absent_literal("__cuda"), true), g(">=2.34,<3.0.a0")],
+            vec![(absent_literal("__cuda"), true), g(">=2.28,<2.34")],
+            vec![(absent_literal("__cuda"), true), g(">=2.17,<2.28")],
+        ];
+
+        let result = simplify_presence(presence.clone());
+        assert_eq!(
+            result.iter().map(display_condition).collect::<Vec<_>>(),
+            vec![
+                "__glibc >=2.34,<3.0.a0 AND __cuda >=12.0,<12.8",
+                "__glibc >=2.17,<2.34 AND __cuda >=12.0",
+                "__cuda absent AND __glibc >=2.17,<3.0.a0",
+            ]
+        );
+
+        // The simplified disjunction describes exactly the same region:
+        // evaluate both on a grid of machines straddling every band edge.
+        let glibcs = [
+            None,
+            Some("2.10"),
+            Some("2.17"),
+            Some("2.20"),
+            Some("2.28"),
+            Some("2.30"),
+            Some("2.34"),
+            Some("2.40"),
+            Some("3.0"),
+        ];
+        let cudas = [
+            None,
+            Some("11.0"),
+            Some("12.0"),
+            Some("12.1"),
+            Some("12.2"),
+            Some("12.3"),
+            Some("12.4"),
+            Some("12.5"),
+            Some("12.8"),
+            Some("12.9"),
+        ];
+        for glibc in glibcs {
+            for cuda in cudas {
+                let mut machine = Vec::new();
+                if let Some(glibc) = glibc {
+                    machine.push(virtual_package("__glibc", glibc, "0"));
+                }
+                if let Some(cuda) = cuda {
+                    machine.push(virtual_package("__cuda", cuda, "0"));
+                }
+                assert_eq!(
+                    presence_holds(&result, &machine),
+                    presence_holds(&presence, &machine),
+                    "region mismatch for glibc={glibc:?} cuda={cuda:?}"
+                );
+            }
+        }
+    }
+
+    /// A disjunct with FEWER constraints describes a LARGER region: the
+    /// plain glibc disjunct is a superset of the glibc-band-plus-cuda-absent
+    /// disjunct (the extra cuda constraint only shrinks it), so the latter
+    /// is absorbed.
+    #[test]
+    fn test_simplify_presence_absorbs_more_constrained_disjunct() {
+        let presence = vec![
+            vec![(matches_literal("__glibc", ">=2.17,<3.0.a0"), true)],
+            vec![
+                (matches_literal("__glibc", ">=2.28,<2.34"), true),
+                (absent_literal("__cuda"), true),
+            ],
+        ];
+        assert_eq!(simplified(presence), vec!["__glibc >=2.17,<3.0.a0"]);
+    }
+
+    /// A `Raw` entry (a build matcher is not version-only) participates in
+    /// merging as long as it is identical on both sides: the other
+    /// package's adjacent glibc bands merge across it.
+    #[test]
+    fn test_simplify_presence_merges_across_identical_raw_entry() {
+        let presence = vec![
+            vec![
+                (matches_literal("__archspec", "1 x86_64_v3"), true),
+                (matches_literal("__glibc", ">=2.17,<2.28"), true),
+            ],
+            vec![
+                (matches_literal("__archspec", "1 x86_64_v3"), true),
+                (matches_literal("__glibc", ">=2.28,<3.0.a0"), true),
+            ],
+        ];
+        assert_eq!(
+            simplified(presence),
+            vec!["__archspec ==1 x86_64_v3 AND __glibc >=2.17,<3.0.a0"]
+        );
+    }
+
+    /// `Raw` entries are never range-merged themselves: two disjuncts
+    /// differing only in their `__archspec` build matcher stay separate.
+    #[test]
+    fn test_simplify_presence_never_merges_raw_entries() {
+        let presence = vec![
+            vec![
+                (matches_literal("__archspec", "1 x86_64_v3"), true),
+                (matches_literal("__cuda", ">=12"), true),
+            ],
+            vec![
+                (matches_literal("__archspec", "1 x86_64_v2"), true),
+                (matches_literal("__cuda", ">=12"), true),
+            ],
+        ];
+        assert_eq!(
+            simplified(presence),
+            vec![
+                "__archspec ==1 x86_64_v3 AND __cuda >=12",
+                "__archspec ==1 x86_64_v2 AND __cuda >=12",
+            ]
+        );
+    }
+
+    /// A non-contiguous union (`<11` and `>=12` leave a gap) must not
+    /// merge: the merged range would wrongly include the gap.
+    #[test]
+    fn test_simplify_presence_keeps_non_contiguous_union() {
+        let presence = vec![
+            vec![(matches_literal("__cuda", "<11"), true)],
+            vec![(matches_literal("__cuda", ">=12"), true)],
+        ];
+        assert_eq!(simplified(presence), vec!["__cuda <11", "__cuda >=12"]);
+    }
+
+    /// A disjunct whose version constraints are contradictory describes the
+    /// empty region and contributes nothing to the disjunction: it is
+    /// dropped entirely.
+    #[test]
+    fn test_simplify_presence_drops_empty_range_disjunct() {
+        let presence = vec![
+            vec![
+                (matches_literal("__cuda", ">=13"), true),
+                (matches_literal("__cuda", "<12"), true),
+            ],
+            vec![(matches_literal("__glibc", ">=2.17"), true)],
+        ];
+        assert_eq!(simplified(presence), vec!["__glibc >=2.17"]);
+    }
+
+    /// A disjunct mixing `Absent` and `Matches` literals on the same
+    /// package fails to canonicalize structurally: it is kept untouched and
+    /// only deduplicates against an identical disjunct.
+    #[test]
+    fn test_simplify_presence_keeps_uncanonicalizable_disjunct() {
+        let weird = vec![
+            (matches_literal("__cuda", ">=12.0"), true),
+            (absent_literal("__cuda"), false),
+        ];
+        let presence = vec![weird.clone(), weird];
+        assert_eq!(
+            simplified(presence),
+            vec!["__cuda >=12.0 AND not (__cuda absent)"]
+        );
     }
 }
