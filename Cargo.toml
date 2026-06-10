@@ -192,6 +192,7 @@ url = { version = "2.5.4" }
 urlencoding = "2.1.3"
 unicode-normalization = "0.1.24"
 uuid = { version = "1.17.0", default-features = false }
+version-ranges = "0.1.1"
 walkdir = "2.5.0"
 wasmtimer = "0.4.1"
 which = "8.0.0"

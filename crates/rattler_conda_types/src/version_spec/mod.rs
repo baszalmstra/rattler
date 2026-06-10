@@ -3,6 +3,8 @@
 
 mod constraint;
 pub(crate) mod parse;
+#[cfg(feature = "version-ranges")]
+mod ranges;
 pub(crate) mod version_tree;
 
 use std::{
@@ -15,6 +17,8 @@ use std::{
 use constraint::Constraint;
 pub(crate) use constraint::is_start_of_version_constraint;
 pub use parse::ParseConstraintError;
+#[cfg(feature = "version-ranges")]
+pub use ranges::VersionSpecRangesError;
 use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 use version_tree::VersionTree;

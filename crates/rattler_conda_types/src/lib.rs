@@ -79,6 +79,8 @@ pub use version::{
     VersionBumpType, VersionExtendError, VersionWithSource,
 };
 pub use version_spec::VersionSpec;
+#[cfg(feature = "version-ranges")]
+pub use version_spec::VersionSpecRangesError;
 
 /// An package identifier that can be used to identify packages across package
 /// ecosystems.

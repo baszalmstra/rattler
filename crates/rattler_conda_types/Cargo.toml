@@ -13,6 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["rayon"]
+version-ranges = ["dep:version-ranges"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -54,6 +55,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 typed-path = { workspace = true }
 url = { workspace = true, features = ["serde"] }
+version-ranges = { workspace = true, optional = true }
 indexmap = { workspace = true }
 dirs = { workspace = true }
 rayon = { workspace = true, optional = true }
