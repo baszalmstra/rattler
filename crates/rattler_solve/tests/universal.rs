@@ -199,13 +199,15 @@ fn test_universal_cuda_unsolvable_region() {
     };
     insta::assert_snapshot!(
         condition,
-        @"not (__cuda absent) AND __cuda >=11 AND not (__cuda >=12.1)"
+        @"__cuda >=11 AND not (__cuda >=12.1)"
     );
     // The rendered error mentions the witness region, and the scoped
     // conflict explains the package that cannot be satisfied there.
+    // (`not (__cuda absent)` is dropped from the condition: it is implied
+    // by the positive `__cuda >=11` literal.)
     let message = error.to_string();
     assert!(
-        message.contains("not (__cuda absent) AND __cuda >=11 AND not (__cuda >=12.1)"),
+        message.contains("__cuda >=11 AND not (__cuda >=12.1)"),
         "message should mention the witness region: {message}"
     );
     assert!(
