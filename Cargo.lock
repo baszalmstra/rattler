@@ -5514,6 +5514,7 @@ dependencies = [
 name = "rattler_solve"
 version = "7.1.2"
 dependencies = [
+ "archspec",
  "criterion",
  "futures",
  "hex",
@@ -5536,6 +5537,7 @@ dependencies = [
  "tools",
  "tracing",
  "url",
+ "version-ranges",
 ]
 
 [[package]]
@@ -5857,9 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "resolvo"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2985c35f7dd19ed00659031b77ce05d1828a12eb9c6b37104da21b09d218fc24"
+version = "0.10.4"
 dependencies = [
  "ahash",
  "bitvec",

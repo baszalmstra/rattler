@@ -18,9 +18,9 @@ use rattler_conda_types::{
 };
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem, SolvableId,
-    Solver as LibSolvRsSolver, SolverCache, StringId, UnsolvableOrCancelled, VersionSetId,
-    VersionSetUnionId,
+    HintDependenciesAvailable, Interner, KnownDependencies, NameId, PackageCandidates, Problem,
+    SolvableId, Solver as LibSolvRsSolver, SolverCache, StringId, UnsolvableOrCancelled,
+    VersionSetId, VersionSetUnionId,
     utils::{Pool, VersionSet},
 };
 
@@ -329,7 +329,7 @@ impl<'a> CondaDependencyProvider<'a> {
 
         // Add virtual packages to the records
         for virtual_package in virtual_packages {
-            let name = pool.intern_package_name(&virtual_package.name);
+            let name = pool.intern_package_name(NameType::from(&virtual_package.name));
             let solvable =
                 pool.intern_solvable(name, SolverPackageRecord::VirtualPackage(virtual_package));
             records.entry(name).or_default().candidates.push(solvable);
@@ -339,7 +339,7 @@ impl<'a> CondaDependencyProvider<'a> {
         let direct_dependencies = match_specs
             .iter()
             .filter_map(|spec| spec.name.as_exact())
-            .map(|name| pool.intern_package_name(name))
+            .map(|name| pool.intern_package_name(NameType::from(name)))
             .collect();
 
         // TODO: Normalize these channel names to urls so we can compare them correctly.
@@ -425,7 +425,7 @@ impl<'a> CondaDependencyProvider<'a> {
             }
 
             for record in ordered_repodata {
-                let package_name = pool.intern_package_name(&record.package_record.name);
+                let package_name = pool.intern_package_name(NameType::from(&record.package_record.name));
                 let solvable_id =
                     pool.intern_solvable(package_name, SolverPackageRecord::Record(record));
 
@@ -532,7 +532,7 @@ impl<'a> CondaDependencyProvider<'a> {
 
         // Add favored packages to the records
         for &favored_record in favored_records {
-            let name = pool.intern_package_name(&favored_record.package_record.name);
+            let name = pool.intern_package_name(NameType::from(&favored_record.package_record.name));
             let solvable = pool.intern_solvable(name, SolverPackageRecord::Record(favored_record));
             let candidates = records.entry(name).or_default();
             candidates.candidates.push(solvable);
@@ -540,7 +540,7 @@ impl<'a> CondaDependencyProvider<'a> {
         }
 
         for &locked_record in locked_records {
-            let name = pool.intern_package_name(&locked_record.package_record.name);
+            let name = pool.intern_package_name(NameType::from(&locked_record.package_record.name));
             let solvable = pool.intern_solvable(name, SolverPackageRecord::Record(locked_record));
             let candidates = records.entry(name).or_default();
             candidates.candidates.push(solvable);
@@ -619,6 +619,9 @@ pub enum CancelReason {
 }
 
 impl Interner for CondaDependencyProvider<'_> {
+    type NameId = NameId;
+    type SolvableId = SolvableId;
+
     fn display_solvable(&self, solvable: SolvableId) -> impl Display + '_ {
         &self.pool.resolve_solvable(solvable).record
     }
@@ -730,9 +733,9 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
             .sort(solvables, &mut highest_version_spec);
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
         match self.pool.resolve_package_name(name) {
-            NameType::Base(_) => self.records.get(&name).cloned(),
+            NameType::Base(_) => self.records.get(&name).cloned().map(Into::into),
             NameType::Extra { package, extra } => {
                 // For extras, we need to create a new candidates object
                 // that contains only the extra solvable.
@@ -741,13 +744,16 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
                     PackageName::new_unchecked(package),
                     extra.clone(),
                 );
-                Some(Candidates {
-                    candidates: vec![extra_solvable],
-                    favored: None,
-                    locked: None,
-                    excluded: Vec::new(),
-                    hint_dependencies_available: HintDependenciesAvailable::All,
-                })
+                Some(
+                    Candidates {
+                        candidates: vec![extra_solvable],
+                        favored: None,
+                        locked: None,
+                        excluded: Vec::new(),
+                        hint_dependencies_available: HintDependenciesAvailable::All,
+                    }
+                    .into(),
+                )
             }
         }
     }
@@ -1012,7 +1018,7 @@ impl super::SolverImpl for Solver {
 
         // Construct the requirements that the solver needs to satisfy.
         let virtual_package_requirements = task.virtual_packages.iter().map(|spec| {
-            let name_id = provider.pool.intern_package_name(&spec.name);
+            let name_id = provider.pool.intern_package_name(NameType::from(&spec.name));
             provider
                 .pool
                 .intern_version_set(name_id, NamelessMatchSpec::default().into())
@@ -1046,7 +1052,7 @@ impl super::SolverImpl for Solver {
                 let (PackageNameMatcher::Exact(name), spec) = spec.clone().into_nameless() else {
                     unimplemented!("only exact package names are supported");
                 };
-                let name_id = provider.pool.intern_package_name(&name);
+                let name_id = provider.pool.intern_package_name(NameType::from(&name));
                 provider.pool.intern_version_set(name_id, spec.into())
             })
             .collect();
@@ -1140,7 +1146,7 @@ fn version_sets_for_match_spec(
     }
 
     // Create a version set for the match spec itself.
-    let dependency_name = pool.intern_package_name(&name);
+    let dependency_name = pool.intern_package_name(NameType::from(&name));
     let version_set_id = pool.intern_version_set(dependency_name, spec.into());
     version_set_ids.push(version_set_id);
 
