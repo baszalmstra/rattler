@@ -254,6 +254,7 @@ pub async fn create(opt: Opt) -> miette::Result<()> {
     // Determine virtual packages of the system. These packages define the
     // capabilities of the system. Some packages depend on these virtual
     // packages to indicate compatibility with the hardware of the system.
+    let has_explicit_virtual_packages = opt.virtual_package.is_some();
     let virtual_packages = wrap_in_progress("determining virtual packages", move || {
         if let Some(virtual_packages) = opt.virtual_package {
             Ok(virtual_packages
@@ -296,7 +297,7 @@ pub async fn create(opt: Opt) -> miette::Result<()> {
             install_platform,
             repo_data,
             specs,
-            virtual_packages,
+            has_explicit_virtual_packages.then_some(virtual_packages),
             opt.cuda_floor,
             opt.glibc_floor,
             opt.timeout,
@@ -399,6 +400,31 @@ pub async fn create(opt: Opt) -> miette::Result<()> {
     Ok(())
 }
 
+/// Returns the concrete virtual packages for a universal solve targeting
+/// `platform`: exactly the virtual packages that hold on EVERY machine of
+/// that platform (`__unix`, `__linux`).
+///
+/// Host-detected virtual packages must not be used here: they describe one
+/// machine, and for a cross-platform solve the wrong operating system
+/// entirely. A missing always-true package such as `__unix` silently kills
+/// every build that depends on it, which both degrades the solution and
+/// sends the solver into a near-unsatisfiable search.
+fn universal_base_virtual_packages(platform: Platform) -> Vec<GenericVirtualPackage> {
+    let base_package = |name: &str| GenericVirtualPackage {
+        name: PackageName::new_unchecked(name),
+        version: Version::from_str("0").unwrap(),
+        build_string: "0".to_string(),
+    };
+    let mut base = Vec::new();
+    if platform.is_unix() {
+        base.push(base_package("__unix"));
+    }
+    if platform.is_linux() {
+        base.push(base_package("__linux"));
+    }
+    base
+}
+
 /// Runs the universal solve path and prints a human-readable report.
 ///
 /// This is a separate (synchronous) function so it can return early without
@@ -409,7 +435,7 @@ fn run_universal_solve(
     install_platform: Platform,
     repo_data: Vec<RepoData>,
     specs: Vec<MatchSpec>,
-    concrete_virtual_packages: Vec<GenericVirtualPackage>,
+    explicit_virtual_packages: Option<Vec<GenericVirtualPackage>>,
     cuda_floor: String,
     glibc_floor: String,
     timeout_ms: Option<u64>,
@@ -448,17 +474,30 @@ fn run_universal_solve(
         });
     }
 
-    // Filter out the symbolic names from the concrete virtual packages, so we
-    // do not inject them as concrete records. Other detected virtual packages
-    // (e.g. __unix, __linux, __archspec) stay concrete as usual.
-    let concrete_vps: Vec<GenericVirtualPackage> = concrete_virtual_packages
-        .into_iter()
-        .filter(|vp| {
-            !symbolic_names
-                .iter()
-                .any(|name| vp.name.as_normalized() == *name)
-        })
-        .collect();
+    // The concrete virtual packages of a universal solve must hold on EVERY
+    // machine in the modeled space, so by default they are derived from the
+    // target platform (`__unix`, `__linux`), never from host detection. An
+    // explicit --virtual-package list overrides this, filtered of the
+    // symbolic names so they are not injected as concrete records.
+    let concrete_vps: Vec<GenericVirtualPackage> = match explicit_virtual_packages {
+        Some(virtual_packages) => virtual_packages
+            .into_iter()
+            .filter(|vp| {
+                !symbolic_names
+                    .iter()
+                    .any(|name| vp.name.as_normalized() == *name)
+            })
+            .collect(),
+        None => universal_base_virtual_packages(install_platform),
+    };
+    println!(
+        "Universal solve: symbolic {}; concrete {}",
+        symbolic_virtual_packages
+            .iter()
+            .map(|s| s.name.as_normalized().to_string())
+            .join(", "),
+        concrete_vps.iter().map(|vp| format!("{vp}")).join(", "),
+    );
 
     // Build the environment model: a CNF bounding the environment space.
     //
@@ -817,5 +856,32 @@ fn print_transaction(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A universal solve must inject exactly the virtual packages that hold
+    /// on EVERY machine of the target platform, independent of the host.
+    /// Regression: a linux-64 universal solve driven from a Windows host
+    /// used the host-detected set, lacked `__unix`/`__linux`, and silently
+    /// killed every noarch build depending on them. The solver then ground
+    /// through a near-unsatisfiable search (5508 conflicts, 8.4s instead of
+    /// 0 conflicts, 0.6s) and downgraded pytorch from 2.11 to 2.8.
+    #[test]
+    fn test_universal_base_virtual_packages() {
+        let names = |platform: Platform| {
+            universal_base_virtual_packages(platform)
+                .into_iter()
+                .map(|vp| vp.name.as_normalized().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(Platform::Linux64), ["__unix", "__linux"]);
+        assert_eq!(names(Platform::LinuxAarch64), ["__unix", "__linux"]);
+        assert_eq!(names(Platform::Osx64), ["__unix"]);
+        assert_eq!(names(Platform::OsxArm64), ["__unix"]);
+        assert_eq!(names(Platform::Win64), Vec::<String>::new());
     }
 }
