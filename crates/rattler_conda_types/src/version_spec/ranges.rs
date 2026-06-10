@@ -119,13 +119,24 @@ impl VersionSpec {
     /// ```
     /// use std::str::FromStr;
     ///
-    /// use rattler_conda_types::{ParseStrictness, Version, VersionSpec};
+    /// use rattler_conda_types::{ParseStrictness, Version, VersionSpec, VersionSpecRangesError};
     ///
     /// let spec = VersionSpec::from_str(">=2.17,<3", ParseStrictness::Strict)?;
     /// let ranges = spec.to_ranges()?;
     /// assert!(ranges.contains(&Version::from_str("2.28")?));
     /// assert!(!ranges.contains(&Version::from_str("3.0")?));
     ///
+    /// // Range algebra: `1.1.*` is a subset of `>=1,<2`.
+    /// let prefix = VersionSpec::from_str("1.1.*", ParseStrictness::Strict)?.to_ranges()?;
+    /// let bounds = VersionSpec::from_str(">=1,<2", ParseStrictness::Strict)?.to_ranges()?;
+    /// assert!(prefix.subset_of(&bounds));
+    ///
+    /// // Specs whose matching set has no interval form are refused.
+    /// let local = VersionSpec::from_str("=1.0+abc", ParseStrictness::Lenient)?;
+    /// assert_eq!(
+    ///     local.to_ranges(),
+    ///     Err(VersionSpecRangesError::LocalVersionPrefix)
+    /// );
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     pub fn to_ranges(&self) -> Result<Ranges<Version>, VersionSpecRangesError> {
@@ -148,9 +159,8 @@ impl VersionSpec {
                 EqualityOperator::NotEquals => Ranges::singleton(limit.clone()).complement(),
             },
             VersionSpec::StrictRange(op, prefix) => match op {
-                StrictRangeOperator::StartsWith | StrictRangeOperator::NotStartsWith => {
-                    todo!("implemented in a later step")
-                }
+                StrictRangeOperator::StartsWith => starts_with_ranges(&prefix.0)?,
+                StrictRangeOperator::NotStartsWith => starts_with_ranges(&prefix.0)?.complement(),
                 StrictRangeOperator::Compatible => compatible_ranges(&prefix.0)?,
                 StrictRangeOperator::NotCompatible => compatible_ranges(&prefix.0)?.complement(),
             },
@@ -170,6 +180,76 @@ impl VersionSpec {
             }
         })
     }
+}
+
+/// Converts the `StartsWith` operator (`prefix.*`) into ranges.
+///
+/// # Derivation
+///
+/// `Version::starts_with(prefix)` holds when the epoch matches, every
+/// non-last prefix segment is matched componentwise (the version may omit
+/// trailing zero components, but may not add components), the version's
+/// segment at the last prefix position starts componentwise with the prefix
+/// segment (arbitrary extra components are allowed there: `1.0.1c` starts
+/// with `1.0.1`), and any further version segments are free.
+///
+/// For prefixes of the supported shape (below) this set is an interval in
+/// the version order:
+///
+/// - every version deviating from a non-last prefix segment sorts strictly
+///   outside the prefix's own segment value (identifier components sort
+///   below the zero padding, `post` above), and
+/// - within the last prefix segment, all and only the component lists that
+///   start with the prefix's final numeral `n` lie between the lists led by
+///   `n - 1` and those led by `n + 1`.
+///
+/// The boundaries of that interval are limits that no version attains (the
+/// infimum is `prefix` extended by an unbounded descending `dev` tower), so
+/// the conversion uses the closest attainable bounds, built with the `dev`
+/// component, which sorts below every other component:
+///
+/// - lower bound (included): `{prefix}dev`, the `dev` pre-release of the
+///   prefix itself (e.g. `1.1.* -> 1.1dev`). Every matching version sorts at
+///   or above it; every version below the prefix's numeral cut sorts below.
+/// - upper bound (excluded): `{bump_last(prefix)}dev`, the `dev`
+///   pre-release of the prefix successor (e.g. `1.1.* -> 1.2dev`), the floor
+///   of the first non-matching region above.
+///
+/// # Supported prefix shapes
+///
+/// The conversion succeeds only when all of the following hold; each
+/// exclusion is a genuine non-representability documented on the returned
+/// error variant:
+///
+/// - **no local part**: a local prefix selects on the local component, which
+///   is not contiguous in the version order.
+/// - **every non-last segment ends in a numeral**: an identifier-ending
+///   segment breaks closure under `Ord`-equality.
+/// - **the last segment is a single numeral that is only zero when it is the
+///   sole segment**: a trailing zero segment re-creates the closure problem
+///   with realistic versions, and an identifier-ending last segment has no
+///   constructible successor bound.
+///
+/// # Known blind spot (documented, deliberate)
+///
+/// Versions that continue below a `dev` floor, i.e. extend the prefix (or
+/// its successor) with a `dev` component followed by further sub-zero
+/// components (`1.2dev0dev`, `1.2dev.rc1` against `1.1.*`), are
+/// misclassified. No interval representation can handle them: the true
+/// boundary is an unattainable limit (a proof sketch lives in the agreement
+/// test's generator docs). No real-world package versions itself below its
+/// own `dev` pre-release, so the practical impact is nil; the agreement
+/// test's version grammar documents and enforces exactly this exclusion.
+fn starts_with_ranges(prefix: &Version) -> Result<Ranges<Version>, VersionSpecRangesError> {
+    prefix_representability(prefix)?;
+    let low = dev_floor(prefix)
+        .expect("a representable prefix ends in a numeral, so its dev floor is a valid version");
+    let bumped = prefix
+        .bump(VersionBumpType::Last)
+        .expect("a representable prefix ends in a numeral, which can always be bumped");
+    let high = dev_floor(&bumped)
+        .expect("a bumped representable prefix ends in a numeral, so its dev floor is valid");
+    Ok(Ranges::between(low, high))
 }
 
 /// Converts the `Compatible` operator (`~=limit`) into ranges.
@@ -264,10 +344,10 @@ fn next_epoch_floor(limit: &Version) -> Version {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::cmp::Ordering;
 
     use super::*;
-    use crate::ParseStrictness;
+    use crate::{ParseStrictness, StrictVersion};
 
     fn spec(s: &str) -> VersionSpec {
         VersionSpec::from_str(s, ParseStrictness::Lenient).unwrap()
@@ -385,6 +465,387 @@ mod tests {
         assert_eq!(
             spec("~=1.2+abc").to_ranges(),
             Err(VersionSpecRangesError::LocalVersionPrefix)
+        );
+    }
+
+    #[test]
+    fn test_starts_with_membership() {
+        // rattler's `starts_with` allows arbitrary extra components within
+        // the last prefix segment, so `1.1a0` and `1.1dev` both match
+        // `1.1.*` (conda/rattler#1914 semantics). Note `1.1a0` and `1.1dev`
+        // sort BELOW `1.1`: a naive `>=1.1` lower bound would exclude them,
+        // which is why the conversion uses the `dev` floor `1.1dev`.
+        assert_members(
+            "1.1.*",
+            &[
+                "1.1", "1.1.5", "1.1.0.4", "1.1a0", "1.1c", "1.1dev", "1.1rc1", "1.1+x.y",
+            ],
+            &["1.2", "1.0.9", "1.2dev", "1.10", "1.2a0", "2.1", "1!1.1"],
+        );
+        // Single-segment prefix: anything whose first segment starts with
+        // `12` (and only those).
+        assert_members(
+            "12.*",
+            &["12", "12.9", "12dev", "12a", "12.0.1"],
+            &["11.9", "13", "120", "13dev", "1.2"],
+        );
+        // Epochs are part of the prefix.
+        assert_members("1!1.2.*", &["1!1.2", "1!1.2.3"], &["1.2", "2!1.2", "1!1.3"]);
+    }
+
+    #[test]
+    fn test_not_starts_with_membership() {
+        assert_members(
+            "!=1.1.*",
+            &["1.2", "1.0.9", "1.2dev"],
+            &["1.1", "1.1.5", "1.1a0"],
+        );
+    }
+
+    #[test]
+    fn test_group_with_prefix_operators() {
+        assert_members("11.*|12.*", &["11.1", "12.9"], &["10.9", "13.0"]);
+        // An unrepresentable member poisons the whole group.
+        assert_eq!(
+            spec(">=1.2,1.0.*").to_ranges(),
+            Err(VersionSpecRangesError::TrailingZeroPrefix)
+        );
+        // ... but representable groups stay representable.
+        assert!(spec(">=1.2,<2").to_ranges().is_ok());
+    }
+
+    #[test]
+    fn test_unrepresentable_prefixes() {
+        // A trailing zero segment makes the matching set inconsistent under
+        // `Ord`-equality: `2024a` matches `2024.0.*` while the Ord-equal
+        // `2024a.0` does not. Both directions are realistic versions, so no
+        // interval representation exists and the conversion must refuse.
+        assert_eq!(
+            spec("1.0.*").to_ranges(),
+            Err(VersionSpecRangesError::TrailingZeroPrefix)
+        );
+        assert_eq!(
+            spec("2.38.0.*").to_ranges(),
+            Err(VersionSpecRangesError::TrailingZeroPrefix)
+        );
+        // An identifier-ending last segment has no constructible successor
+        // bound.
+        assert_eq!(
+            VersionSpec::StrictRange(
+                StrictRangeOperator::StartsWith,
+                StrictVersion(version("1.1a")),
+            )
+            .to_ranges(),
+            Err(VersionSpecRangesError::NonNumeralLastPrefixSegment)
+        );
+        // Local parts in the prefix select on the local component, which is
+        // not contiguous in the version order.
+        assert_eq!(
+            VersionSpec::StrictRange(
+                StrictRangeOperator::StartsWith,
+                StrictVersion(version("1.1+x")),
+            )
+            .to_ranges(),
+            Err(VersionSpecRangesError::LocalVersionPrefix)
+        );
+    }
+
+    /// Permanent record of the counterexamples that shaped the conversion
+    /// (from the Zulip discussion linked in the pull request and from the
+    /// reference implementation). Each block asserts the matching semantics
+    /// that make the case hard AND the conversion's answer to it.
+    #[test]
+    fn test_named_counterexamples() {
+        // `=2.0` matches `2.0a`, which sorts BEFORE `2.0`: a naive `>=2.0`
+        // lower bound would be wrong (the settled answer is the dev floor,
+        // see `test_starts_with_membership`). `2.0.*` itself is refused
+        // outright because of its trailing zero segment (next block).
+        let two_zero = spec("=2.0");
+        assert!(two_zero.matches(&version("2.0a")));
+        assert!(version("2.0a") < version("2.0"));
+        assert_eq!(
+            two_zero.to_ranges(),
+            Err(VersionSpecRangesError::TrailingZeroPrefix)
+        );
+
+        // The dev floor is a floor, not an alpha floor: `1.2dev` matches
+        // `1.2.*` yet sorts below `1.2a0`, so an `a0`-based lower bound
+        // (an earlier attempt from the Zulip thread) would exclude it.
+        assert!(spec("1.2.*").matches(&version("1.2dev")));
+        assert!(version("1.2dev") < version("1.2a0"));
+
+        // Trailing-zero prefixes break `Ord`-equality closure: `2024a`
+        // matches `2024.0.*` while the equal-sorting `2024a.0` does not, so
+        // no interval can represent the matching set.
+        let trailing = spec("2024.0.*");
+        assert!(trailing.matches(&version("2024a")));
+        assert!(!trailing.matches(&version("2024a.0")));
+        assert_eq!(version("2024a").cmp(&version("2024a.0")), Ordering::Equal);
+        assert_eq!(
+            trailing.to_ranges(),
+            Err(VersionSpecRangesError::TrailingZeroPrefix)
+        );
+
+        // Identifier-ending inner segments break the same closure: `1.1a.5`
+        // matches `1.1a.5.*` while the equal-sorting `1.1a0.5` does not.
+        let inner = spec("1.1a.5.*");
+        assert!(inner.matches(&version("1.1a.5")));
+        assert!(!inner.matches(&version("1.1a0.5")));
+        assert_eq!(version("1.1a.5").cmp(&version("1.1a0.5")), Ordering::Equal);
+        assert_eq!(
+            inner.to_ranges(),
+            Err(VersionSpecRangesError::NonNumeralPrefixSegment)
+        );
+
+        // Local prefixes select non-contiguously: `=1.2+abc` matches
+        // `1.2+abc1`, `1.2.1+abc`, `1.2.2+abc` and `1.2.3+abc`, but not
+        // `1.2.2+bbc`, which sorts between the last two.
+        let local = spec("=1.2+abc");
+        for v in ["1.2+abc1", "1.2.1+abc", "1.2.2+abc", "1.2.3+abc"] {
+            assert!(local.matches(&version(v)), "`=1.2+abc` should match `{v}`");
+        }
+        assert!(!local.matches(&version("1.2.2+bbc")));
+        assert!(version("1.2.2+abc") < version("1.2.2+bbc"));
+        assert!(version("1.2.2+bbc") < version("1.2.3+abc"));
+        assert_eq!(
+            local.to_ranges(),
+            Err(VersionSpecRangesError::LocalVersionPrefix)
+        );
+    }
+
+    // =======================================================================
+    // The agreement property test: the soundness anchor of the conversion.
+    // =======================================================================
+
+    /// A deterministic xorshift* generator so the test is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn chance(&mut self, pct: u64) -> bool {
+            self.next() % 100 < pct
+        }
+
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+    }
+
+    /// Generates a diverse but realistic version: optional epoch, one to
+    /// four numeric segments, an optional letter suffix on the last
+    /// segment, an optional pre-release tag segment, optional trailing zero
+    /// segments and an optional local part.
+    ///
+    /// Deliberately excluded shapes (with reasoning, see the module docs):
+    ///
+    /// - a second pre-release marker nested below a `dev` marker (e.g.
+    ///   `1.2dev0dev`, `1.2dev.rc1`): these sort below the dev floor of
+    ///   their own release and no real package versions itself like that.
+    ///   No interval representation can classify them correctly (the
+    ///   infimum of a prefix's matching set is not attainable).
+    /// - letter components attached to a non-final segment with further
+    ///   segments following (e.g. `1c.5`, `1.0rc1.2`): only relevant for
+    ///   trailing-zero prefixes, which the conversion refuses anyway.
+    fn gen_version(rng: &mut Rng) -> Version {
+        const NUMERALS: &[&str] = &[
+            "0", "1", "2", "3", "5", "10", "11", "12", "100", "217", "228", "2024",
+        ];
+        const SUFFIXES: &[&str] = &["a", "b", "c", "g", "rc", "dev", "post"];
+        const TAGS: &[&str] = &[
+            "a0", "b1", "rc1", "rc2", "alpha", "beta", "dev", "dev0", "post",
+        ];
+        const LOCALS: &[&str] = &["1", "3.4", "x.y", "0a"];
+
+        let mut s = String::new();
+        if rng.chance(15) {
+            s.push_str(if rng.chance(50) { "1!" } else { "2!" });
+        }
+        let nseg = 1 + rng.below(4);
+        for i in 0..nseg {
+            if i > 0 {
+                s.push('.');
+            }
+            s.push_str(rng.pick(NUMERALS).as_ref());
+        }
+        let mut dev_terminal = false;
+        if rng.chance(25) {
+            let suffix = rng.pick(SUFFIXES);
+            dev_terminal = *suffix == "dev";
+            s.push_str(suffix);
+        }
+        if !dev_terminal && rng.chance(20) {
+            s.push('.');
+            s.push_str(rng.pick(TAGS).as_ref());
+        }
+        if rng.chance(15) {
+            s.push_str(".0");
+            if rng.chance(30) {
+                s.push_str(".0");
+            }
+        }
+        if rng.chance(10) {
+            s.push('+');
+            s.push_str(rng.pick(LOCALS).as_ref());
+        }
+        Version::from_str(&s).unwrap()
+    }
+
+    /// Generates an atomic spec over a random version from the pool.
+    fn gen_atom(rng: &mut Rng, versions: &[Version]) -> VersionSpec {
+        let v = rng.pick(versions).clone();
+        match rng.below(12) {
+            0 => VersionSpec::Range(RangeOperator::Greater, v),
+            1 => VersionSpec::Range(RangeOperator::GreaterEquals, v),
+            2 => VersionSpec::Range(RangeOperator::Less, v),
+            3 => VersionSpec::Range(RangeOperator::LessEquals, v),
+            4 => VersionSpec::Exact(EqualityOperator::Equals, v),
+            5 => VersionSpec::Exact(EqualityOperator::NotEquals, v),
+            6 | 7 => VersionSpec::StrictRange(StrictRangeOperator::StartsWith, StrictVersion(v)),
+            8 => VersionSpec::StrictRange(StrictRangeOperator::NotStartsWith, StrictVersion(v)),
+            9 => VersionSpec::StrictRange(StrictRangeOperator::Compatible, StrictVersion(v)),
+            10 => VersionSpec::StrictRange(StrictRangeOperator::NotCompatible, StrictVersion(v)),
+            _ => VersionSpec::Any,
+        }
+    }
+
+    /// Generates a spec: an atom or a (possibly nested) group of atoms.
+    fn gen_spec(rng: &mut Rng, versions: &[Version], depth: usize) -> VersionSpec {
+        if depth == 0 || rng.chance(60) {
+            return gen_atom(rng, versions);
+        }
+        let op = if rng.chance(50) {
+            LogicalOperator::And
+        } else {
+            LogicalOperator::Or
+        };
+        let n = 2 + rng.below(2);
+        VersionSpec::Group(
+            op,
+            (0..n).map(|_| gen_spec(rng, versions, depth - 1)).collect(),
+        )
+    }
+
+    /// Whether the spec contains a prefix (strict-range) operator, the
+    /// interesting case for boundary coverage.
+    fn has_strict_operator(spec: &VersionSpec) -> bool {
+        match spec {
+            VersionSpec::StrictRange(..) => true,
+            VersionSpec::Group(_, group) => group.iter().any(has_strict_operator),
+            _ => false,
+        }
+    }
+
+    /// The hand-picked boundary probes for the property tests, augmented
+    /// with a pool of generated versions.
+    fn version_pool(rng: &mut Rng, generated: usize) -> Vec<Version> {
+        let mut versions: Vec<Version> = [
+            "0",
+            "0.0",
+            "1",
+            "1.0",
+            "1.1",
+            "1.2",
+            "2",
+            "2.4",
+            "2.17",
+            "2.38",
+            "3.0a0",
+            "11",
+            "11.8",
+            "12",
+            "12.1",
+            "217",
+            "228",
+            "1.1dev",
+            "1.2dev",
+            "1.1.dev",
+            "1.2dev.0",
+            "1.1a0",
+            "1.2a0",
+            "1.0.1c",
+            "2.39dev",
+            "1!1.2",
+            "1!1.2.3",
+            "1.2.3+4.5",
+            "2.17.1",
+            "1.10",
+            "1.1rc1",
+            "1post",
+            "1.1post",
+            "2.38.0",
+        ]
+        .iter()
+        .map(|s| version(s))
+        .collect();
+        for _ in 0..generated {
+            versions.push(gen_version(rng));
+        }
+        versions
+    }
+
+    /// For every generated `(spec, version)` pair the converted ranges must
+    /// agree exactly with `VersionSpec::matches`. Any disagreement is a bug
+    /// in the conversion; the conversion is fixed, never the test.
+    #[test]
+    fn test_agreement_property() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let versions = version_pool(&mut rng, 70);
+        let specs: Vec<VersionSpec> = (0..600).map(|_| gen_spec(&mut rng, &versions, 2)).collect();
+
+        let mut convertible = 0usize;
+        let mut convertible_strict = 0usize;
+        let mut checks = 0usize;
+        for spec in &specs {
+            let Ok(ranges) = spec.to_ranges() else {
+                continue;
+            };
+            convertible += 1;
+            convertible_strict += usize::from(has_strict_operator(spec));
+            for v in &versions {
+                checks += 1;
+                assert_eq!(
+                    spec.matches(v),
+                    ranges.contains(v),
+                    "conversion disagreement for spec `{spec}` and version `{v}`",
+                );
+            }
+        }
+
+        // The conversion must cover the bulk of realistic specs; with the
+        // grammar above only prefix operators on unrepresentable shapes
+        // (trailing-zero / suffixed / local prefixes) may refuse. The
+        // boundary-heavy prefix operators must be well represented among
+        // the converted specs, or the test would not exercise them.
+        assert!(
+            convertible * 100 >= specs.len() * 60,
+            "only {convertible} of {} specs converted",
+            specs.len(),
+        );
+        assert!(
+            convertible_strict >= 50,
+            "only {convertible_strict} converted specs contain a prefix operator",
+        );
+        assert!(
+            checks >= 30_000,
+            "expected at least 30000 agreement checks, performed {checks}",
+        );
+        println!(
+            "agreement: {} specs, {} versions, {convertible} convertible specs \
+             ({convertible_strict} with prefix operators), {checks} checks",
+            specs.len(),
+            versions.len(),
         );
     }
 }
