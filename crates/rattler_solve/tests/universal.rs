@@ -310,6 +310,100 @@ fn test_universal_verify_ok() {
     assert!(solution.verify().is_ok());
 }
 
+/// Informational benchmark (not a gate): compares one universal solve of
+/// the cuda model against the two concrete solves it replaces (one with
+/// `__cuda` injected, one without), on both the dummy fixture and the
+/// conda-forge bubblewrap closure. Run with:
+///
+/// ```text
+/// cargo test -p rattler_solve --release --test universal -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "informational benchmark; run explicitly with --ignored --nocapture"]
+fn bench_universal_vs_concrete_solves() {
+    use std::time::Instant;
+
+    use rattler_solve::SolverImpl;
+
+    fn concrete_solve(
+        records: &[RepoDataRecord],
+        specs: &[&str],
+        virtual_packages: Vec<GenericVirtualPackage>,
+    ) {
+        let task = rattler_solve::SolverTask {
+            virtual_packages,
+            specs: specs
+                .iter()
+                .map(|s| MatchSpec::from_str(s, ParseStrictness::Lenient).unwrap())
+                .collect(),
+            ..rattler_solve::SolverTask::from_iter([records])
+        };
+        rattler_solve::resolvo::Solver
+            .solve(task)
+            .expect("concrete solve succeeds");
+    }
+
+    fn time(iterations: u32, mut f: impl FnMut()) -> std::time::Duration {
+        // One warmup round.
+        f();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            f();
+        }
+        start.elapsed() / iterations
+    }
+
+    let cuda = GenericVirtualPackage {
+        name: PackageName::new_unchecked("__cuda"),
+        version: Version::from_str("12.4").unwrap(),
+        build_string: "0".to_string(),
+    };
+    let glibc = GenericVirtualPackage {
+        name: PackageName::new_unchecked("__glibc"),
+        version: Version::from_str("2.28").unwrap(),
+        build_string: "0".to_string(),
+    };
+
+    for (name, records, specs, environment_model, concrete_machines) in [
+        (
+            "dummy/cuda-version",
+            read_repodata(&dummy_channel_json_path()),
+            &["cuda-version"][..],
+            model(&[&["__cuda absent", "__cuda >=12.1"]]),
+            vec![vec![cuda.clone()], vec![]],
+        ),
+        (
+            "conda-forge/bubblewrap",
+            read_bubblewrap_closure(),
+            &["bubblewrap"][..],
+            model(&[&["__glibc >=2.17,<3.0.a0"]]),
+            vec![vec![glibc.clone()]],
+        ),
+    ] {
+        let iterations = 10;
+        let universal = time(iterations, || {
+            let solution =
+                solve_universal(task(&records, specs, environment_model.clone())).unwrap();
+            std::hint::black_box(&solution);
+        });
+        let cells = solve_universal(task(&records, specs, environment_model.clone()))
+            .unwrap()
+            .cells
+            .len();
+        let mut concrete_total = std::time::Duration::ZERO;
+        for machine in &concrete_machines {
+            concrete_total += time(iterations, || {
+                concrete_solve(&records, specs, machine.clone());
+            });
+        }
+        println!(
+            "{name}: universal solve {universal:?} ({cells} cells) vs {} concrete solve(s) \
+             totaling {concrete_total:?}",
+            concrete_machines.len(),
+        );
+    }
+}
+
 /// Scenario (f): projecting the cuda-split solution onto concrete machines.
 /// A machine with cuda >= 12.1 selects the cuda cell, a machine without
 /// cuda selects the baseline cell, and a machine with an older cuda is
