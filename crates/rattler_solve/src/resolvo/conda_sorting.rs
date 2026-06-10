@@ -356,6 +356,17 @@ pub(super) fn find_highest_version(
     highest_version_cache
         .entry(match_spec_id)
         .or_insert_with(|| {
+            // Environment (symbolic virtual) packages have no candidate
+            // records by definition, so they cannot contribute a version to
+            // the ordering. Requesting their candidates would panic.
+            let dependency_name = solver
+                .provider()
+                .pool
+                .resolve_version_set_package_name(match_spec_id);
+            if solver.provider().is_environment_package(dependency_name) {
+                return None;
+            }
+
             let candidates = solver
                 .get_or_cache_matching_candidates(match_spec_id)
                 .now_or_never()

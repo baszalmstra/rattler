@@ -404,6 +404,65 @@ fn bench_universal_vs_concrete_solves() {
     }
 }
 
+/// Regression test: candidate sorting must not fetch candidates for
+/// environment packages. Two builds of the same package with equal version
+/// and build number (differing only in build string) that both *depend* on
+/// `__cuda` force the dependency tie-break in the candidate sorter, which
+/// looks up the highest version of every shared dependency name. `__cuda`
+/// is symbolic and has no candidate records, so that lookup used to panic
+/// (observed on real conda-forge data via `pytorch`, whose cuda build
+/// variants tie exactly like this).
+#[test]
+fn test_universal_sorting_tie_break_on_environment_dependency() {
+    let repodata_json = r#"{
+        "info": { "subdir": "linux-64" },
+        "packages": {
+            "gpu-tool-1.0-cuda_aaa_0.tar.bz2": {
+                "build": "cuda_aaa_0",
+                "build_number": 0,
+                "depends": ["__cuda >=12.0"],
+                "license": "MIT",
+                "name": "gpu-tool",
+                "size": 0,
+                "subdir": "linux-64",
+                "timestamp": 1716314536803,
+                "version": "1.0"
+            },
+            "gpu-tool-1.0-cuda_bbb_0.tar.bz2": {
+                "build": "cuda_bbb_0",
+                "build_number": 0,
+                "depends": ["__cuda >=12.0"],
+                "license": "MIT",
+                "name": "gpu-tool",
+                "size": 0,
+                "subdir": "linux-64",
+                "timestamp": 1716314536804,
+                "version": "1.0"
+            }
+        },
+        "packages.conda": {}
+    }"#;
+    let repo_data: RepoData = serde_json::from_str(repodata_json).unwrap();
+    let records = repo_data
+        .into_repo_data_records(&Channel::from_str("conda-forge", &channel_config()).unwrap());
+
+    let solution =
+        solve_universal(task(&records, &["gpu-tool"], model(&[&["__cuda >=12.0"]]))).unwrap();
+
+    assert_eq!(solution.cells.len(), 1, "expected a single cell");
+    let (condition, cell_records) = &solution.cells[0];
+    insta::assert_snapshot!(
+        rattler_solve::resolvo::display_condition(condition),
+        @"__cuda >=12.0"
+    );
+    assert!(
+        cell_records
+            .iter()
+            .any(|r| r.package_record.name.as_normalized() == "gpu-tool"),
+        "expected gpu-tool in the cell"
+    );
+}
+
 /// Scenario (f): projecting the cuda-split solution onto concrete machines.
 /// A machine with cuda >= 12.1 selects the cuda cell, a machine without
 /// cuda selects the baseline cell, and a machine with an older cuda is
