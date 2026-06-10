@@ -1115,13 +1115,31 @@ where
         })
         .collect();
 
+    // Distinct presences are few (bounded by cell combinations) while merged
+    // entries and edges number in the hundreds, and converting a presence is
+    // expensive (the disjunct simplification fixpoint). Convert each
+    // distinct presence once; `Presence` is `Eq` but not `Hash`, so this is
+    // a linear-scan memo, which is fine at these sizes.
+    let mut presence_cache: Vec<(resolvo::Presence<NameId>, Vec<EnvironmentCondition>)> =
+        Vec::new();
+    let mut cached_convert = |presence: resolvo::Presence<NameId>| -> Vec<EnvironmentCondition> {
+        match presence_cache.iter().find(|(key, _)| *key == presence) {
+            Some((_, converted)) => converted.clone(),
+            None => {
+                let converted = convert_presence(provider, &presence);
+                presence_cache.push((presence, converted.clone()));
+                converted
+            }
+        }
+    };
+
     let merged = solution
         .merged()
         .into_iter()
         .filter_map(|(solvable, presence)| {
             Some((
                 record_for_solvable(provider, solvable)?,
-                convert_presence(provider, &presence),
+                cached_convert(presence),
             ))
         })
         .collect();
@@ -1145,7 +1163,7 @@ where
                 parent,
                 requirement: edge.requirement.display(provider).to_string(),
                 target,
-                presence: convert_presence(provider, &presence),
+                presence: cached_convert(presence),
             })
         })
         .collect();
