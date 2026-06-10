@@ -17,10 +17,203 @@
 use std::str::FromStr;
 
 use rattler_conda_types::{
-    Component, Version, VersionBumpType, VersionSpec,
+    Component, NamelessMatchSpec, PackageName, StringMatcher, Version, VersionBumpType,
+    VersionSpec,
     version_spec::{EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator},
 };
+use resolvo::VersionSetRelation;
 use version_ranges::Ranges;
+
+/// The relation between two match specs interpreted as sets of environment
+/// values (a `(version, build_string)` pair describing one virtual package
+/// of one machine).
+///
+/// This is the relation oracle behind
+/// [`resolvo::DependencyProvider::environment_version_set_relation`] for
+/// symbolic virtual packages. Soundness contract: answers other than
+/// [`VersionSetRelation::Unknown`] must be correct; `Unknown` is always
+/// safe.
+///
+/// A spec is the intersection of its version part and its build part:
+///
+/// - the specs are disjoint when their version parts or their build parts
+///   are disjoint,
+/// - one is a subset of the other when both its parts are subsets (where
+///   equality counts as a subset),
+/// - they are equal when both parts are equal,
+/// - anything else is `Unknown`.
+///
+/// Version parts compare through [`version_spec_to_ranges`]; an
+/// unrepresentable part degrades to syntactic equality or `Unknown`. Build
+/// parts compare as exact strings (case-insensitive, like
+/// [`StringMatcher::matches`]), except for the `__archspec` package whose
+/// exact build values compare through the archspec microarchitecture DAG
+/// (see below). Glob and regex build matchers are conservatively `Unknown`.
+///
+/// Any other constraining field on either spec (build number, hashes,
+/// channel, ...) restricts that spec's set in ways this oracle does not
+/// model: a proven `Disjoint` of the version/build parts still holds (a
+/// subset of a disjoint set stays disjoint), every other definite answer
+/// degrades to `Unknown`.
+///
+/// # `__archspec` semantics
+///
+/// For the `__archspec` package an environment literal `__archspec X` means
+/// "the machine's microarchitecture lineage includes `X`", so the set for
+/// `X` is `X` together with all its descendants in the archspec DAG:
+///
+/// - `Y` a descendant of `X` means set(`Y`) is a subset of set(`X`),
+/// - microarchitectures from different families have no common descendant
+///   and are disjoint,
+/// - unrelated microarchitectures within one family may share descendants:
+///   `Unknown`,
+/// - names unknown to the archspec DAG are `Unknown`.
+///
+/// IMPORTANT: these DAG semantics define what an `__archspec` environment
+/// literal MEANS. The projection/evaluation helper that decides which cell
+/// applies to a concrete machine must use the same lineage semantics, and
+/// this deliberately differs from the exact-string matching used for
+/// concrete `__archspec` candidate records in `filter_candidates`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn match_spec_relation(
+    package: &PackageName,
+    a: &NamelessMatchSpec,
+    b: &NamelessMatchSpec,
+) -> VersionSetRelation {
+    use VersionSetRelation::{Equal, Subset, Superset, Unknown};
+
+    let version_relation = version_part_relation(a.version.as_ref(), b.version.as_ref());
+    let build_relation = build_part_relation(package, a.build.as_ref(), b.build.as_ref());
+
+    // A disjoint part proves disjointness of the intersections regardless of
+    // any other field: restricting disjoint sets keeps them disjoint.
+    if version_relation == VersionSetRelation::Disjoint
+        || build_relation == VersionSetRelation::Disjoint
+    {
+        return VersionSetRelation::Disjoint;
+    }
+
+    // Any other definite answer requires that the version/build parts fully
+    // describe the specs.
+    if has_unmodeled_fields(a) || has_unmodeled_fields(b) {
+        return VersionSetRelation::Unknown;
+    }
+
+    let subset = |relation: VersionSetRelation| matches!(relation, Subset | Equal);
+    let superset = |relation: VersionSetRelation| matches!(relation, Superset | Equal);
+    if version_relation == Equal && build_relation == Equal {
+        Equal
+    } else if subset(version_relation) && subset(build_relation) {
+        Subset
+    } else if superset(version_relation) && superset(build_relation) {
+        Superset
+    } else {
+        Unknown
+    }
+}
+
+/// The relation between two optional version parts; a missing part is the
+/// full set.
+fn version_part_relation(a: Option<&VersionSpec>, b: Option<&VersionSpec>) -> VersionSetRelation {
+    let full = Ranges::full();
+    let a_ranges = match a {
+        None => Some(full.clone()),
+        Some(spec) => version_spec_to_ranges(spec),
+    };
+    let b_ranges = match b {
+        None => Some(full),
+        Some(spec) => version_spec_to_ranges(spec),
+    };
+    match (a_ranges, b_ranges) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                VersionSetRelation::Equal
+            } else if a.is_disjoint(&b) {
+                VersionSetRelation::Disjoint
+            } else if a.subset_of(&b) {
+                VersionSetRelation::Subset
+            } else if b.subset_of(&a) {
+                VersionSetRelation::Superset
+            } else {
+                VersionSetRelation::Unknown
+            }
+        }
+        // At least one part is not representable as ranges; syntactically
+        // identical specs still describe the same set.
+        _ if a == b => VersionSetRelation::Equal,
+        _ => VersionSetRelation::Unknown,
+    }
+}
+
+/// The relation between two optional build parts; a missing part is the
+/// full set. See [`match_spec_relation`] for the `__archspec` semantics.
+fn build_part_relation(
+    package: &PackageName,
+    a: Option<&StringMatcher>,
+    b: Option<&StringMatcher>,
+) -> VersionSetRelation {
+    match (a, b) {
+        (None, None) => VersionSetRelation::Equal,
+        (None, Some(_)) => VersionSetRelation::Superset,
+        (Some(_), None) => VersionSetRelation::Subset,
+        (Some(StringMatcher::Exact(a)), Some(StringMatcher::Exact(b))) => {
+            if a.eq_ignore_ascii_case(b) {
+                VersionSetRelation::Equal
+            } else if package.as_normalized() == "__archspec" {
+                archspec_relation(a, b)
+            } else {
+                // The environment has a single build value; two different
+                // exact strings cannot both match it.
+                VersionSetRelation::Disjoint
+            }
+        }
+        // Glob or regex matchers: conservatively unknown.
+        _ => VersionSetRelation::Unknown,
+    }
+}
+
+/// The relation between two distinct microarchitecture names through the
+/// archspec DAG: the set of an `__archspec` literal for name `X` is `X`
+/// together with all its descendants (see [`match_spec_relation`]).
+fn archspec_relation(a: &str, b: &str) -> VersionSetRelation {
+    let targets = archspec::cpu::Microarchitecture::known_targets();
+    let (Some(a), Some(b)) = (targets.get(a), targets.get(b)) else {
+        return VersionSetRelation::Unknown;
+    };
+    if a.decendent_of(b) {
+        // Every machine whose lineage includes `a` also includes `b`.
+        VersionSetRelation::Subset
+    } else if b.decendent_of(a) {
+        VersionSetRelation::Superset
+    } else if a.family().name() != b.family().name() {
+        // Different families (x86_64, aarch64, ppc64le, ...) have no common
+        // descendant: no machine satisfies both.
+        VersionSetRelation::Disjoint
+    } else {
+        // Same family without an ancestor relation: common descendants may
+        // exist (the DAG is not a tree).
+        VersionSetRelation::Unknown
+    }
+}
+
+/// Whether the spec constrains anything beyond the version and build parts
+/// modeled by this oracle.
+fn has_unmodeled_fields(spec: &NamelessMatchSpec) -> bool {
+    spec.build_number.is_some()
+        || spec.file_name.is_some()
+        || spec.extras.is_some()
+        || spec.flags.is_some()
+        || spec.channel.is_some()
+        || spec.subdir.is_some()
+        || spec.namespace.is_some()
+        || spec.md5.is_some()
+        || spec.sha256.is_some()
+        || spec.url.is_some()
+        || spec.license.is_some()
+        || spec.license_family.is_some()
+        || spec.condition.is_some()
+        || spec.track_features.is_some()
+}
 
 /// Converts a [`VersionSpec`] into the equivalent [`Ranges`] over
 /// [`Version`], or `None` when the spec is not exactly representable as an
@@ -226,6 +419,219 @@ mod tests {
 
     fn spec(s: &str) -> VersionSpec {
         VersionSpec::from_str(s, ParseStrictness::Lenient).unwrap()
+    }
+
+    /// Builds a `NamelessMatchSpec` from an optional version spec and an
+    /// optional build matcher.
+    fn nameless(version: Option<&str>, build: Option<&str>) -> NamelessMatchSpec {
+        NamelessMatchSpec {
+            version: version.map(spec),
+            build: build.map(|b| StringMatcher::from_str(b).unwrap()),
+            ..NamelessMatchSpec::default()
+        }
+    }
+
+    fn relation(
+        package: &str,
+        a: (Option<&str>, Option<&str>),
+        b: (Option<&str>, Option<&str>),
+    ) -> VersionSetRelation {
+        match_spec_relation(
+            &PackageName::new_unchecked(package),
+            &nameless(a.0, a.1),
+            &nameless(b.0, b.1),
+        )
+    }
+
+    #[test]
+    fn test_relation_pure_version() {
+        use VersionSetRelation::*;
+        // Every value >=12.1 is also >=11.
+        assert_eq!(
+            relation("__cuda", (Some(">=12.1"), None), (Some(">=11"), None)),
+            Subset
+        );
+        assert_eq!(
+            relation("__cuda", (Some(">=11"), None), (Some(">=12.1"), None)),
+            Superset
+        );
+        assert_eq!(
+            relation("__cuda", (Some(">=12.1"), None), (Some("<12"), None)),
+            Disjoint
+        );
+        assert_eq!(
+            relation("__cuda", (Some(">=11"), None), (Some(">=11"), None)),
+            Equal
+        );
+        // Different spellings of the same set are still equal as ranges.
+        assert_eq!(
+            relation("__cuda", (Some(">=11"), None), (Some(">=11.0"), None)),
+            Equal
+        );
+        // Overlapping without containment.
+        assert_eq!(
+            relation("__cuda", (Some(">=11"), None), (Some("<12"), None)),
+            Unknown
+        );
+        // A missing version part means any version.
+        assert_eq!(
+            relation("__cuda", (None, None), (Some(">=11"), None)),
+            Superset
+        );
+        assert_eq!(
+            relation("__cuda", (Some(">=11"), None), (None, None)),
+            Subset
+        );
+        // Unrepresentable but syntactically identical version parts.
+        assert_eq!(
+            relation("__cuda", (Some("11.0.*"), None), (Some("11.0.*"), None)),
+            Equal
+        );
+        // Unrepresentable and different: no answer.
+        assert_eq!(
+            relation("__cuda", (Some("11.0.*"), None), (Some(">=11"), None)),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn test_relation_archspec_dag() {
+        use VersionSetRelation::*;
+        let arch = |a: &str, b: &str| relation("__archspec", (None, Some(a)), (None, Some(b)));
+        // Equal names.
+        assert_eq!(arch("x86_64", "x86_64"), Equal);
+        // x86_64_v3 descends from x86_64: machines whose lineage includes
+        // v3 are a subset of machines whose lineage includes x86_64.
+        assert_eq!(arch("x86_64_v3", "x86_64"), Subset);
+        assert_eq!(arch("x86_64", "x86_64_v3"), Superset);
+        assert_eq!(arch("x86_64_v4", "x86_64_v3"), Subset);
+        assert_eq!(arch("x86_64_v3", "x86_64_v4"), Superset);
+        // Different families never share a machine.
+        assert_eq!(arch("x86_64", "aarch64"), Disjoint);
+        assert_eq!(arch("zen2", "m1"), Disjoint);
+        // Same family, neither an ancestor of the other: descendants may be
+        // shared, no definite answer.
+        assert_eq!(arch("haswell", "zen2"), Unknown);
+        // Unknown microarchitecture names.
+        assert_eq!(arch("notanarch", "x86_64"), Unknown);
+        // The DAG semantics only apply to __archspec; for other packages
+        // distinct exact builds are plain disjoint strings.
+        assert_eq!(
+            relation("__cuda", (None, Some("x86_64")), (None, Some("x86_64_v3"))),
+            Disjoint
+        );
+    }
+
+    #[test]
+    fn test_relation_build_strings() {
+        use VersionSetRelation::*;
+        // Exact build matchers compare case-insensitively like
+        // StringMatcher::matches does.
+        assert_eq!(
+            relation("__osx", (None, Some("abc")), (None, Some("ABC"))),
+            Equal
+        );
+        assert_eq!(
+            relation("__osx", (None, Some("abc")), (None, Some("abd"))),
+            Disjoint
+        );
+        // A missing build matcher is the full set.
+        assert_eq!(
+            relation("__osx", (None, None), (None, Some("abc"))),
+            Superset
+        );
+        assert_eq!(relation("__osx", (None, Some("abc")), (None, None)), Subset);
+        // Glob and regex matchers are conservatively unknown.
+        assert_eq!(
+            relation("__osx", (None, Some("ab*")), (None, Some("abc"))),
+            Unknown
+        );
+        assert_eq!(
+            relation("__osx", (None, Some("ab*")), (None, Some("ab*"))),
+            Unknown
+        );
+        assert_eq!(
+            relation("__osx", (None, Some("^a.c$")), (None, Some("abc"))),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn test_relation_combined_version_and_build() {
+        use VersionSetRelation::*;
+        // Subset needs both parts to be subsets (equality counts).
+        assert_eq!(
+            relation(
+                "__cuda",
+                (Some(">=12"), Some("abc")),
+                (Some(">=11"), Some("abc"))
+            ),
+            Subset
+        );
+        assert_eq!(
+            relation("__cuda", (Some(">=12"), Some("abc")), (Some(">=11"), None)),
+            Subset
+        );
+        // Version subset but build superset: no containment either way.
+        assert_eq!(
+            relation("__cuda", (Some(">=12"), None), (Some(">=11"), Some("abc"))),
+            Unknown
+        );
+        // A disjoint part makes the whole specs disjoint.
+        assert_eq!(
+            relation(
+                "__cuda",
+                (Some(">=12"), Some("abc")),
+                (Some("<12"), Some("abc"))
+            ),
+            Disjoint
+        );
+        assert_eq!(
+            relation(
+                "__cuda",
+                (Some(">=11"), Some("abc")),
+                (Some(">=11"), Some("abd"))
+            ),
+            Disjoint
+        );
+        assert_eq!(
+            relation(
+                "__cuda",
+                (Some(">=11"), Some("abc")),
+                (Some(">=11"), Some("abc"))
+            ),
+            Equal
+        );
+    }
+
+    #[test]
+    fn test_relation_other_fields_degrade() {
+        use VersionSetRelation::*;
+        let plain = nameless(Some(">=11"), None);
+        let mut with_build_number = nameless(Some(">=11"), None);
+        with_build_number.build_number = Some("3".parse().expect("a valid build number spec"));
+        let cuda = PackageName::new_unchecked("__cuda");
+        // An unmodeled constraining field forbids definite non-disjoint
+        // answers in both directions.
+        assert_eq!(
+            match_spec_relation(&cuda, &plain, &with_build_number),
+            Unknown
+        );
+        assert_eq!(
+            match_spec_relation(&cuda, &with_build_number, &plain),
+            Unknown
+        );
+        assert_eq!(
+            match_spec_relation(&cuda, &with_build_number, &with_build_number),
+            Unknown
+        );
+        // ... but a disjoint version part stays disjoint: restricting either
+        // side further cannot create an overlap.
+        let low = nameless(Some("<11"), None);
+        assert_eq!(
+            match_spec_relation(&cuda, &with_build_number, &low),
+            Disjoint
+        );
     }
 
     fn version(s: &str) -> Version {
@@ -515,6 +921,16 @@ mod tests {
         )
     }
 
+    /// Whether the spec contains a prefix (strict-range) operator, the
+    /// interesting case for boundary coverage.
+    fn has_strict_operator(spec: &VersionSpec) -> bool {
+        match spec {
+            VersionSpec::StrictRange(..) => true,
+            VersionSpec::Group(_, group) => group.iter().any(has_strict_operator),
+            _ => false,
+        }
+    }
+
     /// For every generated `(spec, version)` pair the converted ranges must
     /// agree exactly with `VersionSpec::matches`. Any disagreement is a bug
     /// in the conversion; the conversion is fixed, never the test.
@@ -567,16 +983,6 @@ mod tests {
         }
 
         let specs: Vec<VersionSpec> = (0..600).map(|_| gen_spec(&mut rng, &versions, 2)).collect();
-
-        /// Whether the spec contains a prefix (strict-range) operator, the
-        /// interesting case for boundary coverage.
-        fn has_strict_operator(spec: &VersionSpec) -> bool {
-            match spec {
-                VersionSpec::StrictRange(..) => true,
-                VersionSpec::Group(_, group) => group.iter().any(has_strict_operator),
-                _ => false,
-            }
-        }
 
         let mut convertible = 0usize;
         let mut convertible_strict = 0usize;
