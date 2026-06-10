@@ -40,7 +40,7 @@ use version_ranges::Ranges;
 
 use crate::{
     Version, VersionSpec,
-    version_spec::{EqualityOperator, RangeOperator},
+    version_spec::{EqualityOperator, LogicalOperator, RangeOperator},
 };
 
 /// The reason a [`VersionSpec`] has no exact representation as a
@@ -119,10 +119,10 @@ impl VersionSpec {
     ///
     /// use rattler_conda_types::{ParseStrictness, Version, VersionSpec};
     ///
-    /// let spec = VersionSpec::from_str(">=2.17", ParseStrictness::Strict)?;
+    /// let spec = VersionSpec::from_str(">=2.17,<3", ParseStrictness::Strict)?;
     /// let ranges = spec.to_ranges()?;
     /// assert!(ranges.contains(&Version::from_str("2.28")?));
-    /// assert!(!ranges.contains(&Version::from_str("2.16")?));
+    /// assert!(!ranges.contains(&Version::from_str("3.0")?));
     ///
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -146,7 +146,20 @@ impl VersionSpec {
                 EqualityOperator::NotEquals => Ranges::singleton(limit.clone()).complement(),
             },
             VersionSpec::StrictRange(..) => todo!("implemented in a later step"),
-            VersionSpec::Group(..) => todo!("implemented in a later step"),
+            VersionSpec::Group(LogicalOperator::And, group) => {
+                let mut result = Ranges::full();
+                for sub in group {
+                    result = result.intersection(&sub.to_ranges()?);
+                }
+                result
+            }
+            VersionSpec::Group(LogicalOperator::Or, group) => {
+                let mut result = Ranges::empty();
+                for sub in group {
+                    result = result.union(&sub.to_ranges()?);
+                }
+                result
+            }
         })
     }
 }
@@ -227,5 +240,16 @@ mod tests {
         assert!(any.contains(&version("1.2.3")));
         let none = VersionSpec::None.to_ranges().unwrap();
         assert!(!none.contains(&version("1.2.3")));
+    }
+
+    #[test]
+    fn test_group_operators() {
+        assert_members(
+            ">=2.17,<3.0a0",
+            &["2.17", "2.28"],
+            &["2.16", "3.0a0", "3.0", "3.1"],
+        );
+        // Nested groups.
+        assert_members(">=1.2,<2|>3.1", &["1.5", "3.2"], &["1.1", "2.5", "3.1"]);
     }
 }
