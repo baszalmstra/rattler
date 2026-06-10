@@ -38,7 +38,10 @@
 use thiserror::Error;
 use version_ranges::Ranges;
 
-use crate::{Version, VersionSpec, version_spec::RangeOperator};
+use crate::{
+    Version, VersionSpec,
+    version_spec::{EqualityOperator, RangeOperator},
+};
 
 /// The reason a [`VersionSpec`] has no exact representation as a
 /// [`version_ranges::Ranges`] interval set under [`Version`]'s ordering.
@@ -136,7 +139,12 @@ impl VersionSpec {
                 RangeOperator::Less => Ranges::strictly_lower_than(limit.clone()),
                 RangeOperator::LessEquals => Ranges::lower_than(limit.clone()),
             },
-            VersionSpec::Exact(..) => todo!("implemented in a later step"),
+            // `Version`'s `Eq` agrees with `Ord` (both pad missing components
+            // with zeros), so singleton sets are exact as well.
+            VersionSpec::Exact(op, limit) => match op {
+                EqualityOperator::Equals => Ranges::singleton(limit.clone()),
+                EqualityOperator::NotEquals => Ranges::singleton(limit.clone()).complement(),
+            },
             VersionSpec::StrictRange(..) => todo!("implemented in a later step"),
             VersionSpec::Group(..) => todo!("implemented in a later step"),
         })
@@ -204,6 +212,13 @@ mod tests {
             &["12.0", "12.1a0", "12.1dev"],
             &["12.1", "12.1.0.0", "12.2"],
         );
+    }
+
+    #[test]
+    fn test_exact_operators() {
+        // `Version` equality pads with zeros, so `12.1` == `12.1.0`.
+        assert_members("==12.1", &["12.1", "12.1.0"], &["12.1.1", "12.1a0", "12.0"]);
+        assert_members("!=12.1", &["12.1.1", "12.0", "0"], &["12.1", "12.1.0"]);
     }
 
     #[test]
