@@ -35,12 +35,14 @@
 //! themselves below their own `dev` floor (see
 //! [`VersionSpec::to_ranges`]).
 
+use std::str::FromStr;
+
 use thiserror::Error;
 use version_ranges::Ranges;
 
 use crate::{
-    Version, VersionSpec,
-    version_spec::{EqualityOperator, LogicalOperator, RangeOperator},
+    Component, Version, VersionBumpType, VersionSpec,
+    version_spec::{EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator},
 };
 
 /// The reason a [`VersionSpec`] has no exact representation as a
@@ -145,7 +147,13 @@ impl VersionSpec {
                 EqualityOperator::Equals => Ranges::singleton(limit.clone()),
                 EqualityOperator::NotEquals => Ranges::singleton(limit.clone()).complement(),
             },
-            VersionSpec::StrictRange(..) => todo!("implemented in a later step"),
+            VersionSpec::StrictRange(op, prefix) => match op {
+                StrictRangeOperator::StartsWith | StrictRangeOperator::NotStartsWith => {
+                    todo!("implemented in a later step")
+                }
+                StrictRangeOperator::Compatible => compatible_ranges(&prefix.0)?,
+                StrictRangeOperator::NotCompatible => compatible_ranges(&prefix.0)?.complement(),
+            },
             VersionSpec::Group(LogicalOperator::And, group) => {
                 let mut result = Ranges::full();
                 for sub in group {
@@ -162,6 +170,96 @@ impl VersionSpec {
             }
         })
     }
+}
+
+/// Converts the `Compatible` operator (`~=limit`) into ranges.
+///
+/// `Version::compatible_with(limit)` is `self >= limit` (exact under `Ord`)
+/// AND epoch equality AND `starts_with` on the all-but-last-segment prefix
+/// of `limit`. The `>= limit` part supplies an exact lower bound, which also
+/// cuts away every below-prefix deviation, so only the upper bound of the
+/// `starts_with` component is needed:
+///
+/// - multi-segment limit: the dev floor of the bumped prefix, exactly as in
+///   [`starts_with_ranges`] (`~=1.2.3 -> >=1.2.3, <1.3dev`). The prefix must
+///   be of the supported shape; note a trailing zero segment in the prefix
+///   is again non-representable (`1post` matches `~=1.0.3` while the
+///   `Ord`-equal `1post.0` does not).
+/// - single-segment limit: the prefix is empty and only epoch equality
+///   remains; the upper bound is the dev floor of the next epoch
+///   (`~=2 -> >=2, <1!0dev`).
+fn compatible_ranges(limit: &Version) -> Result<Ranges<Version>, VersionSpecRangesError> {
+    if limit.has_local() {
+        return Err(VersionSpecRangesError::LocalVersionPrefix);
+    }
+    let high = if limit.segment_count() == 1 {
+        next_epoch_floor(limit)
+    } else {
+        let prefix = limit
+            .pop_segments(1)
+            .expect("a multi-segment version can pop one segment");
+        prefix_representability(&prefix)?;
+        let bumped = prefix
+            .bump(VersionBumpType::Last)
+            .expect("a representable prefix ends in a numeral, which can always be bumped");
+        dev_floor(&bumped)
+            .expect("a bumped representable prefix ends in a numeral, so its dev floor is valid")
+    };
+    Ok(Ranges::higher_than(limit.clone()).intersection(&Ranges::strictly_lower_than(high)))
+}
+
+/// Checks that a `starts_with` prefix has the supported shape described in
+/// [`starts_with_ranges`]: no local part, every non-last segment ends in a
+/// numeral component, and the last segment is a single numeral that is only
+/// zero when it is the sole segment.
+fn prefix_representability(prefix: &Version) -> Result<(), VersionSpecRangesError> {
+    if prefix.has_local() {
+        return Err(VersionSpecRangesError::LocalVersionPrefix);
+    }
+    let segment_count = prefix.segments().len();
+    for (index, segment) in prefix.segments().enumerate() {
+        let is_last = index + 1 == segment_count;
+        if is_last {
+            let mut components = segment.components();
+            let single = components.next();
+            if components.next().is_some() {
+                return Err(VersionSpecRangesError::NonNumeralLastPrefixSegment);
+            }
+            match single {
+                Some(Component::Numeral(_)) => {}
+                _ => return Err(VersionSpecRangesError::NonNumeralLastPrefixSegment),
+            }
+            if segment_count > 1 && segment.is_zero() {
+                return Err(VersionSpecRangesError::TrailingZeroPrefix);
+            }
+        } else {
+            match segment.components().next_back() {
+                Some(Component::Numeral(_)) => {}
+                _ => return Err(VersionSpecRangesError::NonNumeralPrefixSegment),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the `dev` pre-release floor of a version: the version with a
+/// `dev` component appended to its last segment (`1.2 -> 1.2dev`). The
+/// floor is only meaningful for versions whose last segment ends in a
+/// numeral, which the exact conversion guarantees through
+/// [`prefix_representability`]; the envelope also applies it to other
+/// shapes, where the result still sorts above every version matching the
+/// corresponding prefix (all that an upper bound needs).
+fn dev_floor(version: &Version) -> Option<Version> {
+    Version::from_str(&format!("{version}dev")).ok()
+}
+
+/// Returns the `dev` floor of the next epoch (`2 -> 1!0dev`), the upper
+/// bound of a single-segment compatible operator: with an empty
+/// all-but-last-segment prefix only epoch equality remains, and every
+/// version of the next epoch sorts at or above this floor.
+fn next_epoch_floor(limit: &Version) -> Version {
+    Version::from_str(&format!("{}!0dev", limit.epoch() + 1))
+        .expect("an epoch followed by a `0dev` segment is a valid version")
 }
 
 #[cfg(test)]
@@ -251,5 +349,42 @@ mod tests {
         );
         // Nested groups.
         assert_members(">=1.2,<2|>3.1", &["1.5", "3.2"], &["1.1", "2.5", "3.1"]);
+    }
+
+    #[test]
+    fn test_compatible_membership() {
+        // `~=2.4` is `>=2.4` and sharing the all-but-last-segment prefix.
+        assert_members(
+            "~=2.4",
+            &["2.4", "2.5", "2.99", "2.4.9"],
+            &["2.3", "3.1", "3.0dev", "1!2.5"],
+        );
+        assert_members(
+            "~=1.2.3",
+            &["1.2.3", "1.2.10", "1.2.3post"],
+            &["1.2.2", "1.3.0", "1.3dev", "2.0"],
+        );
+        // Single-segment limit: only the epoch bounds remain. `~=1` reaches
+        // up to but not into the next epoch: `1999` is compatible, `1!1999`
+        // is not (the upper bound is the next epoch's dev floor, `1!0dev`).
+        assert_members("~=2", &["2", "3", "99.5"], &["1.9", "1!1", "1!3"]);
+        assert_members("~=1", &["1", "1999", "99.5"], &["0.9", "1dev", "1!1999"]);
+    }
+
+    #[test]
+    fn test_compatible_unrepresentable() {
+        // Compatible inherits the prefix shape rules for its
+        // all-but-last-segment prefix: the prefix of `~=1.0.3` is `1.0`,
+        // which ends in a zero segment (`1post` matches `~=1.0.3` while the
+        // `Ord`-equal `1post.0` does not).
+        assert_eq!(
+            spec("~=1.0.3").to_ranges(),
+            Err(VersionSpecRangesError::TrailingZeroPrefix)
+        );
+        // A local part in the limit is refused.
+        assert_eq!(
+            spec("~=1.2+abc").to_ranges(),
+            Err(VersionSpecRangesError::LocalVersionPrefix)
+        );
     }
 }
