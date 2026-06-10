@@ -664,6 +664,12 @@ impl<'a> CondaDependencyProvider<'a> {
         self.records.keys().copied()
     }
 
+    /// Returns true if the given package name is configured as a symbolic
+    /// virtual package (an environment package without candidate records).
+    fn is_environment_package(&self, name: NameId) -> bool {
+        self.symbolic_virtual_packages.contains_key(&name)
+    }
+
     fn extra_condition(&self, package: &PackageName, extra: &str) -> ConditionId {
         let name_id = self.pool.intern_package_name(NameType::Extra {
             package: package.as_normalized().to_owned(),
