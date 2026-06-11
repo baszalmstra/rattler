@@ -1,8 +1,13 @@
 //! Functionality to stream and extract packages directly from a
 //! [`reqwest::Url`] within a [`tokio`] async context.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    sync::Arc,
+};
 
+use async_spooled_tempfile::{SpooledData, SpooledTempFile};
 use fs_err::tokio as tokio_fs;
 use futures_util::stream::TryStreamExt;
 use rattler_conda_types::package::CondaArchiveType;
@@ -24,6 +29,13 @@ use crate::{DownloadReporter, ExtractError, ExtractResult};
 /// decompression. Read more in <https://github.com/conda/rattler/issues/794>
 const DATA_DESCRIPTOR_ERROR_MESSAGE: &str = "The file length is not available in the local header";
 
+/// The buffer size used for I/O chunking (128KB).
+const DEFAULT_BUF_SIZE: usize = 128 * 1024;
+
+/// The amount of package data that is buffered in memory while downloading;
+/// larger packages spill to a temporary file.
+const SPOOL_MEMORY_LIMIT: usize = 5 * 1024 * 1024;
+
 fn error_for_status(response: reqwest::Response) -> reqwest_middleware::Result<Response> {
     response
         .error_for_status()
@@ -35,7 +47,7 @@ async fn get_reader(
     client: reqwest_middleware::ClientWithMiddleware,
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
-) -> Result<impl tokio::io::AsyncRead, ExtractError> {
+) -> Result<impl tokio::io::AsyncRead + Send + Unpin + 'static, ExtractError> {
     if let Some(reporter) = &reporter {
         reporter.on_download_start();
     }
@@ -87,8 +99,89 @@ async fn get_reader(
     }
 }
 
+/// A synchronous reader over fully downloaded package data, either in memory
+/// or in an unnamed temporary file.
+enum SpoolReader {
+    Memory(std::io::Cursor<Vec<u8>>),
+    Disk(std::fs::File),
+}
+
+impl Read for SpoolReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SpoolReader::Memory(cursor) => cursor.read(buf),
+            SpoolReader::Disk(file) => file.read(buf),
+        }
+    }
+}
+
+impl Seek for SpoolReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            SpoolReader::Memory(cursor) => cursor.seek(pos),
+            SpoolReader::Disk(file) => file.seek(pos),
+        }
+    }
+}
+
+/// Drains the given reader into a spooled temporary buffer (in memory up to
+/// [`SPOOL_MEMORY_LIMIT`], on disk beyond that) and returns a synchronous
+/// reader over the downloaded data, positioned at the start.
+///
+/// Downloading to a local buffer first means the HTTP stream is always
+/// consumed at network speed. If extraction were to read from the network
+/// stream directly, a slow extractor would stall the HTTP/2 stream long
+/// enough for servers to reset it (`stream error: unexpected internal
+/// error`), particularly when many packages are fetched concurrently on a
+/// saturated CPU.
+async fn download_to_spool(
+    reader: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+) -> Result<SpoolReader, ExtractError> {
+    let mut spool = SpooledTempFile::new(SPOOL_MEMORY_LIMIT);
+    let mut buffered = BufReader::with_capacity(DEFAULT_BUF_SIZE, reader);
+    tokio::io::copy_buf(&mut buffered, &mut spool)
+        .await
+        .map_err(ExtractError::IoError)?;
+
+    match spool.into_inner().await.map_err(ExtractError::IoError)? {
+        SpooledData::InMemory(mut cursor) => {
+            cursor.set_position(0);
+            Ok(SpoolReader::Memory(cursor))
+        }
+        SpooledData::OnDisk(file) => {
+            let mut file = file.into_std().await;
+            file.seek(SeekFrom::Start(0))
+                .map_err(ExtractError::IoError)?;
+            Ok(SpoolReader::Disk(file))
+        }
+    }
+}
+
+/// Runs the provided extraction closure on a blocking thread.
+async fn run_blocking_extract<F>(f: F) -> Result<ExtractResult, ExtractError>
+where
+    F: FnOnce() -> Result<ExtractResult, ExtractError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(err) => {
+            if let Ok(panic) = err.try_into_panic() {
+                std::panic::resume_unwind(panic);
+            }
+            Err(ExtractError::Cancelled)
+        }
+    }
+}
+
 /// Extracts the contents a `.tar.bz2` package archive from the specified remote
 /// location.
+///
+/// The package data is first downloaded into a spooled buffer (in memory for
+/// small packages, a temporary file for large ones), after which
+/// decompression, hashing and writing the files to disk happen synchronously
+/// on a blocking thread. This avoids the per-file overhead of asynchronous
+/// filesystem operations which dominates extraction time for archives with
+/// many files.
 ///
 /// ```rust,no_run
 /// # #[tokio::main]
@@ -116,16 +209,31 @@ pub async fn extract_tar_bz2(
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
     let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-    // The `response` is used to stream in the package data
-    let result = crate::tokio::async_read::extract_tar_bz2(reader, destination).await?;
+    let spool = download_to_spool(reader).await?;
     if let Some(reporter) = &reporter {
         reporter.on_download_complete();
     }
-    Ok(result)
+
+    // Extract from the local buffer on a blocking thread.
+    let destination = destination.to_owned();
+    run_blocking_extract(move || {
+        crate::read::extract_tar_bz2(
+            std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, spool),
+            &destination,
+        )
+    })
+    .await
 }
 
 /// Extracts the contents a `.conda` package archive from the specified remote
 /// location.
+///
+/// The package data is first downloaded into a spooled buffer (in memory for
+/// small packages, a temporary file for large ones), after which
+/// decompression, hashing and writing the files to disk happen synchronously
+/// on a blocking thread. This avoids the per-file overhead of asynchronous
+/// filesystem operations which dominates extraction time for archives with
+/// many files.
 ///
 /// ```rust,no_run
 /// # #[tokio::main]
@@ -152,49 +260,42 @@ pub async fn extract_conda(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    // The `response` is used to stream in the package data
-    let reader = get_reader(
-        url.clone(),
-        client.clone(),
-        expected_sha256,
-        reporter.clone(),
-    )
-    .await?;
-    match crate::tokio::async_read::extract_conda(reader, destination).await {
-        Ok(result) => {
-            if let Some(reporter) = &reporter {
-                reporter.on_download_complete();
-            }
-            Ok(result)
-        }
-        // https://github.com/conda/rattler/issues/794
-        Err(ExtractError::ZipError(ZipError::UnsupportedArchive(zip_error)))
-            if (zip_error.contains(DATA_DESCRIPTOR_ERROR_MESSAGE)) =>
-        {
-            tracing::warn!(
-                "Failed to stream decompress conda package from '{}' due to the presence of zip data descriptors. Falling back to non streaming decompression",
-                url
-            );
-            if let Some(reporter) = &reporter {
-                reporter.on_download_complete();
-            }
-            let new_reader =
-                get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-
-            match crate::tokio::async_read::extract_conda_via_buffering(new_reader, destination)
-                .await
-            {
-                Ok(result) => {
-                    if let Some(reporter) = &reporter {
-                        reporter.on_download_complete();
-                    }
-                    Ok(result)
-                }
-                Err(e) => Err(e),
-            }
-        }
-        Err(e) => Err(e),
+    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
+    let mut spool = download_to_spool(reader).await?;
+    if let Some(reporter) = &reporter {
+        reporter.on_download_complete();
     }
+
+    // Extract from the local buffer on a blocking thread. Since the package
+    // data is buffered locally, the zip data-descriptor fallback
+    // (https://github.com/conda/rattler/issues/794) can rewind and retry
+    // without downloading the package a second time.
+    let destination = destination.to_owned();
+    let url_for_log = url.clone();
+    run_blocking_extract(move || {
+        let result = crate::read::extract_conda_via_streaming(
+            std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, &mut spool),
+            &destination,
+        );
+
+        match result {
+            Err(ExtractError::ZipError(ZipError::UnsupportedArchive(zip_error)))
+                if (zip_error.contains(DATA_DESCRIPTOR_ERROR_MESSAGE)) =>
+            {
+                tracing::warn!(
+                    "Failed to stream decompress conda package from '{}' due to the presence of zip data descriptors. Falling back to non streaming decompression",
+                    url_for_log
+                );
+                spool.seek(SeekFrom::Start(0))?;
+                crate::read::extract_conda_via_buffering(
+                    std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, spool),
+                    &destination,
+                )
+            }
+            other => other,
+        }
+    })
+    .await
 }
 
 /// Extracts the contents a package archive from the specified remote location.
