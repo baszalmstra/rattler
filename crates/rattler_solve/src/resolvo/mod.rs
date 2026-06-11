@@ -766,15 +766,21 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
 
         // Add regular dependencies
         for depends in record.package_record.depends.iter() {
-            // Try to parse the dependency and check for overrides.
-            let dep_str = match MatchSpec::from_str(
-                depends,
-                ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
-            ) {
-                Ok(dep_spec) => self
-                    .apply_dependency_override(record, &dep_spec)
-                    .unwrap_or_else(|| depends.clone()),
-                Err(_) => depends.clone(),
+            // Try to parse the dependency and check for overrides. Checking
+            // for an override requires parsing the spec outside of the
+            // parsing cache, so only do this when overrides are configured.
+            let dep_str = if self.dependency_overrides.is_empty() {
+                depends.clone()
+            } else {
+                match MatchSpec::from_str(
+                    depends,
+                    ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
+                ) {
+                    Ok(dep_spec) => self
+                        .apply_dependency_override(record, &dep_spec)
+                        .unwrap_or_else(|| depends.clone()),
+                    Err(_) => depends.clone(),
+                }
             };
             let specs = match parse_match_spec(&self.pool, &dep_str, &mut parse_match_spec_cache) {
                 Ok(version_set_id) => version_set_id,

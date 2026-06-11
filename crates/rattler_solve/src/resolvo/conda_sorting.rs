@@ -277,16 +277,22 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
                 })
         };
 
+        // Precompute the highest version of each shared dependency for every
+        // solvable. Computing this lazily inside the sort comparator would
+        // repeat the work (including cloning versions out of the cache) for
+        // every comparison.
+        let highest_versions: HashMap<(SolvableId, NameId), Option<TrackedFeatureVersion>> =
+            id_and_deps
+                .iter()
+                .map(|(&key, version_set_ids)| (key, find_highest_version_for_set(version_set_ids)))
+                .collect();
+
         // Sort the solvables by comparing the highest version of the shared
         // dependencies in alphabetic order.
         solvables.sort_by(|a, b| {
             for &name in sorted_unique_names.iter() {
-                let a_version = id_and_deps
-                    .get(&(*a, name))
-                    .and_then(&mut find_highest_version_for_set);
-                let b_version = id_and_deps
-                    .get(&(*b, name))
-                    .and_then(&mut find_highest_version_for_set);
+                let a_version = highest_versions.get(&(*a, name)).and_then(Option::as_ref);
+                let b_version = highest_versions.get(&(*b, name)).and_then(Option::as_ref);
 
                 // Deal with the case where resolving the version set doesn't actually select a
                 // version
@@ -304,7 +310,7 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
                 };
 
                 // Compare the versions
-                match a_version.compare_with_strategy(&b_version, self.dependency_strategy) {
+                match a_version.compare_with_strategy(b_version, self.dependency_strategy) {
                     Ordering::Equal => {
                         // If this version is equal, we continue with the next
                         // dependency
