@@ -81,7 +81,7 @@ pub async fn extract_tar_bz2(
 
     Ok(ExtractResult {
         sha256,
-        md5,
+        md5: Some(md5),
         total_size,
     })
 }
@@ -158,7 +158,7 @@ pub async fn extract_conda(
 
     Ok(ExtractResult {
         sha256,
-        md5,
+        md5: Some(md5),
         total_size,
     })
 }
@@ -225,7 +225,7 @@ pub async fn extract_conda_via_buffering(
 
     Ok(ExtractResult {
         sha256,
-        md5,
+        md5: Some(md5),
         total_size,
     })
 }

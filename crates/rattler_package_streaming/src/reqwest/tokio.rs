@@ -214,12 +214,15 @@ pub async fn extract_tar_bz2(
         reporter.on_download_complete();
     }
 
-    // Extract from the local buffer on a blocking thread.
+    // Extract from the local buffer on a blocking thread. Skip the MD5
+    // computation when we already have a sha256 hash to verify.
+    let compute_md5 = expected_sha256.is_none();
     let destination = destination.to_owned();
     run_blocking_extract(move || {
-        crate::read::extract_tar_bz2(
+        crate::read::extract_tar_bz2_with_options(
             std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, spool),
             &destination,
+            compute_md5,
         )
     })
     .await
@@ -269,13 +272,16 @@ pub async fn extract_conda(
     // Extract from the local buffer on a blocking thread. Since the package
     // data is buffered locally, the zip data-descriptor fallback
     // (https://github.com/conda/rattler/issues/794) can rewind and retry
-    // without downloading the package a second time.
+    // without downloading the package a second time. Skip the MD5
+    // computation when we already have a sha256 hash to verify.
+    let compute_md5 = expected_sha256.is_none();
     let destination = destination.to_owned();
     let url_for_log = url.clone();
     run_blocking_extract(move || {
-        let result = crate::read::extract_conda_via_streaming(
+        let result = crate::read::extract_conda_via_streaming_with_options(
             std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, &mut spool),
             &destination,
+            compute_md5,
         );
 
         match result {
@@ -287,9 +293,10 @@ pub async fn extract_conda(
                     url_for_log
                 );
                 spool.seek(SeekFrom::Start(0))?;
-                crate::read::extract_conda_via_buffering(
+                crate::read::extract_conda_via_buffering_with_options(
                     std::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, spool),
                     &destination,
+                    compute_md5,
                 )
             }
             other => other,

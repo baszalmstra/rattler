@@ -107,7 +107,9 @@ pub async fn extract(opt: Opt) -> miette::Result<()> {
     );
     println!("  Destination: {}", destination.display());
     println!("  SHA256: {}", hex::encode(result.sha256));
-    println!("  MD5: {}", hex::encode(result.md5));
+    if let Some(md5) = result.md5 {
+        println!("  MD5: {}", hex::encode(md5));
+    }
     println!("  Size: {} bytes", result.total_size);
 
     Ok(())

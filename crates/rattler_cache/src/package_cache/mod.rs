@@ -541,7 +541,8 @@ impl PackageCache {
                                     });
                                 }
                             }  else if let Some(md5) = md5
-                                && md5 != result.md5 {
+                                && let Some(actual_md5) = result.md5
+                                && md5 != actual_md5 {
                                     // Delete the package if the hash does not match.
                                     // Failure here is non-fatal: the TempDir guard will
                                     // clean up on drop; log and continue so the retry
@@ -556,7 +557,7 @@ impl PackageCache {
                                         url: url.clone().redact().to_string(),
                                         destination: destination.display().to_string(),
                                         expected: hex::encode(md5),
-                                        actual: hex::encode(result.md5),
+                                        actual: hex::encode(actual_md5),
                                         total_size: result.total_size,
                                     });
                                 }

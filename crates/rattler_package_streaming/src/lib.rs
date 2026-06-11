@@ -130,8 +130,10 @@ pub struct ExtractResult {
     /// The SHA256 hash of the extracted archive.
     pub sha256: Sha256Hash,
 
-    /// The Md5 hash of the extracted archive.
-    pub md5: Md5Hash,
+    /// The Md5 hash of the extracted archive, if it was computed. Computing
+    /// the MD5 hash is skipped when the caller indicates it only cares about
+    /// the SHA256 hash, since hashing the stream twice is pure overhead.
+    pub md5: Option<Md5Hash>,
 
     /// The total size of the extracted archive in bytes.
     pub total_size: u64,
