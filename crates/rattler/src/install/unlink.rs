@@ -37,6 +37,10 @@ pub enum UnlinkError {
     /// Failed to move a file to the trash
     #[error("failed to move file: {0} to {1}")]
     FailedToMoveFile(String, String, std::io::Error),
+
+    /// The operation was cancelled
+    #[error("the unlink operation was cancelled")]
+    Cancelled,
 }
 
 pub(crate) fn recursively_remove_empty_directories(
@@ -154,9 +158,9 @@ pub async fn empty_trash(target_prefix: &Path) -> Result<(), UnlinkError> {
     Ok(())
 }
 
-async fn move_to_trash(target_prefix: &Prefix, path: &Path) -> Result<(), UnlinkError> {
+fn move_to_trash(target_prefix: &Prefix, path: &Path) -> Result<(), UnlinkError> {
     let mut trash_dest = target_prefix.get_trash_dir();
-    tokio_fs::create_dir_all(&trash_dest).await.map_err(|e| {
+    std::fs::create_dir_all(&trash_dest).map_err(|e| {
         UnlinkError::FailedToCreateDirectory(trash_dest.to_string_lossy().to_string(), e)
     })?;
 
@@ -167,7 +171,7 @@ async fn move_to_trash(target_prefix: &Prefix, path: &Path) -> Result<(), Unlink
     }
     new_filename.push(format!("{}.trash", Uuid::new_v4().simple()));
     trash_dest.push(new_filename);
-    match tokio_fs::rename(path, &trash_dest).await {
+    match std::fs::rename(path, &trash_dest) {
         Ok(_) => Ok(()),
         Err(e) => Err(UnlinkError::FailedToMoveFile(
             path.to_string_lossy().to_string(),
@@ -178,14 +182,50 @@ async fn move_to_trash(target_prefix: &Prefix, path: &Path) -> Result<(), Unlink
 }
 
 /// Completely remove the specified package from the environment.
+///
+/// Removing a package can require thousands of file removals. These run as a
+/// single synchronous batch on a blocking thread instead of dispatching every
+/// removal through the async runtime individually, which costs roughly an
+/// order of magnitude more per file.
 pub async fn unlink_package(
     target_prefix: &Prefix,
     prefix_record: &PrefixRecord,
 ) -> Result<(), UnlinkError> {
+    let target_prefix = target_prefix.clone();
+    let relative_paths: Vec<PathBuf> = prefix_record
+        .paths_data
+        .paths
+        .iter()
+        .map(|p| p.relative_path.clone())
+        .collect();
+    let conda_meta_file = prefix_record.file_name();
+
+    match tokio::task::spawn_blocking(move || {
+        unlink_package_sync(&target_prefix, &relative_paths, &conda_meta_file)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            if let Ok(panic) = err.try_into_panic() {
+                std::panic::resume_unwind(panic);
+            }
+            Err(UnlinkError::Cancelled)
+        }
+    }
+}
+
+/// Synchronously removes all files of a package from the prefix, as well as
+/// its `conda-meta` entry.
+fn unlink_package_sync(
+    target_prefix: &Prefix,
+    relative_paths: &[PathBuf],
+    conda_meta_file: &str,
+) -> Result<(), UnlinkError> {
     // Remove all entries
-    for paths in prefix_record.paths_data.paths.iter() {
-        let p = target_prefix.path().join(&paths.relative_path);
-        match tokio_fs::remove_file(&p).await {
+    for relative_path in relative_paths {
+        let p = target_prefix.path().join(relative_path);
+        match std::fs::remove_file(&p) {
             Ok(_) => {}
             Err(e) => match e.kind() {
                 // Simply ignore if the file is already gone.
@@ -193,10 +233,10 @@ pub async fn unlink_package(
                     // Another process may have already deleted the file. It
                     // doesn't matter, gone is gone.
                 }
-                ErrorKind::PermissionDenied => move_to_trash(target_prefix, &p).await?,
+                ErrorKind::PermissionDenied => move_to_trash(target_prefix, &p)?,
                 _ => {
                     return Err(UnlinkError::FailedToDeleteFile(
-                        paths.relative_path.to_string_lossy().to_string(),
+                        relative_path.to_string_lossy().to_string(),
                         e,
                     ));
                 }
@@ -205,11 +245,9 @@ pub async fn unlink_package(
     }
 
     // Remove the conda-meta file
-    let conda_meta_path = target_prefix
-        .join("conda-meta")
-        .join(prefix_record.file_name());
+    let conda_meta_path = target_prefix.join("conda-meta").join(conda_meta_file);
 
-    match tokio_fs::remove_file(&conda_meta_path).await {
+    match std::fs::remove_file(&conda_meta_path) {
         Ok(_) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // Another process may have already deleted the file. It
