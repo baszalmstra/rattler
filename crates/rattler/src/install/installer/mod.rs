@@ -716,6 +716,7 @@ impl Installer {
                 };
 
                 // Install the package if it was fetched.
+                let mut linked_record = None;
                 if let Some((cache_metadata, record)) = package_to_install.await? {
                     let reporter = reporter
                         .as_deref()
@@ -734,7 +735,7 @@ impl Installer {
                     }
 
                     let link_start = std::time::Instant::now();
-                    link_package(
+                    let prefix_record = link_package(
                         &record,
                         prefix,
                         cache_metadata.path(),
@@ -748,6 +749,7 @@ impl Installer {
                         duration_ms = link_start.elapsed().as_millis() as u64,
                         "linked package into prefix"
                     );
+                    linked_record = Some(prefix_record);
                     if let Some((reporter, index)) = reporter {
                         reporter.on_link_complete(index);
                     }
@@ -758,7 +760,7 @@ impl Installer {
                     reporter.on_transaction_operation_complete(operation_idx);
                 }
 
-                Ok::<_, InstallerError>(())
+                Ok::<_, InstallerError>(linked_record)
             };
 
             pending_link_futures.push(operation_future);
@@ -785,8 +787,11 @@ impl Installer {
 
         // Wait for all transaction operations to finish
         let link_phase_start = std::time::Instant::now();
+        let mut new_prefix_records = Vec::new();
         while let Some(result) = pending_link_futures.next().await {
-            result?;
+            if let Some(prefix_record) = result? {
+                new_prefix_records.push(prefix_record);
+            }
         }
         drop(pending_link_futures);
         tracing::debug!(
@@ -794,10 +799,19 @@ impl Installer {
             "download, extract and link phase finished"
         );
 
-        // Post process the transaction
+        // Post process the transaction. All prefix records are known in
+        // memory at this point (the unchanged ones and the freshly linked
+        // ones), so pass them along instead of re-reading the entire
+        // conda-meta directory from disk.
         let post_process_start = std::time::Instant::now();
-        let post_process_result =
-            driver.post_process(&transaction, &prefix, self.reporter.as_deref())?;
+        let mut prefix_records: Vec<PrefixRecord> = transaction.unchanged_packages().to_vec();
+        prefix_records.append(&mut new_prefix_records);
+        let post_process_result = driver.post_process_with_records(
+            &transaction,
+            prefix_records,
+            &prefix,
+            self.reporter.as_deref(),
+        )?;
         tracing::debug!(
             duration_ms = post_process_start.elapsed().as_millis() as u64,
             "post-processing finished"
@@ -833,7 +847,7 @@ async fn link_package(
     install_options: InstallOptions,
     driver: &InstallDriver,
     requested_specs: Vec<String>,
-) -> Result<(), InstallerError> {
+) -> Result<PrefixRecord, InstallerError> {
     let record = record.clone();
     let target_prefix = target_prefix.clone();
     let cached_package_dir = cached_package_dir.to_path_buf();
@@ -873,7 +887,7 @@ async fn link_package(
                     InstallerError::IoError(format!("failed to write {pkg_meta_path}"), e)
                 })?;
 
-            Ok(())
+            Ok(prefix_record)
         };
 
         let _ = tx.send(inner());

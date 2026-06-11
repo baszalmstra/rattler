@@ -247,6 +247,22 @@ impl InstallDriver {
             "collected prefix records for post-processing"
         );
 
+        self.post_process_with_records(transaction, prefix_records, target_prefix, reporter)
+    }
+
+    /// Variant of [`Self::post_process`] that takes the prefix records of the
+    /// environment after the transaction was applied, instead of re-reading
+    /// (and re-parsing) every record from the `conda-meta` directory.
+    pub fn post_process_with_records<
+        Old: Borrow<PrefixRecord> + AsRef<New>,
+        New: AsRef<PackageRecord>,
+    >(
+        &self,
+        transaction: &Transaction<Old, New>,
+        prefix_records: Vec<PrefixRecord>,
+        target_prefix: &Prefix,
+        reporter: Option<&dyn crate::install::installer::Reporter>,
+    ) -> Result<PostProcessResult, PostProcessingError> {
         let required_packages =
             PackageRecord::sort_topologically(prefix_records.iter().collect::<Vec<_>>());
 
