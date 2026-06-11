@@ -872,78 +872,77 @@ pub fn link_package_sync(
     // tasks.
     let python_info = options.python_info;
 
-    // Link the individual files in parallel
+    // Link the individual files in parallel. Parallelism is per file rather
+    // than per directory: packages frequently concentrate most of their files
+    // in a few directories (e.g. `lib/` or `site-packages/`), which would
+    // otherwise serialize the bulk of the work on a single thread.
     let link_target_prefix = target_prefix.clone();
     let package_dir = package_dir.to_path_buf();
     let mut paths = paths_by_directory
         .into_values()
+        .flatten()
         .collect_vec()
         .into_par_iter()
-        .with_min_len(100)
-        .flat_map(move |entries_in_subdir| {
-            let mut path_entries = Vec::with_capacity(entries_in_subdir.len());
-            for link_path in entries_in_subdir {
-                let entry = link_path.entry;
+        .with_min_len(64)
+        .filter_map(move |link_path| {
+            let entry = link_path.entry;
 
-                let is_clobber = link_path.clobber_path.is_some();
-                let link_result = link_file(
-                    &entry,
-                    link_path
-                        .clobber_path
-                        .unwrap_or(link_path.computed_path.clone()),
-                    &package_dir,
-                    target_dir,
-                    &link_target_prefix,
-                    allow_symbolic_links && !entry.no_link,
-                    allow_hard_links && !entry.no_link,
-                    allow_ref_links && !entry.no_link,
-                    platform,
-                    options.apple_codesign_behavior,
-                    modification_time,
-                    options.external_symlink_policy,
-                );
+            let is_clobber = link_path.clobber_path.is_some();
+            let link_result = link_file(
+                &entry,
+                link_path
+                    .clobber_path
+                    .unwrap_or(link_path.computed_path.clone()),
+                &package_dir,
+                target_dir,
+                &link_target_prefix,
+                allow_symbolic_links && !entry.no_link,
+                allow_hard_links && !entry.no_link,
+                allow_ref_links && !entry.no_link,
+                platform,
+                options.apple_codesign_behavior,
+                modification_time,
+                options.external_symlink_policy,
+            );
 
-                let result = match link_result {
-                    Ok(Some(linked_file)) => linked_file,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        return vec![Err(InstallError::FailedToLink(
-                            entry.relative_path.clone(),
-                            e,
-                        ))];
-                    }
-                };
+            let result = match link_result {
+                Ok(Some(linked_file)) => linked_file,
+                Ok(None) => return None,
+                Err(e) => {
+                    return Some(Err(InstallError::FailedToLink(
+                        entry.relative_path.clone(),
+                        e,
+                    )));
+                }
+            };
 
-                // Construct a `PathsEntry` from the result of the linking operation
-                path_entries.push(Ok(prefix_record::PathsEntry {
-                    relative_path: result.relative_path,
-                    original_path: if is_clobber {
-                        Some(link_path.computed_path)
-                    } else {
-                        None
-                    },
-                    path_type: entry.path_type.into(),
-                    no_link: entry.no_link,
-                    sha256: entry.sha256,
-                    // Only set sha256_in_prefix if it differs from the original sha256
-                    sha256_in_prefix: if Some(result.sha256) == entry.sha256 {
-                        None
-                    } else {
-                        Some(result.sha256)
-                    },
-                    size_in_bytes: Some(result.file_size),
-                    file_mode: match result.method {
-                        LinkMethod::Patched(file_mode) => Some(file_mode),
-                        _ => None,
-                    },
-                    prefix_placeholder: entry
-                        .prefix_placeholder
-                        .as_ref()
-                        .map(|p| p.placeholder.clone()),
-                }));
-            }
-
-            path_entries
+            // Construct a `PathsEntry` from the result of the linking operation
+            Some(Ok(prefix_record::PathsEntry {
+                relative_path: result.relative_path,
+                original_path: if is_clobber {
+                    Some(link_path.computed_path)
+                } else {
+                    None
+                },
+                path_type: entry.path_type.into(),
+                no_link: entry.no_link,
+                sha256: entry.sha256,
+                // Only set sha256_in_prefix if it differs from the original sha256
+                sha256_in_prefix: if Some(result.sha256) == entry.sha256 {
+                    None
+                } else {
+                    Some(result.sha256)
+                },
+                size_in_bytes: Some(result.file_size),
+                file_mode: match result.method {
+                    LinkMethod::Patched(file_mode) => Some(file_mode),
+                    _ => None,
+                },
+                prefix_placeholder: entry
+                    .prefix_placeholder
+                    .as_ref()
+                    .map(|p| p.placeholder.clone()),
+            }))
         })
         .collect::<Result<Vec<_>, _>>()?;
 

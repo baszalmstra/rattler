@@ -680,7 +680,7 @@ impl Installer {
                         let _permit = download_semaphore
                             .acquire_owned()
                             .await
-                            .map_err(|_| InstallerError::Cancelled)?;
+                            .map_err(|_err| InstallerError::Cancelled)?;
                         let populate_cache_report = reporter.clone().map(|r| {
                             let cache_index = r.on_populate_cache_start(operation_idx, &record);
                             (r, cache_index)
