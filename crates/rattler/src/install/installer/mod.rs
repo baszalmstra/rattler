@@ -69,6 +69,7 @@ pub struct Installer {
     downloader: Option<LazyClient>,
     execute_link_scripts: bool,
     io_semaphore: Option<Arc<Semaphore>>,
+    download_concurrency_limit: Option<usize>,
     reporter: Option<Arc<dyn Reporter>>,
     target_platform: Option<Platform>,
     apple_code_sign_behavior: AppleCodeSignBehavior,
@@ -142,6 +143,30 @@ impl Installer {
     /// modifies an existing instance.
     pub fn set_io_concurrency_semaphore(&mut self, limit: usize) -> &mut Self {
         self.io_semaphore = Some(Arc::new(Semaphore::new(limit)));
+        self
+    }
+
+    /// Sets the maximum number of packages that are fetched (downloaded and
+    /// extracted into the package cache) concurrently.
+    ///
+    /// Without a limit, one task is started for every package in the
+    /// transaction simultaneously. This can exhaust HTTP/2 stream limits of
+    /// the server and oversubscribes the CPU with concurrent extractions.
+    /// By default, the limit is derived from the available parallelism.
+    #[must_use]
+    pub fn with_download_concurrency_limit(self, limit: usize) -> Self {
+        Self {
+            download_concurrency_limit: Some(limit),
+            ..self
+        }
+    }
+
+    /// Sets the maximum number of packages that are fetched concurrently.
+    ///
+    /// This function is similar to [`Self::with_download_concurrency_limit`],
+    /// but modifies an existing instance.
+    pub fn set_download_concurrency_limit(&mut self, limit: usize) -> &mut Self {
+        self.download_concurrency_limit = Some(limit);
         self
     }
 
@@ -521,6 +546,14 @@ impl Installer {
             .map_err(InstallerError::FailedToDetectInstalledPackages)?;
 
         let downloader = self.downloader.unwrap_or_default();
+        // Limit the number of packages that are fetched (downloaded and
+        // extracted) concurrently. Unbounded fetches can breach HTTP/2
+        // concurrent stream limits and oversubscribe the CPU with parallel
+        // extractions.
+        let download_semaphore = Arc::new(Semaphore::new(
+            self.download_concurrency_limit
+                .unwrap_or_else(default_download_concurrency_limit),
+        ));
         let package_cache = self.package_cache.unwrap_or_else(|| {
             PackageCache::new(
                 default_cache_dir()
@@ -623,6 +656,7 @@ impl Installer {
         {
             let downloader = &downloader;
             let package_cache = &package_cache;
+            let download_semaphore = download_semaphore.clone();
             let reporter = self.reporter.clone();
             let base_install_options = &base_install_options;
             let driver = &driver;
@@ -641,7 +675,12 @@ impl Installer {
                     let downloader = downloader.clone();
                     let reporter = reporter.clone();
                     let package_cache = package_cache.clone();
+                    let download_semaphore = download_semaphore.clone();
                     tokio::spawn(async move {
+                        let _permit = download_semaphore
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| InstallerError::Cancelled)?;
                         let populate_cache_report = reporter.clone().map(|r| {
                             let cache_index = r.on_populate_cache_start(operation_idx, &record);
                             (r, cache_index)
@@ -777,6 +816,14 @@ impl Installer {
             clobbered_paths: post_process_result.clobbered_paths,
         })
     }
+}
+
+/// The default maximum number of packages fetched (downloaded and extracted)
+/// concurrently, derived from the available parallelism.
+fn default_download_concurrency_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() * 2).clamp(8, 50))
+        .unwrap_or(16)
 }
 
 async fn link_package(
