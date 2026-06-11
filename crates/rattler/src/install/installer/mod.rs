@@ -394,6 +394,7 @@ impl Installer {
         // can start this in parallel with the other operations and resolve it
         // when we need it.
         let installed_provided = self.installed.is_some();
+        let detect_start = std::time::Instant::now();
         let mut installed: Vec<InstallationResultRecord> = if let Some(installed) = self.installed {
             installed
                 .into_iter()
@@ -413,6 +414,11 @@ impl Installer {
             .map(InstallationResultRecord::Min)
             .collect()
         };
+        tracing::debug!(
+            duration_ms = detect_start.elapsed().as_millis() as u64,
+            provided = installed_provided,
+            "detected installed packages"
+        );
 
         // Construct a transaction from the current and desired situation.
         let target_platform = self.target_platform.unwrap_or_else(Platform::current);
@@ -427,6 +433,7 @@ impl Installer {
         // If transaction is non-empty, we need full prefix records for file operations
         // Reload them and reconstruct the transaction with full records
         if !transaction.operations.is_empty() && !installed_provided {
+            let reload_start = std::time::Instant::now();
             let prefix = prefix.clone();
             installed = run_blocking_task(move || {
                 PrefixRecord::collect_from_prefix(&prefix)
@@ -445,6 +452,10 @@ impl Installer {
                 self.ignored_packages.as_ref(),
                 target_platform,
             )?;
+            tracing::debug!(
+                duration_ms = reload_start.elapsed().as_millis() as u64,
+                "reloaded full prefix records and rebuilt transaction"
+            );
         }
 
         let transaction = transaction.to_owned();
@@ -635,6 +646,7 @@ impl Installer {
                             let cache_index = r.on_populate_cache_start(operation_idx, &record);
                             (r, cache_index)
                         });
+                        let populate_start = std::time::Instant::now();
                         let cache_metadata = populate_cache(
                             &record,
                             downloader,
@@ -642,6 +654,11 @@ impl Installer {
                             populate_cache_report.clone(),
                         )
                         .await?;
+                        tracing::debug!(
+                            package = record.package_record.name.as_normalized(),
+                            duration_ms = populate_start.elapsed().as_millis() as u64,
+                            "populated package cache"
+                        );
                         if let Some((reporter, index)) = populate_cache_report {
                             reporter.on_populate_cache_complete(index);
                         }
@@ -677,6 +694,7 @@ impl Installer {
                         install_options.paths_json = Some(paths_json.clone());
                     }
 
+                    let link_start = std::time::Instant::now();
                     link_package(
                         &record,
                         prefix,
@@ -686,6 +704,11 @@ impl Installer {
                         requested_spec,
                     )
                     .await?;
+                    tracing::debug!(
+                        package = record.package_record.name.as_normalized(),
+                        duration_ms = link_start.elapsed().as_millis() as u64,
+                        "linked package into prefix"
+                    );
                     if let Some((reporter, index)) = reporter {
                         reporter.on_link_complete(index);
                     }
@@ -703,10 +726,15 @@ impl Installer {
         }
 
         // Wait for all transaction operations to finish
+        let unlink_start = std::time::Instant::now();
         while let Some(result) = pending_unlink_futures.next().await {
             result?;
         }
         drop(pending_unlink_futures);
+        tracing::debug!(
+            duration_ms = unlink_start.elapsed().as_millis() as u64,
+            "unlink phase finished"
+        );
 
         driver
             .remove_empty_directories(
@@ -717,14 +745,24 @@ impl Installer {
             .map_err(|e| InstallerError::UnlinkError("remove_empty_directories".to_string(), e))?;
 
         // Wait for all transaction operations to finish
+        let link_phase_start = std::time::Instant::now();
         while let Some(result) = pending_link_futures.next().await {
             result?;
         }
         drop(pending_link_futures);
+        tracing::debug!(
+            duration_ms = link_phase_start.elapsed().as_millis() as u64,
+            "download, extract and link phase finished"
+        );
 
         // Post process the transaction
+        let post_process_start = std::time::Instant::now();
         let post_process_result =
             driver.post_process(&transaction, &prefix, self.reporter.as_deref())?;
+        tracing::debug!(
+            duration_ms = post_process_start.elapsed().as_millis() as u64,
+            "post-processing finished"
+        );
 
         if let Some(reporter) = &self.reporter {
             reporter.on_transaction_complete();

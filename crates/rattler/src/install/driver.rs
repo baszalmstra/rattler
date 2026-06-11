@@ -238,15 +238,27 @@ impl InstallDriver {
         target_prefix: &Prefix,
         reporter: Option<&dyn crate::install::installer::Reporter>,
     ) -> Result<PostProcessResult, PostProcessingError> {
+        let collect_start = std::time::Instant::now();
         let prefix_records: Vec<PrefixRecord> = PrefixRecord::collect_from_prefix(target_prefix)
             .map_err(PostProcessingError::FailedToDetectInstalledPackages)?;
+        tracing::debug!(
+            duration_ms = collect_start.elapsed().as_millis() as u64,
+            records = prefix_records.len(),
+            "collected prefix records for post-processing"
+        );
 
         let required_packages =
             PackageRecord::sort_topologically(prefix_records.iter().collect::<Vec<_>>());
 
+        let unclobber_start = std::time::Instant::now();
         let clobbered_paths = self
             .clobber_registry()
             .unclobber(&required_packages, target_prefix)?;
+        tracing::debug!(
+            duration_ms = unclobber_start.elapsed().as_millis() as u64,
+            clobbered = clobbered_paths.len(),
+            "unclobbered paths"
+        );
 
         // If the clobber mode is set to error, return an error if any
         // clobbering was detected.
