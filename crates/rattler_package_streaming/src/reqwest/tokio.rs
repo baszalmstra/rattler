@@ -1,7 +1,10 @@
 //! Functionality to stream and extract packages directly from a
 //! [`reqwest::Url`] within a [`tokio`] async context.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use fs_err::tokio as tokio_fs;
 use futures_util::stream::TryStreamExt;
@@ -9,7 +12,10 @@ use rattler_conda_types::package::CondaArchiveType;
 use rattler_digest::Sha256Hash;
 use reqwest::Response;
 use tokio::io::BufReader;
-use tokio_util::{either::Either, io::StreamReader};
+use tokio_util::{
+    either::Either,
+    io::{StreamReader, SyncIoBridge},
+};
 use tracing;
 use url::Url;
 use zip::result::ZipError;
@@ -116,12 +122,51 @@ pub async fn extract_tar_bz2(
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
     let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-    // The `response` is used to stream in the package data
-    let result = crate::tokio::async_read::extract_tar_bz2(reader, destination).await?;
+    // The `response` is used to stream in the package data.
+    //
+    // Extraction runs synchronously on a single blocking thread. Extracting
+    // through async filesystem APIs dispatches every file operation to the
+    // blocking thread pool individually which becomes a significant overhead
+    // for archives with many small files.
+    let result = run_sync_extraction(reader, destination.to_owned(), |reader, destination| {
+        crate::read::extract_tar_bz2(reader, &destination)
+    })
+    .await?;
     if let Some(reporter) = &reporter {
         reporter.on_download_complete();
     }
     Ok(result)
+}
+
+/// Bridges the asynchronous `reader` into blocking code and runs the provided
+/// synchronous extraction function on a dedicated thread.
+///
+/// A dedicated thread is used instead of tokio's blocking thread pool because
+/// the extraction blocks until the entire download has been streamed in. The
+/// blocking pool may be configured with a small upper limit, and occupying it
+/// with long-running tasks can starve the runtime: undownloaded response
+/// bodies then stall HTTP/2 connection flow control which in turn deadlocks
+/// the downloads that are being extracted.
+async fn run_sync_extraction<R, F>(
+    reader: R,
+    destination: PathBuf,
+    extract: F,
+) -> Result<ExtractResult, ExtractError>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    F: FnOnce(SyncIoBridge<R>, PathBuf) -> Result<ExtractResult, ExtractError> + Send + 'static,
+{
+    // The bridge must be constructed within the async context.
+    let sync_reader = SyncIoBridge::new(reader);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(String::from("package-extract"))
+        .spawn(move || {
+            let _ = tx.send(extract(sync_reader, destination));
+        })
+        .map_err(ExtractError::IoError)?;
+    // The sender is dropped without sending if the extraction panicked.
+    rx.await.unwrap_or(Err(ExtractError::Cancelled))
 }
 
 /// Extracts the contents a `.conda` package archive from the specified remote
@@ -152,7 +197,12 @@ pub async fn extract_conda(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    // The `response` is used to stream in the package data
+    // The `response` is used to stream in the package data.
+    //
+    // Extraction runs synchronously on a single blocking thread. Extracting
+    // through async filesystem APIs dispatches every file operation to the
+    // blocking thread pool individually which becomes a significant overhead
+    // for archives with many small files.
     let reader = get_reader(
         url.clone(),
         client.clone(),
@@ -160,7 +210,11 @@ pub async fn extract_conda(
         reporter.clone(),
     )
     .await?;
-    match crate::tokio::async_read::extract_conda(reader, destination).await {
+    match run_sync_extraction(reader, destination.to_owned(), |reader, destination| {
+        crate::read::extract_conda_via_streaming(reader, &destination)
+    })
+    .await
+    {
         Ok(result) => {
             if let Some(reporter) = &reporter {
                 reporter.on_download_complete();
@@ -181,8 +235,10 @@ pub async fn extract_conda(
             let new_reader =
                 get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
 
-            match crate::tokio::async_read::extract_conda_via_buffering(new_reader, destination)
-                .await
+            match run_sync_extraction(new_reader, destination.to_owned(), |reader, destination| {
+                crate::read::extract_conda_via_buffering(reader, &destination)
+            })
+            .await
             {
                 Ok(result) => {
                     if let Some(reporter) = &reporter {
