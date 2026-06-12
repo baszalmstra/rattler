@@ -99,12 +99,16 @@ impl ExtractError {
     /// network streaming operations.
     pub fn should_retry(&self) -> bool {
         match self {
-            // Retry on all I/O errors during streaming - these are typically
+            // Retry on I/O errors during streaming - these are typically
             // transient network issues (broken pipe, connection reset, etc.)
             // The cache layer will clean up partial files on retry.
+            // A full disk or exceeded quota is not transient: retrying only
+            // fails again until something else frees up space.
             // TODO: Add more specific checks for transient I/O errors
-            ExtractError::IoError(_) => true,
-            ExtractError::CouldNotCreateDestination(_) => true,
+            ExtractError::IoError(err) | ExtractError::CouldNotCreateDestination(err) => !matches!(
+                err.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            ),
             #[cfg(feature = "reqwest")]
             ExtractError::ReqwestError(err) => {
                 // Check if this is a connection error (includes broken pipe during connection)
@@ -233,6 +237,24 @@ mod tests {
             "permission denied",
         ));
         assert!(err.should_retry());
+    }
+
+    #[test]
+    fn test_should_not_retry_io_error_storage_full() {
+        let err = ExtractError::IoError(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left on device",
+        ));
+        assert!(!err.should_retry());
+    }
+
+    #[test]
+    fn test_should_not_retry_could_not_create_destination_storage_full() {
+        let err = ExtractError::CouldNotCreateDestination(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left on device",
+        ));
+        assert!(!err.should_retry());
     }
 
     #[test]
