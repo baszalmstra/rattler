@@ -3,13 +3,11 @@
 
 use std::{path::Path, sync::Arc};
 
-use fs_err::tokio as tokio_fs;
 use futures_util::stream::TryStreamExt;
 use rattler_conda_types::package::CondaArchiveType;
 use rattler_digest::Sha256Hash;
 use reqwest::Response;
-use tokio::io::BufReader;
-use tokio_util::{either::Either, io::StreamReader};
+use tokio_util::io::StreamReader;
 use url::Url;
 
 use crate::{
@@ -36,55 +34,67 @@ async fn get_reader(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<impl tokio::io::AsyncRead + Unpin, ExtractError> {
-    if let Some(reporter) = &reporter {
-        reporter.on_download_start();
+    // Send the request for the file
+    let mut request = client.get(url.clone());
+
+    if let Some(sha256) = expected_sha256 {
+        // This is used by the OCI registry middleware to verify the sha256 of the
+        // response
+        request = request.header("X-Expected-Sha256", hex::encode(sha256));
     }
 
-    if url.scheme() == "file" {
-        let file =
-            tokio_fs::File::open(url.to_file_path().expect("Could not convert to file path"))
-                .await
-                .map_err(ExtractError::IoError)?;
+    let response = request
+        .send()
+        .await
+        .and_then(error_for_status)
+        .map_err(ExtractError::ReqwestError)?;
 
-        Ok(Either::Left(BufReader::new(file)))
-    } else {
-        // Send the request for the file
-        let mut request = client.get(url.clone());
-
-        if let Some(sha256) = expected_sha256 {
-            // This is used by the OCI registry middleware to verify the sha256 of the
-            // response
-            request = request.header("X-Expected-Sha256", hex::encode(sha256));
+    let total_bytes = response.content_length();
+    let mut bytes_received = Box::new(0);
+    let byte_stream = response.bytes_stream().inspect_ok(move |frame| {
+        *bytes_received += frame.len() as u64;
+        if let Some(reporter) = &reporter {
+            reporter.on_download_progress(*bytes_received, total_bytes);
         }
+    });
 
-        let response = request
-            .send()
-            .await
-            .and_then(error_for_status)
-            .map_err(ExtractError::ReqwestError)?;
+    // Get the response as a stream
+    Ok(StreamReader::new(byte_stream.map_err(|err| {
+        if err.is_body() {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, err)
+        } else if err.is_decode() {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+        } else {
+            std::io::Error::other(err)
+        }
+    })))
+}
 
-        let total_bytes = response.content_length();
-        let mut bytes_received = Box::new(0);
-        let byte_stream = response.bytes_stream().inspect_ok(move |frame| {
-            *bytes_received += frame.len() as u64;
-            if let Some(reporter) = &reporter {
-                reporter.on_download_progress(*bytes_received, total_bytes);
+/// Extracts a `file://` URL by reading the (seekable) package straight from
+/// disk on a blocking thread; piping a local file through the download
+/// machinery would only add a redundant copy of the data.
+async fn extract_local_file<F>(
+    url: &Url,
+    reporter: Option<Arc<dyn DownloadReporter>>,
+    extract: F,
+) -> Result<ExtractResult, ExtractError>
+where
+    F: FnOnce(&Path) -> Result<ExtractResult, ExtractError> + Send + 'static,
+{
+    let path = url.to_file_path().expect("Could not convert to file path");
+    let result = match tokio::task::spawn_blocking(move || extract(&path)).await {
+        Ok(result) => result?,
+        Err(err) => {
+            if let Ok(panic) = err.try_into_panic() {
+                std::panic::resume_unwind(panic);
             }
-        });
-
-        // Get the response as a stream
-        Ok(Either::Right(StreamReader::new(byte_stream.map_err(
-            |err| {
-                if err.is_body() {
-                    std::io::Error::new(std::io::ErrorKind::Interrupted, err)
-                } else if err.is_decode() {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, err)
-                } else {
-                    std::io::Error::other(err)
-                }
-            },
-        ))))
+            return Err(ExtractError::Cancelled);
+        }
+    };
+    if let Some(reporter) = &reporter {
+        reporter.on_download_complete();
     }
+    Ok(result)
 }
 
 /// Streams `reader` into a spooled pipe while `extract` consumes the other
@@ -176,8 +186,19 @@ pub async fn extract_tar_bz2(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
+    if let Some(reporter) = &reporter {
+        reporter.on_download_start();
+    }
+
     let destination = destination.to_owned();
+    if url.scheme() == "file" {
+        return extract_local_file(&url, reporter, move |path| {
+            crate::fs::extract_tar_bz2(path, &destination)
+        })
+        .await;
+    }
+
+    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
     download_and_extract(reader, reporter, move |pipe| {
         crate::read::extract_tar_bz2(pipe, &destination)
     })
@@ -220,8 +241,19 @@ pub async fn extract_conda(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
+    if let Some(reporter) = &reporter {
+        reporter.on_download_start();
+    }
+
     let destination = destination.to_owned();
+    if url.scheme() == "file" {
+        return extract_local_file(&url, reporter, move |path| {
+            crate::fs::extract_conda(path, &destination)
+        })
+        .await;
+    }
+
+    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
     download_and_extract(reader, reporter, move |pipe| {
         crate::read::extract_conda(pipe, &destination)
     })

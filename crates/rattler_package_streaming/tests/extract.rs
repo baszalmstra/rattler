@@ -667,6 +667,31 @@ mod remote {
         }
     }
 
+    /// `file://` URLs bypass the download pipeline entirely and extract the
+    /// seekable package straight from disk, including the data-descriptor
+    /// fallback.
+    // Skip on windows as the test package contains symbolic links
+    #[cfg_attr(target_os = "windows", ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_extract_file_url() {
+        let path = std::fs::canonicalize(DATA_DESCRIPTOR_PACKAGE).unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+
+        let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("file_url");
+        let result = rattler_package_streaming::reqwest::tokio::extract(
+            client(),
+            url,
+            &target_dir,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hex::encode(result.sha256), DATA_DESCRIPTOR_SHA256);
+        assert_eq!(hex::encode(result.md5), DATA_DESCRIPTOR_MD5);
+    }
+
     /// Stress-tests the failure mode that motivated decoupling download from
     /// extraction: several large real packages extracted concurrently from
     /// conda-forge over HTTPS, in multiple rounds. When extraction applied
