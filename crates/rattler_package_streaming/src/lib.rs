@@ -17,6 +17,9 @@ pub mod seek;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
 
+#[cfg(feature = "reqwest")]
+mod spooled_pipe;
+
 pub mod fs;
 pub mod tokio;
 pub mod write;

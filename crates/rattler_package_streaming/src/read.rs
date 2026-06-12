@@ -11,10 +11,19 @@ use std::{
 };
 use tempfile::SpooledTempFile;
 use zip::read::{ZipArchive, ZipFile, read_zipfile_from_stream};
+use zip::result::ZipError;
 
 /// The minimum safe timestamp (1980-01-01T00:00:00 UTC) for filesystems like exFAT
 /// that do not support timestamps before 1980.
 const SAFE_MTIME_FLOOR: u64 = 315_532_800;
+
+/// zip files may use data descriptors to signal that the decompressor needs to
+/// seek ahead in the buffer to find the compressed data length.
+/// Streaming extraction cannot seek ahead, so this condition surfaces as an
+/// error with this message during decompression. Read more in
+/// <https://github.com/conda/rattler/issues/794>
+pub(crate) const DATA_DESCRIPTOR_ERROR_MESSAGE: &str =
+    "The file length is not available in the local header";
 
 /// Returns the `.tar.bz2` as a decompressed `tar::Archive`. The `tar::Archive` can be used to
 /// extract the files from it, or perform introspection.
@@ -58,6 +67,31 @@ pub fn extract_conda_via_streaming(
         }
         Ok(())
     })
+}
+
+/// Extracts the contents of a `.conda` package archive from a seekable reader.
+///
+/// The archive is extracted by streaming. Archives that use zip data
+/// descriptors cannot be extracted that way (see
+/// <https://github.com/conda/rattler/issues/794>); for those the reader is
+/// rewound to the start and the archive is extracted with
+/// [`extract_conda_via_buffering`] instead.
+pub fn extract_conda(
+    mut reader: impl Read + Seek,
+    destination: &Path,
+) -> Result<ExtractResult, ExtractError> {
+    match extract_conda_via_streaming(&mut reader, destination) {
+        Err(ExtractError::ZipError(ZipError::UnsupportedArchive(message)))
+            if message.contains(DATA_DESCRIPTOR_ERROR_MESSAGE) =>
+        {
+            tracing::warn!(
+                "failed to stream decompress conda package due to the presence of zip data descriptors, falling back to buffered decompression"
+            );
+            reader.seek(SeekFrom::Start(0))?;
+            extract_conda_via_buffering(reader, destination)
+        }
+        result => result,
+    }
 }
 
 /// Extracts the contents of a .conda package archive by fully reading the stream and then decompressing
@@ -128,6 +162,16 @@ fn unpack_tar_archive_sync<R: Read>(
 
     for entry in archive.entries().map_err(ExtractError::IoError)? {
         let mut entry = entry.map_err(ExtractError::IoError)?;
+
+        // On Windows, skip symlink entries as they require special privileges
+        if cfg!(windows) && entry.header().entry_type().is_symlink() {
+            tracing::warn!(
+                "Skipping symlink in tar archive: {}",
+                entry.path().map_err(ExtractError::IoError)?.display()
+            );
+            continue;
+        }
+
         let mtime = entry.header().mtime().unwrap_or(0);
         let is_symlink = entry.header().entry_type().is_symlink();
         let entry_path = entry.path().map_err(ExtractError::IoError)?.into_owned();

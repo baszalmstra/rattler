@@ -22,13 +22,20 @@ pub async fn extract_tar_bz2(
     archive: &Path,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
-    // Open the file for reading using async I/O
-    let file = tokio::fs::File::open(archive)
+    // Spawn a blocking task to perform the extraction
+    let destination = destination.to_owned();
+    let archive = archive.to_owned();
+    match tokio::task::spawn_blocking(move || crate::fs::extract_tar_bz2(&archive, &destination))
         .await
-        .map_err(ExtractError::IoError)?;
-
-    // Use the fully async extraction implementation
-    crate::tokio::async_read::extract_tar_bz2(file, destination).await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            if let Ok(reason) = err.try_into_panic() {
+                std::panic::resume_unwind(reason);
+            }
+            Err(ExtractError::Cancelled)
+        }
+    }
 }
 
 /// Extracts the contents a `.conda` package archive at the specified path to a directory.
