@@ -351,6 +351,7 @@ impl RunExportExtractor {
                 client.clone(),
                 rattler_networking::retry_policies::default_retry_policy(),
                 reporter,
+                None,
             )
             .await
         {

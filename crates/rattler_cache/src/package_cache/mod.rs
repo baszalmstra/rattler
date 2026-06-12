@@ -50,7 +50,6 @@ mod reporter;
 pub struct PackageCache {
     inner: Arc<PackageCacheInner>,
     cache_origin: bool,
-    fetch_semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Default)]
@@ -270,22 +269,6 @@ impl PackageCache {
         }
     }
 
-    /// Limits the number of packages that are fetched (downloaded and
-    /// extracted) into the cache concurrently.
-    ///
-    /// The semaphore only gates actual fetches performed through
-    /// [`Self::get_or_fetch_from_path`], [`Self::get_or_fetch_from_url`] and
-    /// [`Self::get_or_fetch_from_url_with_retry`]: requesting a package that
-    /// is already present and valid in the cache does not require a permit.
-    /// Callers that pass their own fetch function to [`Self::get_or_fetch`]
-    /// are responsible for acquiring a permit in that function themselves.
-    pub fn with_fetch_concurrency_semaphore(self, fetch_semaphore: Arc<Semaphore>) -> Self {
-        Self {
-            fetch_semaphore: Some(fetch_semaphore),
-            ..self
-        }
-    }
-
     /// Acquires a global lock on the package cache.
     ///
     /// This lock can be used to coordinate multiple package operations,
@@ -341,7 +324,6 @@ impl PackageCache {
         Self {
             inner: Arc::new(PackageCacheInner { layers }),
             cache_origin,
-            fetch_semaphore: None,
         }
     }
 
@@ -443,7 +425,7 @@ impl PackageCache {
         client: LazyClient,
         reporter: Option<Arc<dyn CacheReporter>>,
     ) -> Result<CacheMetadata, PackageCacheError> {
-        self.get_or_fetch_from_url_with_retry(pkg, url, client, DoNotRetryPolicy, reporter)
+        self.get_or_fetch_from_url_with_retry(pkg, url, client, DoNotRetryPolicy, reporter, None)
             .await
     }
 
@@ -465,24 +447,11 @@ impl PackageCache {
             cache_key = cache_key.with_path(path);
         }
 
-        let fetch_semaphore = self.fetch_semaphore.clone();
         self.get_or_fetch(
             cache_key,
             move |destination| {
                 let path_buf = path_buf.clone();
-                let fetch_semaphore = fetch_semaphore.clone();
                 async move {
-                    // This closure only runs when the package is missing from
-                    // the cache, so only actual extractions wait for a permit.
-                    let _permit = match fetch_semaphore {
-                        Some(semaphore) => Some(
-                            semaphore
-                                .acquire_owned()
-                                .await
-                                .map_err(|_err| ExtractError::Cancelled)?,
-                        ),
-                        None => None,
-                    };
                     rattler_package_streaming::tokio::fs::extract(&path_buf, &destination)
                         .await
                         .map(|_| ())
@@ -504,6 +473,12 @@ impl PackageCache {
     /// uses the passed in `retry_policy` if, after the request has been sent
     /// and the response is successful, streaming of the package data fails
     /// and the whole request must be retried.
+    ///
+    /// If a `fetch_semaphore` is passed, a permit is acquired before the
+    /// package is downloaded. Since the download only happens when the
+    /// package is missing from the cache, a cache hit never waits for a
+    /// permit. The semaphore can be shared with other operations to bound the
+    /// total number of concurrent downloads.
     #[instrument(skip_all, fields(url=%url))]
     pub async fn get_or_fetch_from_url_with_retry(
         &self,
@@ -512,6 +487,7 @@ impl PackageCache {
         client: LazyClient,
         retry_policy: impl RetryPolicy + Send + 'static + Clone,
         reporter: Option<Arc<dyn CacheReporter>>,
+        fetch_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<CacheMetadata, PackageCacheError> {
         let request_start = SystemTime::now();
         // Convert into cache key
@@ -523,7 +499,6 @@ impl PackageCache {
         let sha256 = cache_key.sha256();
         let md5 = cache_key.md5();
         let download_reporter = reporter.clone();
-        let fetch_semaphore = self.fetch_semaphore.clone();
         // Get or fetch the package, using the specified fetch function
         self.get_or_fetch(cache_key, move |destination| {
             let url = url.clone();
@@ -1470,6 +1445,7 @@ mod test {
                 client.clone().into(),
                 DoNotRetryPolicy,
                 None,
+                None,
             )
             .await;
 
@@ -1487,7 +1463,14 @@ mod test {
 
         // The second one should fail after the 2nd try
         let result = cache
-            .get_or_fetch_from_url_with_retry(identifier, url, client.into(), retry_policy, None)
+            .get_or_fetch_from_url_with_retry(
+                identifier,
+                url,
+                client.into(),
+                retry_policy,
+                None,
+                None,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -1594,8 +1577,8 @@ mod test {
         tokio::spawn(axum::serve(listener, router.into_make_service()).into_future());
 
         let packages_dir = tempdir().unwrap();
-        let cache = PackageCache::new(packages_dir.path())
-            .with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(1)));
+        let cache = PackageCache::new(packages_dir.path());
+        let fetch_semaphore = Arc::new(Semaphore::new(1));
         let server_url = Url::parse(&format!("http://localhost:{}", addr.port())).unwrap();
         let client = ClientBuilder::new(Client::default()).build();
 
@@ -1604,7 +1587,14 @@ mod test {
                 .join(&format!("demo{idx}-0.1.0-cpython.conda"))
                 .unwrap();
             let identifier = CondaArchiveIdentifier::try_from_url(&url).unwrap();
-            cache.get_or_fetch_from_url(identifier, url, client.clone().into(), None)
+            cache.get_or_fetch_from_url_with_retry(
+                identifier,
+                url,
+                client.clone().into(),
+                DoNotRetryPolicy,
+                None,
+                Some(fetch_semaphore.clone()),
+            )
         });
         for result in futures::future::join_all(fetches).await {
             result.unwrap();
@@ -1633,14 +1623,25 @@ mod test {
             .unwrap();
 
         // A fresh cache handle simulates a new process with a warm on-disk
-        // cache. The semaphore has no permits, so any attempt to fetch would
-        // block forever: a cache hit must complete without acquiring a permit.
-        let cache = PackageCache::new(packages_dir.path())
-            .with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(0)));
+        // cache. The semaphore has no permits, so any attempt to download
+        // would block forever: a cache hit must complete without acquiring a
+        // permit. The URL points at an unreachable server for the same
+        // reason: a cache hit must not perform a request at all.
+        let cache = PackageCache::new(packages_dir.path());
+        let url = Url::parse("http://localhost:1/clobber-python-0.1.0-cpython.conda").unwrap();
+        let identifier = CondaArchiveIdentifier::try_from_url(&url).unwrap();
+        let client = ClientBuilder::new(Client::default()).build();
 
         let cache_metadata = tokio::time::timeout(
             Duration::from_secs(60),
-            cache.get_or_fetch_from_path(&package_path, None),
+            cache.get_or_fetch_from_url_with_retry(
+                identifier,
+                url,
+                client.into(),
+                DoNotRetryPolicy,
+                None,
+                Some(Arc::new(Semaphore::new(0))),
+            ),
         )
         .await
         .expect("a cached package must not wait for a fetch permit")

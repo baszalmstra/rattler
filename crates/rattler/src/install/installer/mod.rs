@@ -69,7 +69,7 @@ pub struct Installer {
     downloader: Option<LazyClient>,
     execute_link_scripts: bool,
     io_semaphore: Option<Arc<Semaphore>>,
-    download_concurrency_limit: Option<usize>,
+    download_semaphore: Option<Arc<Semaphore>>,
     reporter: Option<Arc<dyn Reporter>>,
     target_platform: Option<Platform>,
     apple_code_sign_behavior: AppleCodeSignBehavior,
@@ -146,31 +146,63 @@ impl Installer {
         self
     }
 
-    /// Sets the maximum number of packages that are fetched (downloaded and
-    /// extracted into the package cache) concurrently.
+    /// Sets the maximum number of packages that are downloaded (and extracted
+    /// into the package cache) concurrently.
     ///
-    /// Without a limit, a fetch is started for every missing package in the
-    /// transaction at once. This can breach HTTP/2 concurrent stream limits
-    /// of the server, exhaust file descriptors, and oversubscribe the CPU
-    /// with parallel extractions. By default, the limit is derived from the
-    /// available parallelism.
+    /// Without a limit, a download is started for every missing package in
+    /// the transaction at once. This can breach HTTP/2 concurrent stream
+    /// limits of the server, exhaust file descriptors, and oversubscribe the
+    /// CPU with parallel extractions. By default, the limit is derived from
+    /// the available parallelism.
     ///
     /// Packages that are already present in the package cache are not
     /// affected by this limit.
     #[must_use]
     pub fn with_download_concurrency_limit(self, limit: usize) -> Self {
         Self {
-            download_concurrency_limit: Some(limit),
+            download_semaphore: Some(Arc::new(Semaphore::new(limit))),
             ..self
         }
     }
 
-    /// Sets the maximum number of packages that are fetched concurrently.
+    /// Sets the maximum number of packages that are downloaded concurrently.
     ///
     /// This function is similar to [`Self::with_download_concurrency_limit`],
     /// but modifies an existing instance.
     pub fn set_download_concurrency_limit(&mut self, limit: usize) -> &mut Self {
-        self.download_concurrency_limit = Some(limit);
+        self.download_semaphore = Some(Arc::new(Semaphore::new(limit)));
+        self
+    }
+
+    /// Sets a semaphore that bounds how many packages are downloaded (and
+    /// extracted into the package cache) concurrently.
+    ///
+    /// This function is similar to
+    /// [`Self::with_download_concurrency_limit`], but allows sharing the
+    /// semaphore between concurrent installers to bound the total number of
+    /// concurrent downloads.
+    #[must_use]
+    pub fn with_download_concurrency_semaphore(
+        self,
+        download_concurrency_semaphore: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            download_semaphore: Some(download_concurrency_semaphore),
+            ..self
+        }
+    }
+
+    /// Sets a semaphore that bounds how many packages are downloaded
+    /// concurrently.
+    ///
+    /// This function is similar to
+    /// [`Self::with_download_concurrency_semaphore`], but modifies an
+    /// existing instance.
+    pub fn set_download_concurrency_semaphore(
+        &mut self,
+        download_concurrency_semaphore: Arc<Semaphore>,
+    ) -> &mut Self {
+        self.download_semaphore = Some(download_concurrency_semaphore);
         self
     }
 
@@ -547,17 +579,15 @@ impl Installer {
             )
         });
 
-        // Bound the number of packages that are fetched (downloaded and
-        // extracted into the cache) concurrently. Without a bound, a fetch is
+        // Bound the number of packages that are downloaded (and extracted
+        // into the cache) concurrently. Without a bound, a download is
         // started for every missing package at once, which can breach HTTP/2
         // concurrent stream limits of the server, exhaust file descriptors,
         // and oversubscribe the CPU with parallel extractions. Packages that
         // are already in the cache are not gated by this limit.
-        let package_cache =
-            package_cache.with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(
-                self.download_concurrency_limit
-                    .unwrap_or_else(default_download_concurrency_limit),
-            )));
+        let download_semaphore = self
+            .download_semaphore
+            .unwrap_or_else(|| Arc::new(Semaphore::new(default_download_concurrency_limit())));
 
         // Acquire a global lock on the package cache for the entire installation.
         // This significantly reduces overhead by avoiding per-package locking.
@@ -653,6 +683,7 @@ impl Installer {
         {
             let downloader = &downloader;
             let package_cache = &package_cache;
+            let download_semaphore = download_semaphore.clone();
             let reporter = self.reporter.clone();
             let base_install_options = &base_install_options;
             let driver = &driver;
@@ -671,6 +702,7 @@ impl Installer {
                     let downloader = downloader.clone();
                     let reporter = reporter.clone();
                     let package_cache = package_cache.clone();
+                    let download_semaphore = download_semaphore.clone();
                     tokio::spawn(async move {
                         let populate_cache_report = reporter.clone().map(|r| {
                             let cache_index = r.on_populate_cache_start(operation_idx, &record);
@@ -681,6 +713,7 @@ impl Installer {
                             downloader,
                             &package_cache,
                             populate_cache_report.clone(),
+                            download_semaphore,
                         )
                         .await?;
                         if let Some((reporter, index)) = populate_cache_report {
@@ -853,6 +886,7 @@ async fn populate_cache(
     downloader: LazyClient,
     cache: &PackageCache,
     reporter: Option<(Arc<dyn Reporter>, usize)>,
+    download_semaphore: Arc<Semaphore>,
 ) -> Result<CacheMetadata, InstallerError> {
     struct CacheReporterBridge {
         reporter: Arc<dyn Reporter>,
@@ -911,6 +945,7 @@ async fn populate_cache(
                 downloader,
                 default_retry_policy(),
                 reporter,
+                Some(download_semaphore),
             )
             .await
             .map_err(|e| fetch_error_to_installer_error(e, record))
@@ -1336,8 +1371,9 @@ mod tests {
         let (_temp_dir, target_prefix) = create_test_environment();
         let repo_record = create_dummy_repo_record();
 
-        // Use an empty dedicated cache so the package is actually fetched and
-        // the fetch passes through the concurrency semaphore.
+        // An installation with a download concurrency limit must succeed.
+        // Note that the dummy record uses a file:// URL, so it does not pass
+        // through the download semaphore itself.
         let cache_dir = TempDir::new().unwrap();
         let installer = Installer::new()
             .with_package_cache(PackageCache::new(cache_dir.path()))
