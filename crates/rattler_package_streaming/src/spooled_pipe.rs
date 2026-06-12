@@ -1,17 +1,20 @@
 //! A single-producer single-consumer pipe that connects an asynchronous
 //! producer (a package download) to a synchronous consumer (an extractor
-//! running on a blocking thread), buffering in memory up to a limit and
-//! spilling to an unnamed temporary file beyond that.
+//! running on a blocking thread), buffering a sliding window in memory and
+//! spilling to an unnamed temporary file only when the consumer falls behind.
 //!
-//! The pipe is designed around two hard constraints learned from extracting
+//! The pipe is designed around three hard constraints learned from extracting
 //! packages directly from the network:
 //!
 //! 1. The writer never waits for the reader. If the extractor applied
 //!    backpressure to the HTTP stream, servers reset the stream whenever
-//!    concurrent extractions saturate the CPU. Data the reader has not yet
-//!    consumed is kept in memory up to the configured limit and spills to an
-//!    unnamed temporary file beyond that, so the download always proceeds at
-//!    network speed. The spill file lives in the OS page cache; physical disk
+//!    concurrent extractions saturate the CPU. The most recent data is kept
+//!    in a sliding in-memory window; when the window overflows, data the
+//!    reader has already consumed is discarded and only unconsumed data is
+//!    flushed to an unnamed temporary file. A reader that keeps up with the
+//!    download therefore never touches the disk at all, no matter how large
+//!    the package is, and a lagging reader costs only the backlog, not the
+//!    whole stream. The spill file lives in the OS page cache; physical disk
 //!    I/O only happens under memory pressure.
 //! 2. The reader is a plain blocking [`Read`] + [`Seek`] that only ever
 //!    touches memory, a [`std::fs::File`] and a condition variable. It never
@@ -23,12 +26,18 @@
 //!    threads while waiting for data, so any pool dependency on the write
 //!    path deadlocks once the pool is saturated with waiting readers.
 //!
-//! All data is retained until the pipe is dropped, so the reader can seek
-//! backwards over data it already consumed. The zip data-descriptor fallback
-//! relies on this to re-read the package from the start without downloading
-//! it a second time.
+//! The reader may seek backwards over data that is still available: the first
+//! backward seek switches the pipe to full retention, after which nothing is
+//! discarded anymore. The zip data-descriptor handling relies on this: it
+//! decides from the first local file header (30 bytes) that the archive needs
+//! central-directory driven extraction and rewinds while essentially nothing
+//! has been consumed, so nothing has been discarded yet. Seeking back over
+//! data that *was* discarded fails with a [`DiscardedDataError`] marker,
+//! which the remote extraction answers by downloading the package again into
+//! a fully-retaining pipe.
 
 use std::{
+    collections::VecDeque,
     fs::File,
     io::{Read, Seek, SeekFrom},
     sync::{Arc, Condvar, Mutex, MutexGuard},
@@ -77,17 +86,52 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::R
     Ok(())
 }
 
+/// Marker error returned when the reader seeks back to data the pipe already
+/// discarded. The remote extraction recognizes this error and restarts the
+/// download with full retention enabled.
+#[derive(Debug)]
+pub(crate) struct DiscardedDataError;
+
+impl std::fmt::Display for DiscardedDataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the stream data was already consumed and is no longer buffered")
+    }
+}
+
+impl std::error::Error for DiscardedDataError {}
+
+fn discarded_data_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Unsupported, DiscardedDataError)
+}
+
+/// Returns true if `error` marks a seek into discarded pipe data.
+pub(crate) fn is_discarded_data_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<DiscardedDataError>)
+}
+
 /// State shared between the reader and the writer.
 struct State {
-    /// The first `memory_limit` bytes of the stream. Append-only, so the
-    /// reader can copy out of it without invalidation.
-    memory: Vec<u8>,
-    /// Spill file holding all bytes past `memory_limit`. Created lazily on
-    /// the first spill. Byte `memory_limit + n` of the stream lives at offset
-    /// `n` in this file. All access is through positioned reads and writes,
-    /// never the file cursor, so no synchronization is needed beyond the
-    /// commit protocol: the writer only bumps `committed` after the bytes are
-    /// fully written, and the reader only reads below `committed`.
+    /// Sliding in-memory window holding stream bytes
+    /// `[window_start, committed)`.
+    window: VecDeque<u8>,
+    /// Stream offset of the first byte in `window`.
+    window_start: u64,
+    /// Everything in `[retained_from, committed)` is still available (in the
+    /// window or in the spill file); data before it has been discarded.
+    /// Only advances while `retain` is false.
+    retained_from: u64,
+    /// The reader's position, published so the writer can discard consumed
+    /// window overflow instead of flushing it.
+    reader_pos: u64,
+    /// When true nothing is discarded anymore; window overflow is always
+    /// flushed so the reader can seek backwards. Enabled by the first
+    /// backward seek.
+    retain: bool,
+    /// Spill file for window overflow that could not be discarded. Stream
+    /// byte `n` lives at file offset `n`; only flushed ranges are ever
+    /// written (the file is sparse where data was discarded). Created lazily.
     file: Option<Arc<File>>,
     /// Total number of bytes committed to the pipe and readable.
     committed: u64,
@@ -119,12 +163,21 @@ fn clone_error(error: &Arc<std::io::Error>) -> std::io::Error {
     std::io::Error::new(error.kind(), Arc::clone(error))
 }
 
-/// Creates a new spooled pipe that keeps at most `memory_limit` bytes in
-/// memory before spilling to an unnamed temporary file.
-pub(crate) fn spooled_pipe(memory_limit: usize) -> (SpooledPipeWriter, SpooledPipeReader) {
+/// Creates a new spooled pipe that keeps a sliding window of at most
+/// `memory_limit` bytes in memory. With `retain` set, nothing is ever
+/// discarded (window overflow always spills to disk), guaranteeing the reader
+/// can seek back over the entire stream.
+pub(crate) fn spooled_pipe(
+    memory_limit: usize,
+    retain: bool,
+) -> (SpooledPipeWriter, SpooledPipeReader) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
-            memory: Vec::new(),
+            window: VecDeque::new(),
+            window_start: 0,
+            retained_from: 0,
+            reader_pos: 0,
+            retain,
             file: None,
             committed: 0,
             eof: false,
@@ -152,8 +205,9 @@ pub(crate) struct SpooledPipeWriter {
 }
 
 impl SpooledPipeWriter {
-    /// Appends `data` to the pipe. Data within the memory limit is committed
-    /// directly; the remainder is written to the spill file.
+    /// Appends `data` to the pipe. The window overflow this causes is either
+    /// discarded (already consumed by the reader) or flushed to the spill
+    /// file, so a reader that keeps up never causes disk I/O.
     ///
     /// This is deliberately a synchronous, blocking-pool-free operation even
     /// though it is called from async code: spill writes go to an unlinked
@@ -166,43 +220,46 @@ impl SpooledPipeWriter {
     /// writer staying off the blocking pool guarantees downloads always run
     /// to completion, which in turn guarantees blocked readers always wake.
     pub(crate) fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
-        // Commit the prefix that still fits within the memory limit.
-        let (spilled_offset, spill_start) = {
-            let mut state = self.shared.lock();
-            let take = (self.shared.memory_limit - state.memory.len()).min(data.len());
-            if take > 0 {
-                state.memory.extend_from_slice(&data[..take]);
-                state.committed += take as u64;
-                self.shared.progress.notify_all();
-            }
-            (state.committed, take)
-        };
-        if spill_start == data.len() {
-            return Ok(());
-        }
-
-        // Write the remainder to the spill file with a positioned write; the
-        // reader may be reading other regions of the file concurrently.
-        let file = self.spill_file()?;
-        let offset = spilled_offset - self.shared.memory_limit as u64;
-        write_all_at(&file, &data[spill_start..], offset)?;
-
         let mut state = self.shared.lock();
-        state.committed += (data.len() - spill_start) as u64;
+        state.window.extend(data.iter().copied());
+        state.committed += data.len() as u64;
         self.shared.progress.notify_all();
-        drop(state);
+
+        // Evict the window overflow.
+        while state.window.len() > self.shared.memory_limit {
+            let excess = state.window.len() - self.shared.memory_limit;
+            let consumed_front = state.reader_pos.saturating_sub(state.window_start);
+            if !state.retain && consumed_front > 0 {
+                // The reader already consumed the front of the window; drop
+                // it without ever touching the disk.
+                let drop_len = excess.min(usize::try_from(consumed_front).unwrap_or(usize::MAX));
+                state.window.drain(..drop_len);
+                state.window_start += drop_len as u64;
+                state.retained_from = state.window_start;
+            } else {
+                // Flush unconsumed (or retained) overflow to the spill file.
+                // Copy it out so it stays readable from the window until the
+                // write completes, and write without holding the lock. Only
+                // the writer mutates the window, so the front is unchanged
+                // when the lock is re-acquired.
+                let flush: Vec<u8> = state.window.iter().take(excess).copied().collect();
+                let offset = state.window_start;
+                let file = if let Some(file) = &state.file {
+                    file.clone()
+                } else {
+                    let file = Arc::new(tempfile::tempfile()?);
+                    state.file = Some(file.clone());
+                    file
+                };
+                drop(state);
+                write_all_at(&file, &flush, offset)?;
+                state = self.shared.lock();
+                state.window.drain(..flush.len());
+                state.window_start += flush.len() as u64;
+            }
+        }
 
         Ok(())
-    }
-
-    /// Returns the spill file, creating it on first use.
-    fn spill_file(&self) -> std::io::Result<Arc<File>> {
-        if let Some(file) = self.shared.lock().file.clone() {
-            return Ok(file);
-        }
-        let file = Arc::new(tempfile::tempfile()?);
-        self.shared.lock().file = Some(file.clone());
-        Ok(file)
     }
 
     /// Marks the pipe as complete; the reader observes end-of-file after
@@ -243,8 +300,9 @@ impl Drop for SpooledPipeWriter {
 }
 
 /// The synchronous read half of the pipe. Reads block until the writer
-/// commits more data, finishes, or fails. Seeking is supported over the
-/// entire stream; `SeekFrom::End` blocks until the writer is done.
+/// commits more data, finishes, or fails. Seeking backwards is supported over
+/// all data that has not been discarded; the first backward seek stops any
+/// further discarding. `SeekFrom::End` blocks until the writer is done.
 pub(crate) struct SpooledPipeReader {
     shared: Arc<Shared>,
     pos: u64,
@@ -267,6 +325,22 @@ impl SpooledPipeReader {
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+}
+
+/// Copies `window[start..start + out.len()]` into `out`.
+fn copy_from_window(window: &VecDeque<u8>, start: usize, out: &mut [u8]) {
+    let (front, back) = window.as_slices();
+    let len = out.len();
+    if start + len <= front.len() {
+        out.copy_from_slice(&front[start..start + len]);
+    } else if start >= front.len() {
+        let back_start = start - front.len();
+        out.copy_from_slice(&back[back_start..back_start + len]);
+    } else {
+        let split = front.len() - start;
+        out[..split].copy_from_slice(&front[start..]);
+        out[split..].copy_from_slice(&back[..len - split]);
     }
 }
 
@@ -293,29 +367,38 @@ impl Read for SpooledPipeReader {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
 
-        let memory_len = state.memory.len() as u64;
-        if self.pos < memory_len {
-            let start = usize::try_from(self.pos).expect("memory positions fit in usize");
-            let len = out.len().min(state.memory.len() - start);
-            out[..len].copy_from_slice(&state.memory[start..start + len]);
+        if self.pos < state.window_start {
+            // Data before the window was either flushed (when this reader
+            // lagged behind) or discarded; the seek protocol guarantees a
+            // sequential read never enters a discarded region.
+            if self.pos < state.retained_from {
+                return Err(discarded_data_error());
+            }
+            let len = usize::try_from(state.window_start - self.pos)
+                .unwrap_or(usize::MAX)
+                .min(out.len());
+            let file = state
+                .file
+                .clone()
+                .expect("retained data below the window must have been flushed");
+            let offset = self.pos;
+            state.reader_pos = self.pos + len as u64;
+            drop(state);
+
+            read_exact_at(&file, &mut out[..len], offset)?;
             self.pos += len as u64;
             return Ok(len);
         }
 
-        // Committed data past the in-memory prefix is always on disk.
+        // Serve from the in-memory window.
+        let start =
+            usize::try_from(self.pos - state.window_start).expect("window offsets fit in usize");
         let len = usize::try_from(state.committed - self.pos)
             .unwrap_or(usize::MAX)
             .min(out.len());
-        let file = state
-            .file
-            .clone()
-            .expect("committed data past the memory limit must have a spill file");
-        let offset = self.pos - self.shared.memory_limit as u64;
-        drop(state);
-
-        read_exact_at(&file, &mut out[..len], offset)?;
-
+        copy_from_window(&state.window, start, &mut out[..len]);
         self.pos += len as u64;
+        state.reader_pos = self.pos;
         Ok(len)
     }
 }
@@ -327,13 +410,24 @@ impl Seek for SpooledPipeReader {
             SeekFrom::Current(delta) => i128::from(self.pos) + i128::from(delta),
             SeekFrom::End(delta) => i128::from(self.total_len()?) + i128::from(delta),
         };
-        self.pos = u64::try_from(new_pos).map_err(|_out_of_range| {
+        let new_pos = u64::try_from(new_pos).map_err(|_out_of_range| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot seek before the start of the stream",
             )
         })?;
-        Ok(self.pos)
+
+        let mut state = self.shared.lock();
+        if new_pos < self.pos {
+            if new_pos < state.retained_from {
+                return Err(discarded_data_error());
+            }
+            // The reader is re-reading; from now on nothing may be discarded.
+            state.retain = true;
+        }
+        state.reader_pos = new_pos;
+        self.pos = new_pos;
+        Ok(new_pos)
     }
 }
 
@@ -405,7 +499,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn round_trip_stays_in_memory_below_limit() {
         let data = test_data(64 * 1024);
-        let (mut writer, reader) = spooled_pipe(1024 * 1024);
+        let (mut writer, reader) = spooled_pipe(1024 * 1024, false);
 
         write_chunks(&mut writer, &data, 8 * 1024);
         assert!(
@@ -418,20 +512,41 @@ mod tests {
         assert_eq!(result.unwrap(), data);
     }
 
+    /// The core property of the sliding window: a reader that keeps up with
+    /// the writer never causes any disk I/O, no matter how large the stream.
+    #[test]
+    fn fast_consumer_keeps_large_stream_off_disk() {
+        let data = test_data(2 * 1024 * 1024);
+        let (mut writer, mut reader) = spooled_pipe(64 * 1024, false);
+
+        let mut out = vec![0u8; 32 * 1024];
+        for chunk in data.chunks(32 * 1024) {
+            writer.write(chunk).unwrap();
+            reader.read_exact(&mut out[..chunk.len()]).unwrap();
+            assert_eq!(&out[..chunk.len()], chunk);
+        }
+        assert!(
+            writer.shared.lock().file.is_none(),
+            "a reader that keeps up must keep the stream entirely off the disk"
+        );
+        writer.finish();
+    }
+
+    /// Window overflow the reader has not consumed yet must be flushed to
+    /// disk (never dropped) and re-readable.
     #[tokio::test(flavor = "multi_thread")]
-    async fn round_trip_spills_to_disk_above_limit() {
+    async fn unconsumed_overflow_spills_to_disk() {
         let data = test_data(1024 * 1024);
-        let (mut writer, reader) = spooled_pipe(64 * 1024);
-        let consumer = read_to_end_blocking(reader);
+        let (mut writer, reader) = spooled_pipe(64 * 1024, false);
 
         write_chunks(&mut writer, &data, 13 * 1024);
         assert!(
             writer.shared.lock().file.is_some(),
-            "data above the memory limit must spill to a file"
+            "unconsumed data above the memory limit must spill to a file"
         );
         writer.finish();
 
-        let (_, result) = consumer.await.unwrap();
+        let (_, result) = read_to_end_blocking(reader).await.unwrap();
         assert_eq!(result.unwrap(), data);
     }
 
@@ -440,7 +555,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_consumer_does_not_block_writer() {
         let data = test_data(2 * 1024 * 1024);
-        let (mut writer, reader) = spooled_pipe(16 * 1024);
+        let (mut writer, reader) = spooled_pipe(16 * 1024, false);
 
         tokio::time::timeout(Duration::from_secs(30), async {
             write_chunks(&mut writer, &data, 64 * 1024);
@@ -458,7 +573,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_producer_blocks_reader_until_data_arrives() {
         let data = test_data(256 * 1024);
-        let (mut writer, reader) = spooled_pipe(32 * 1024);
+        let (mut writer, reader) = spooled_pipe(32 * 1024, false);
         let consumer = read_to_end_blocking(reader);
 
         for chunk in data.chunks(4 * 1024) {
@@ -493,8 +608,8 @@ mod tests {
                     tokio::spawn(async {
                         let data = test_data(256 * 1024);
                         // A memory limit far below the data size forces
-                        // every pipe to spill.
-                        let (mut writer, mut reader) = spooled_pipe(16 * 1024);
+                        // every pipe to evict its window.
+                        let (mut writer, mut reader) = spooled_pipe(16 * 1024, false);
                         let consumer = tokio::task::spawn_blocking(move || {
                             let mut out = Vec::new();
                             reader.read_to_end(&mut out).map(|_| out)
@@ -521,11 +636,12 @@ mod tests {
     }
 
     /// Seeking back to the start after consuming the stream re-reads the
-    /// retained data. The zip data-descriptor fallback depends on this.
+    /// retained data when nothing was consumed while writing (everything was
+    /// flushed, not discarded).
     #[tokio::test(flavor = "multi_thread")]
     async fn seek_back_and_reread() {
         let data = test_data(512 * 1024);
-        let (mut writer, reader) = spooled_pipe(64 * 1024);
+        let (mut writer, reader) = spooled_pipe(64 * 1024, false);
 
         write_chunks(&mut writer, &data, 32 * 1024);
         writer.finish();
@@ -556,11 +672,72 @@ mod tests {
         assert_eq!(result.unwrap(), data);
     }
 
+    /// Rewinding early (like the zip data-descriptor fallback does, after
+    /// barely consuming anything) switches the pipe to full retention so the
+    /// entire stream can be re-read even while the writer keeps writing.
+    #[test]
+    fn early_rewind_enables_full_reread() {
+        let data = test_data(512 * 1024);
+        let (mut writer, mut reader) = spooled_pipe(64 * 1024, false);
+
+        write_chunks(&mut writer, &data[..16 * 1024], 16 * 1024);
+        let mut head = vec![0u8; 8 * 1024];
+        reader.read_exact(&mut head).unwrap();
+        assert_eq!(head, data[..8 * 1024]);
+
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        write_chunks(&mut writer, &data[16 * 1024..], 32 * 1024);
+        writer.finish();
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// Seeking back over data the pipe already discarded fails with the
+    /// marker error that triggers a fresh, fully-retained download.
+    #[test]
+    fn seek_back_over_discarded_data_fails() {
+        let data = test_data(1024 * 1024);
+        let (mut writer, mut reader) = spooled_pipe(64 * 1024, false);
+
+        // Lock-step consumption discards the consumed window overflow.
+        let mut out = vec![0u8; 32 * 1024];
+        for chunk in data.chunks(32 * 1024) {
+            writer.write(chunk).unwrap();
+            reader.read_exact(&mut out[..chunk.len()]).unwrap();
+        }
+        assert!(writer.shared.lock().file.is_none());
+
+        let error = reader.seek(SeekFrom::Start(0)).unwrap_err();
+        assert!(is_discarded_data_error(&error));
+    }
+
+    /// A fully retaining pipe never discards, so it can always rewind even
+    /// when the reader consumed everything as it arrived.
+    #[test]
+    fn retaining_pipe_allows_rewind_after_lockstep_consumption() {
+        let data = test_data(512 * 1024);
+        let (mut writer, mut reader) = spooled_pipe(64 * 1024, true);
+
+        let mut out = vec![0u8; 32 * 1024];
+        for chunk in data.chunks(32 * 1024) {
+            writer.write(chunk).unwrap();
+            reader.read_exact(&mut out[..chunk.len()]).unwrap();
+        }
+        writer.finish();
+
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut reread = Vec::new();
+        reader.read_to_end(&mut reread).unwrap();
+        assert_eq!(reread, data);
+    }
+
     /// A writer failure is observed only after all committed data is served.
     #[tokio::test(flavor = "multi_thread")]
     async fn error_surfaces_after_committed_data() {
         let data = test_data(128 * 1024);
-        let (mut writer, mut reader) = spooled_pipe(16 * 1024);
+        let (mut writer, mut reader) = spooled_pipe(16 * 1024, false);
 
         write_chunks(&mut writer, &data, 16 * 1024);
         writer.fail(std::io::Error::new(
@@ -584,7 +761,7 @@ mod tests {
     /// reader always wakes up.
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped_writer_unblocks_reader_with_error() {
-        let (mut writer, mut reader) = spooled_pipe(16 * 1024);
+        let (mut writer, mut reader) = spooled_pipe(16 * 1024, false);
         let data = test_data(8 * 1024);
         write_chunks(&mut writer, &data, 8 * 1024);
 

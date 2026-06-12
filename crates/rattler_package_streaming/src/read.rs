@@ -69,22 +69,57 @@ pub fn extract_conda_via_streaming(
     })
 }
 
+/// The fixed-size portion of a zip local file header.
+const ZIP_LOCAL_HEADER_LEN: usize = 30;
+
+/// Returns true when a zip local file header signals that the entry's sizes
+/// are written in a trailing data descriptor (general purpose flag bit 3)
+/// rather than in the header itself.
+fn local_header_uses_data_descriptor(header: &[u8]) -> bool {
+    header.len() >= 8 && header[..4] == [0x50, 0x4b, 0x03, 0x04] && header[6] & 0x08 != 0
+}
+
 /// Extracts the contents of a `.conda` package archive from a seekable reader.
 ///
 /// The archive is extracted by streaming, which computes the hashes and
-/// extracts the entries in a single pass. Archives that use zip data
-/// descriptors cannot be extracted that way (see
-/// <https://github.com/conda/rattler/issues/794>); for those the reader is
-/// rewound to the start and the archive is extracted through the zip central
-/// directory with [`extract_conda_via_seeking`] instead.
+/// extracts the entries in a single pass. Entries whose sizes live in a
+/// trailing zip data descriptor cannot be streamed: the entries are stored
+/// (not deflated) so the data is not self-delimiting, and the sizes are only
+/// available in the central directory at the very end of the archive (see
+/// <https://github.com/conda/rattler/issues/794>). Whether that is the case
+/// is decided upfront from the first local file header, so such archives go
+/// straight to central-directory driven extraction with
+/// [`extract_conda_via_seeking`] without first consuming the stream only to
+/// fail.
 pub fn extract_conda(
     mut reader: impl Read + Seek,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
-    match extract_conda_via_streaming(&mut reader, destination) {
+    // Peek at the first local file header to pick the extraction strategy.
+    let mut header = [0u8; ZIP_LOCAL_HEADER_LEN];
+    let mut peeked = 0;
+    while peeked < header.len() {
+        let read = reader.read(&mut header[peeked..])?;
+        if read == 0 {
+            break;
+        }
+        peeked += read;
+    }
+    if local_header_uses_data_descriptor(&header[..peeked]) {
+        return extract_conda_via_seeking(reader, destination);
+    }
+
+    // Replay the peeked bytes in front of the reader so the streaming path
+    // does not need to seek at all.
+    let result = {
+        let mut replay = std::io::Cursor::new(&header[..peeked]).chain(&mut reader);
+        extract_conda_via_streaming(&mut replay, destination)
+    };
+    match result {
         Err(ExtractError::ZipError(ZipError::UnsupportedArchive(message)))
             if message.contains(DATA_DESCRIPTOR_ERROR_MESSAGE) =>
         {
+            // A later entry still used a data descriptor (mixed archive).
             tracing::warn!(
                 "failed to stream decompress conda package due to the presence of zip data descriptors, falling back to decompression via the zip central directory"
             );

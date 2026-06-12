@@ -131,13 +131,17 @@ where
 /// extraction overlap.
 ///
 /// The two halves are deliberately decoupled: the download never waits for
-/// the extractor (data the extractor has not consumed yet is buffered in
+/// the extractor. Data the extractor has not consumed yet is buffered in
 /// memory up to [`SPOOL_MEMORY_LIMIT`] and spills to a temporary file beyond
-/// that). Reading from the network stream on the extraction thread directly
-/// would stall the HTTP/2 stream whenever the extractor falls behind, which
-/// servers answer with stream resets under concurrent load. The extractor in
-/// turn only ever touches plain memory and a plain [`std::fs::File`], never
-/// the async runtime.
+/// that, while data it has consumed is discarded — an extractor that keeps up
+/// keeps even large packages entirely off the disk. Reading from the network
+/// stream on the extraction thread directly would stall the HTTP/2 stream
+/// whenever the extractor falls behind, which servers answer with stream
+/// resets under concurrent load. The extractor in turn only ever touches
+/// plain memory and a plain [`std::fs::File`], never the async runtime.
+///
+/// With `retain` set, consumed data is kept instead of discarded so the
+/// extractor can seek back over the entire package.
 ///
 /// Both halves always run to completion so no detached extraction keeps
 /// writing to the destination after this function returns. A download error
@@ -147,12 +151,13 @@ where
 async fn download_and_extract<F>(
     reader: impl tokio::io::AsyncRead + Unpin,
     reporter: StartedDownloadReporter,
+    retain: bool,
     extract: F,
 ) -> Result<ExtractResult, ExtractError>
 where
     F: FnOnce(&mut SpooledPipeReader) -> Result<ExtractResult, ExtractError> + Send + 'static,
 {
-    let (writer, mut pipe_reader) = spooled_pipe(SPOOL_MEMORY_LIMIT);
+    let (writer, mut pipe_reader) = spooled_pipe(SPOOL_MEMORY_LIMIT, retain);
 
     let download = async {
         copy_to_pipe(reader, writer, DEFAULT_BUF_SIZE)
@@ -224,7 +229,7 @@ pub async fn extract_tar_bz2(
     }
 
     let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-    download_and_extract(reader, reporter, move |pipe| {
+    download_and_extract(reader, reporter, false, move |pipe| {
         crate::read::extract_tar_bz2(pipe, &destination)
     })
     .await
@@ -276,11 +281,42 @@ pub async fn extract_conda(
         .await;
     }
 
-    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-    download_and_extract(reader, reporter, move |pipe| {
-        crate::read::extract_conda(pipe, &destination)
+    let reader = get_reader(
+        url.clone(),
+        client.clone(),
+        expected_sha256,
+        reporter.clone(),
+    )
+    .await?;
+    let extract_destination = destination.clone();
+    let result = download_and_extract(reader, reporter.clone(), false, move |pipe| {
+        crate::read::extract_conda(pipe, &extract_destination)
     })
-    .await
+    .await;
+
+    match result {
+        // The zip data-descriptor fallback needed to seek back over data the
+        // pipe already discarded, which only happens when the streaming
+        // attempt consumed more than the pipe buffers before failing.
+        // Download the package again into a fully retaining pipe.
+        Err(error) if is_discarded_data_extract_error(&error) => {
+            tracing::warn!(
+                "the conda package from '{url}' requires buffered extraction, but the streamed data was no longer available; downloading the package again"
+            );
+            let reader = get_reader(url, client, expected_sha256, reporter.clone()).await?;
+            download_and_extract(reader, reporter, true, move |pipe| {
+                crate::read::extract_conda(pipe, &destination)
+            })
+            .await
+        }
+        result => result,
+    }
+}
+
+/// Returns true if the extraction failed because the reader had to seek back
+/// over data the spooled pipe had already discarded.
+fn is_discarded_data_extract_error(error: &ExtractError) -> bool {
+    matches!(error, ExtractError::IoError(io) if crate::spooled_pipe::is_discarded_data_error(io))
 }
 
 /// Extracts the contents a package archive from the specified remote location.
