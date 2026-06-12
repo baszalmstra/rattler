@@ -26,6 +26,37 @@
 //!    threads while waiting for data, so any pool dependency on the write
 //!    path deadlocks once the pool is saturated with waiting readers.
 //!
+//! ```text
+//!          async download task                 blocking extraction thread
+//!   network --> SpooledPipeWriter           SpooledPipeReader --> extractor
+//!                    |                                ^
+//!                    | commit + notify                | wait on the condvar
+//!                    v                                | until data is committed
+//!   =========================== shared state ===========================
+//!
+//!   stream:  0           reader_pos        window_start        committed
+//!            |                |                  |                  |
+//!            v                v                  v                  v
+//!            +----------------+------------------+------------------+ . . .
+//!            |    consumed    |     backlog      |      window      |   (writer
+//!            +----------------+------------------+------------------+  appends)
+//!             dropped from      flushed to the     the newest bytes,
+//!             memory, or dead   spill file         in memory (VecDeque,
+//!             in the spill      because the        at most memory_limit)
+//!             file              reader lags
+//!
+//!   spill file:  +--- run 1: consumed, dead ---+--- run 2: live backlog ---+
+//!                +-----------------------------+---------------------------+
+//!                0                             ^ flush_file_start          ^ file_len
+//! ```
+//!
+//! The drawing shows a *lagging* reader. When the reader keeps up
+//! (`reader_pos` inside the window), the overflow leaving the window is
+//! already consumed and is simply discarded — the spill file is never even
+//! created. Flushed runs are packed back to back in the file: the gaps that
+//! discarded data leaves in the stream are not mirrored as holes in the file
+//! (NTFS would physically zero-fill them).
+//!
 //! The pipe is strictly sequential: extraction that needs random access (the
 //! zip data-descriptor case, which is driven by the central directory at the
 //! *end* of the archive) cannot overlap the download anyway and downloads

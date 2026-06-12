@@ -89,7 +89,7 @@ pub(crate) fn local_header_uses_data_descriptor(header: &[u8]) -> bool {
 /// <https://github.com/conda/rattler/issues/794>). Whether that is the case
 /// is decided upfront from the first local file header, so such archives go
 /// straight to central-directory driven extraction with
-/// [`extract_conda_via_seeking`] without first consuming the stream only to
+/// `extract_conda_via_seeking` without first consuming the stream only to
 /// fail.
 pub fn extract_conda(
     mut reader: impl Read + Seek,
