@@ -940,8 +940,9 @@ mod test {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use assert_matches::assert_matches;
@@ -964,7 +965,7 @@ mod test {
     use reqwest_middleware::ClientBuilder;
     use reqwest_retry::RetryTransientMiddleware;
     use tempfile::{TempDir, tempdir};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Semaphore};
     use tokio_stream::StreamExt;
     use url::Url;
 
@@ -1541,10 +1542,6 @@ mod test {
 
     #[tokio::test]
     async fn test_fetch_semaphore_bounds_concurrent_fetches() {
-        use std::{sync::atomic::AtomicUsize, time::Duration};
-
-        use tokio::sync::Semaphore;
-
         // A handler that serves a small test package for any file name and
         // tracks how many requests are in flight at the same time.
         type ServeState = (Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<Vec<u8>>);
@@ -1609,10 +1606,6 @@ mod test {
 
     #[tokio::test]
     async fn test_cached_package_does_not_require_fetch_permit() {
-        use std::time::Duration;
-
-        use tokio::sync::Semaphore;
-
         let packages_dir = tempdir().unwrap();
         let package_path = get_test_data_dir().join("clobber/clobber-python-0.1.0-cpython.conda");
 
