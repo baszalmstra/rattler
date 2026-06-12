@@ -71,11 +71,12 @@ pub fn extract_conda_via_streaming(
 
 /// Extracts the contents of a `.conda` package archive from a seekable reader.
 ///
-/// The archive is extracted by streaming. Archives that use zip data
+/// The archive is extracted by streaming, which computes the hashes and
+/// extracts the entries in a single pass. Archives that use zip data
 /// descriptors cannot be extracted that way (see
 /// <https://github.com/conda/rattler/issues/794>); for those the reader is
-/// rewound to the start and the archive is extracted with
-/// [`extract_conda_via_buffering`] instead.
+/// rewound to the start and the archive is extracted through the zip central
+/// directory with [`extract_conda_via_seeking`] instead.
 pub fn extract_conda(
     mut reader: impl Read + Seek,
     destination: &Path,
@@ -85,13 +86,58 @@ pub fn extract_conda(
             if message.contains(DATA_DESCRIPTOR_ERROR_MESSAGE) =>
         {
             tracing::warn!(
-                "failed to stream decompress conda package due to the presence of zip data descriptors, falling back to buffered decompression"
+                "failed to stream decompress conda package due to the presence of zip data descriptors, falling back to decompression via the zip central directory"
             );
-            reader.seek(SeekFrom::Start(0))?;
-            extract_conda_via_buffering(reader, destination)
+            extract_conda_via_seeking(reader, destination)
         }
         result => result,
     }
+}
+
+/// Extracts the contents of a `.conda` package archive from a seekable reader
+/// using the zip central directory instead of streaming the local headers.
+///
+/// This is the fallback for archives that use zip data descriptors. Unlike
+/// [`extract_conda_via_buffering`] it does not copy the data into yet another
+/// temporary buffer: the seekable source already retains the package, so the
+/// hashes and size are computed in one linear pass and the entries are then
+/// read directly through random access.
+fn extract_conda_via_seeking(
+    mut reader: impl Read + Seek,
+    destination: &Path,
+) -> Result<ExtractResult, ExtractError> {
+    // Delete the destination first as this is used as a fallback from a
+    // failed streaming decompression that may have partially extracted files.
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
+    }
+    std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
+
+    // Compute the hashes and the total size in one linear pass.
+    reader.seek(SeekFrom::Start(0))?;
+    let sha256_reader =
+        rattler_digest::HashingReader::<_, rattler_digest::Sha256>::new(&mut reader);
+    let mut md5_reader =
+        rattler_digest::HashingReader::<_, rattler_digest::Md5>::new(sha256_reader);
+    let mut size_reader = SizeCountingReader::new(&mut md5_reader);
+    copy(&mut size_reader, &mut std::io::sink())?;
+    let (_, total_size) = size_reader.finalize();
+    let (sha256_reader, md5) = md5_reader.finalize();
+    let (_, sha256) = sha256_reader.finalize();
+
+    // Extract the entries through the central directory.
+    reader.seek(SeekFrom::Start(0))?;
+    let mut archive = ZipArchive::new(reader)?;
+    for index in 0..archive.len() {
+        let file = archive.by_index(index)?;
+        extract_zipfile(file, destination)?;
+    }
+
+    Ok(ExtractResult {
+        sha256,
+        md5,
+        total_size,
+    })
 }
 
 /// Extracts the contents of a .conda package archive by fully reading the stream and then decompressing

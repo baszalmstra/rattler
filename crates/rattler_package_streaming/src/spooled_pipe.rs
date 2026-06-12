@@ -30,9 +30,52 @@
 
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     sync::{Arc, Condvar, Mutex, MutexGuard},
 };
+
+/// Writes the whole buffer at the given offset without touching a shared file
+/// cursor, so the reader and the writer can access the spill file
+/// concurrently without locking.
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let written = file.seek_write(buf, offset)?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        buf = &buf[written..];
+        offset += written as u64;
+    }
+    Ok(())
+}
+
+/// Fills the whole buffer from the given offset; the counterpart of
+/// [`write_all_at`].
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let read = file.seek_read(buf, offset)?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[read..];
+        offset += read as u64;
+    }
+    Ok(())
+}
 
 /// State shared between the reader and the writer.
 struct State {
@@ -41,8 +84,11 @@ struct State {
     memory: Vec<u8>,
     /// Spill file holding all bytes past `memory_limit`. Created lazily on
     /// the first spill. Byte `memory_limit + n` of the stream lives at offset
-    /// `n` in this file.
-    file: Option<Arc<Mutex<File>>>,
+    /// `n` in this file. All access is through positioned reads and writes,
+    /// never the file cursor, so no synchronization is needed beyond the
+    /// commit protocol: the writer only bumps `committed` after the bytes are
+    /// fully written, and the reader only reads below `committed`.
+    file: Option<Arc<File>>,
     /// Total number of bytes committed to the pipe and readable.
     committed: u64,
     /// The writer finished successfully; `committed` is the final length.
@@ -135,18 +181,11 @@ impl SpooledPipeWriter {
             return Ok(());
         }
 
-        // Write the remainder to the spill file. The file is shared with the
-        // reader under a mutex and has no stable cursor, so every access
-        // seeks explicitly.
+        // Write the remainder to the spill file with a positioned write; the
+        // reader may be reading other regions of the file concurrently.
         let file = self.spill_file()?;
         let offset = spilled_offset - self.shared.memory_limit as u64;
-        {
-            let mut file = file
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&data[spill_start..])?;
-        }
+        write_all_at(&file, &data[spill_start..], offset)?;
 
         let mut state = self.shared.lock();
         state.committed += (data.len() - spill_start) as u64;
@@ -157,11 +196,11 @@ impl SpooledPipeWriter {
     }
 
     /// Returns the spill file, creating it on first use.
-    fn spill_file(&self) -> std::io::Result<Arc<Mutex<File>>> {
+    fn spill_file(&self) -> std::io::Result<Arc<File>> {
         if let Some(file) = self.shared.lock().file.clone() {
             return Ok(file);
         }
-        let file = Arc::new(Mutex::new(tempfile::tempfile()?));
+        let file = Arc::new(tempfile::tempfile()?);
         self.shared.lock().file = Some(file.clone());
         Ok(file)
     }
@@ -274,12 +313,7 @@ impl Read for SpooledPipeReader {
         let offset = self.pos - self.shared.memory_limit as u64;
         drop(state);
 
-        let mut file = file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut out[..len])?;
-        drop(file);
+        read_exact_at(&file, &mut out[..len], offset)?;
 
         self.pos += len as u64;
         Ok(len)
