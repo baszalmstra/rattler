@@ -198,7 +198,6 @@ impl PackageCacheLayer {
             None,
             None,
             self.validation_mode,
-            None,
         )
         .await
         {
@@ -212,16 +211,11 @@ impl PackageCacheLayer {
     }
 
     /// Validate the package, and fetch it if invalid.
-    ///
-    /// If a `fetch_semaphore` is passed, a permit is acquired before the
-    /// `fetch` function is invoked. Validation itself is not gated by the
-    /// semaphore.
     pub async fn validate_or_fetch<F, Fut, E>(
         &self,
         fetch: F,
         cache_key: &CacheKey,
         reporter: Option<Arc<dyn CacheReporter>>,
-        fetch_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<CacheMetadata, PackageCacheLayerError>
     where
         F: (Fn(PathBuf) -> Fut) + Send + 'static,
@@ -244,7 +238,6 @@ impl PackageCacheLayer {
             Some(fetch),
             reporter,
             self.validation_mode,
-            fetch_semaphore,
         )
         .await
         {
@@ -280,8 +273,12 @@ impl PackageCache {
     /// Limits the number of packages that are fetched (downloaded and
     /// extracted) into the cache concurrently.
     ///
-    /// The semaphore only gates actual fetches: requesting a package that is
-    /// already present and valid in the cache does not require a permit.
+    /// The semaphore only gates actual fetches performed through
+    /// [`Self::get_or_fetch_from_path`], [`Self::get_or_fetch_from_url`] and
+    /// [`Self::get_or_fetch_from_url_with_retry`]: requesting a package that
+    /// is already present and valid in the cache does not require a permit.
+    /// Callers that pass their own fetch function to [`Self::get_or_fetch`]
+    /// are responsible for acquiring a permit in that function themselves.
     pub fn with_fetch_concurrency_semaphore(self, fetch_semaphore: Arc<Semaphore>) -> Self {
         Self {
             fetch_semaphore: Some(fetch_semaphore),
@@ -425,10 +422,7 @@ impl PackageCache {
         // No matches in all layers, let's write to the first writable layer
         tracing::debug!("no matches in all layers. writing to first writable layer");
         if let Some(layer) = writable_layers.first() {
-            return match layer
-                .validate_or_fetch(fetch, &cache_key, reporter, self.fetch_semaphore.clone())
-                .await
-            {
+            return match layer.validate_or_fetch(fetch, &cache_key, reporter).await {
                 Ok(cache_metadata) => Ok(cache_metadata),
                 Err(e) => Err(e.into()),
             };
@@ -471,11 +465,24 @@ impl PackageCache {
             cache_key = cache_key.with_path(path);
         }
 
+        let fetch_semaphore = self.fetch_semaphore.clone();
         self.get_or_fetch(
             cache_key,
             move |destination| {
                 let path_buf = path_buf.clone();
+                let fetch_semaphore = fetch_semaphore.clone();
                 async move {
+                    // This closure only runs when the package is missing from
+                    // the cache, so only actual extractions wait for a permit.
+                    let _permit = match fetch_semaphore {
+                        Some(semaphore) => Some(
+                            semaphore
+                                .acquire_owned()
+                                .await
+                                .map_err(|_err| ExtractError::Cancelled)?,
+                        ),
+                        None => None,
+                    };
                     rattler_package_streaming::tokio::fs::extract(&path_buf, &destination)
                         .await
                         .map(|_| ())
@@ -516,13 +523,26 @@ impl PackageCache {
         let sha256 = cache_key.sha256();
         let md5 = cache_key.md5();
         let download_reporter = reporter.clone();
+        let fetch_semaphore = self.fetch_semaphore.clone();
         // Get or fetch the package, using the specified fetch function
         self.get_or_fetch(cache_key, move |destination| {
             let url = url.clone();
             let client = client.clone();
             let retry_policy = retry_policy.clone();
             let download_reporter = download_reporter.clone();
+            let fetch_semaphore = fetch_semaphore.clone();
             async move {
+                // This closure only runs when the package is missing from the
+                // cache, so only actual downloads wait for a permit.
+                let _permit = match fetch_semaphore {
+                    Some(semaphore) => Some(
+                        semaphore
+                            .acquire_owned()
+                            .await
+                            .map_err(|_err| ExtractError::Cancelled)?,
+                    ),
+                    None => None,
+                };
                 let mut current_try = 0;
                 // Retry until the retry policy says to stop
                 loop {
@@ -715,7 +735,6 @@ async fn validate_package_common<F, Fut, E>(
     fetch: Option<F>,
     reporter: Option<Arc<dyn CacheReporter>>,
     validation_mode: ValidationMode,
-    fetch_semaphore: Option<Arc<Semaphore>>,
 ) -> Result<CacheMetadata, PackageCacheLayerError>
 where
     F: Fn(PathBuf) -> Fut + Send,
@@ -824,19 +843,6 @@ where
     // Since we hold the global cache lock, we can safely update the metadata
     // and fetch the package without worrying about concurrent modifications.
     if let Some(ref fetch_fn) = fetch {
-        // An actual fetch is required, acquire a permit before performing any
-        // side effects. Packages that validated from the cache above never
-        // reach this point and are not gated by the semaphore.
-        let _permit = match fetch_semaphore {
-            Some(semaphore) => Some(
-                semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|_err| PackageCacheLayerError::Cancelled)?,
-            ),
-            None => None,
-        };
-
         // Write the new revision
         let new_revision = cache_revision + 1;
         metadata
@@ -1554,55 +1560,60 @@ mod test {
     async fn test_fetch_semaphore_bounds_concurrent_fetches() {
         use std::{sync::atomic::AtomicUsize, time::Duration};
 
-        use rattler_conda_types::{PackageName, PackageRecord, VersionWithSource};
         use tokio::sync::Semaphore;
+
+        // A handler that serves a small test package for any file name and
+        // tracks how many requests are in flight at the same time.
+        type ServeState = (Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<Vec<u8>>);
+        async fn serve_package(
+            State((in_flight, max_in_flight, package_bytes)): State<ServeState>,
+        ) -> Vec<u8> {
+            let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            (*package_bytes).clone()
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let package_bytes =
+            std::fs::read(get_test_data_dir().join("clobber/clobber-python-0.1.0-cpython.conda"))
+                .unwrap();
+
+        let router = Router::new()
+            .route("/{file}", get(serve_package))
+            .with_state((
+                in_flight.clone(),
+                max_in_flight.clone(),
+                Arc::new(package_bytes),
+            ));
+        let addr = SocketAddr::new([127, 0, 0, 1].into(), 0);
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router.into_make_service()).into_future());
 
         let packages_dir = tempdir().unwrap();
         let cache = PackageCache::new(packages_dir.path())
             .with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(1)));
+        let server_url = Url::parse(&format!("http://localhost:{}", addr.port())).unwrap();
+        let client = ClientBuilder::new(Client::default()).build();
 
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let max_in_flight = Arc::new(AtomicUsize::new(0));
-
-        let mut tasks = Vec::new();
-        for idx in 0..4 {
-            let cache = cache.clone();
-            let in_flight = in_flight.clone();
-            let max_in_flight = max_in_flight.clone();
-            tasks.push(tokio::spawn(async move {
-                let record = PackageRecord::new(
-                    PackageName::new_unchecked(format!("demo-{idx}")),
-                    "1.0".parse::<VersionWithSource>().unwrap(),
-                    "0".to_string(),
-                );
-                cache
-                    .get_or_fetch(
-                        CacheKey::from(&record),
-                        move |_destination: PathBuf| {
-                            let in_flight = in_flight.clone();
-                            let max_in_flight = max_in_flight.clone();
-                            async move {
-                                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                                max_in_flight.fetch_max(current, Ordering::SeqCst);
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                in_flight.fetch_sub(1, Ordering::SeqCst);
-                                Ok::<(), Infallible>(())
-                            }
-                        },
-                        None,
-                    )
-                    .await
-                    .unwrap();
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
+        let fetches = (0..4).map(|idx| {
+            let url = server_url
+                .join(&format!("demo{idx}-0.1.0-cpython.conda"))
+                .unwrap();
+            let identifier = CondaArchiveIdentifier::try_from_url(&url).unwrap();
+            cache.get_or_fetch_from_url(identifier, url, client.clone().into(), None)
+        });
+        for result in futures::future::join_all(fetches).await {
+            result.unwrap();
         }
 
         assert_eq!(
             max_in_flight.load(Ordering::SeqCst),
             1,
-            "the fetch semaphore must bound the number of concurrent fetches"
+            "the fetch semaphore must bound the number of concurrent downloads"
         );
     }
 
@@ -1871,7 +1882,6 @@ mod test {
                         }
                     },
                     &key,
-                    None,
                     None,
                 )
                 .await
