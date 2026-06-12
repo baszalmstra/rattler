@@ -42,7 +42,7 @@ use crate::{
         installer::result_record::InstallationResultRecord,
         link_script::{LinkScriptError, PrePostLinkResult},
     },
-    package_cache::PackageCache,
+    package_cache::{PackageCache, PackageCacheError},
 };
 
 /// Defines which operations can be used to link files to disk.
@@ -69,6 +69,7 @@ pub struct Installer {
     downloader: Option<LazyClient>,
     execute_link_scripts: bool,
     io_semaphore: Option<Arc<Semaphore>>,
+    download_concurrency_limit: Option<usize>,
     reporter: Option<Arc<dyn Reporter>>,
     target_platform: Option<Platform>,
     apple_code_sign_behavior: AppleCodeSignBehavior,
@@ -142,6 +143,34 @@ impl Installer {
     /// modifies an existing instance.
     pub fn set_io_concurrency_semaphore(&mut self, limit: usize) -> &mut Self {
         self.io_semaphore = Some(Arc::new(Semaphore::new(limit)));
+        self
+    }
+
+    /// Sets the maximum number of packages that are fetched (downloaded and
+    /// extracted into the package cache) concurrently.
+    ///
+    /// Without a limit, a fetch is started for every missing package in the
+    /// transaction at once. This can breach HTTP/2 concurrent stream limits
+    /// of the server, exhaust file descriptors, and oversubscribe the CPU
+    /// with parallel extractions. By default, the limit is derived from the
+    /// available parallelism.
+    ///
+    /// Packages that are already present in the package cache are not
+    /// affected by this limit.
+    #[must_use]
+    pub fn with_download_concurrency_limit(self, limit: usize) -> Self {
+        Self {
+            download_concurrency_limit: Some(limit),
+            ..self
+        }
+    }
+
+    /// Sets the maximum number of packages that are fetched concurrently.
+    ///
+    /// This function is similar to [`Self::with_download_concurrency_limit`],
+    /// but modifies an existing instance.
+    pub fn set_download_concurrency_limit(&mut self, limit: usize) -> &mut Self {
+        self.download_concurrency_limit = Some(limit);
         self
     }
 
@@ -518,6 +547,18 @@ impl Installer {
             )
         });
 
+        // Bound the number of packages that are fetched (downloaded and
+        // extracted into the cache) concurrently. Without a bound, a fetch is
+        // started for every missing package at once, which can breach HTTP/2
+        // concurrent stream limits of the server, exhaust file descriptors,
+        // and oversubscribe the CPU with parallel extractions. Packages that
+        // are already in the cache are not gated by this limit.
+        let package_cache =
+            package_cache.with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(
+                self.download_concurrency_limit
+                    .unwrap_or_else(default_download_concurrency_limit),
+            )));
+
         // Acquire a global lock on the package cache for the entire installation.
         // This significantly reduces overhead by avoiding per-package locking.
         let _global_cache_lock = package_cache
@@ -741,6 +782,14 @@ impl Installer {
     }
 }
 
+/// The default maximum number of packages fetched (downloaded and extracted)
+/// concurrently, derived from the available parallelism.
+fn default_download_concurrency_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() * 2).clamp(8, 50))
+        .unwrap_or(16)
+}
+
 async fn link_package(
     record: &RepoDataRecord,
     target_prefix: &Prefix,
@@ -853,7 +902,7 @@ async fn populate_cache(
         cache
             .get_or_fetch_from_path(&path, reporter)
             .await
-            .map_err(|e| InstallerError::FailedToFetch(record.identifier.to_string(), e))
+            .map_err(|e| fetch_error_to_installer_error(e, record))
     } else {
         cache
             .get_or_fetch_from_url_with_retry(
@@ -864,7 +913,20 @@ async fn populate_cache(
                 reporter,
             )
             .await
-            .map_err(|e| InstallerError::FailedToFetch(record.identifier.to_string(), e))
+            .map_err(|e| fetch_error_to_installer_error(e, record))
+    }
+}
+
+/// Converts a [`PackageCacheError`] encountered while fetching a package into
+/// an [`InstallerError`], preserving cancellation (e.g. a closed fetch
+/// concurrency semaphore).
+fn fetch_error_to_installer_error(
+    error: PackageCacheError,
+    record: &RepoDataRecord,
+) -> InstallerError {
+    match error {
+        PackageCacheError::Cancelled => InstallerError::Cancelled,
+        error => InstallerError::FailedToFetch(record.identifier.to_string(), error),
     }
 }
 
@@ -1267,6 +1329,23 @@ mod tests {
             "empty >=0.1.0",
             "requested_specs should match the original spec"
         );
+    }
+
+    #[tokio::test]
+    async fn test_install_with_download_concurrency_limit() {
+        let (_temp_dir, target_prefix) = create_test_environment();
+        let repo_record = create_dummy_repo_record();
+
+        // Use an empty dedicated cache so the package is actually fetched and
+        // the fetch passes through the concurrency semaphore.
+        let cache_dir = TempDir::new().unwrap();
+        let installer = Installer::new()
+            .with_package_cache(PackageCache::new(cache_dir.path()))
+            .with_download_concurrency_limit(1);
+        install_and_verify_success(installer, &target_prefix, repo_record.clone()).await;
+
+        let meta_file_path = get_meta_file_path(&target_prefix, &repo_record);
+        assert!(meta_file_path.exists(), "conda-meta file should exist");
     }
 
     #[tokio::test]

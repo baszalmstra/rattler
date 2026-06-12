@@ -29,6 +29,7 @@ use rattler_package_streaming::{DownloadReporter, ExtractError};
 use rattler_redaction::Redact;
 pub use reporter::CacheReporter;
 use simple_spawn_blocking::Cancelled;
+use tokio::sync::Semaphore;
 use tracing::instrument;
 use url::Url;
 
@@ -49,6 +50,7 @@ mod reporter;
 pub struct PackageCache {
     inner: Arc<PackageCacheInner>,
     cache_origin: bool,
+    fetch_semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Default)]
@@ -155,8 +157,12 @@ impl From<Cancelled> for PackageCacheLayerError {
 
 impl From<PackageCacheLayerError> for PackageCacheError {
     fn from(err: PackageCacheLayerError) -> Self {
-        // Convert the PackageCacheLayerError to a LayerError by boxing it
-        PackageCacheError::LayerError(Box::new(err))
+        match err {
+            PackageCacheLayerError::Cancelled => PackageCacheError::Cancelled,
+            // Convert any other PackageCacheLayerError to a LayerError by
+            // boxing it
+            err => PackageCacheError::LayerError(Box::new(err)),
+        }
     }
 }
 
@@ -192,6 +198,7 @@ impl PackageCacheLayer {
             None,
             None,
             self.validation_mode,
+            None,
         )
         .await
         {
@@ -205,11 +212,16 @@ impl PackageCacheLayer {
     }
 
     /// Validate the package, and fetch it if invalid.
+    ///
+    /// If a `fetch_semaphore` is passed, a permit is acquired before the
+    /// `fetch` function is invoked. Validation itself is not gated by the
+    /// semaphore.
     pub async fn validate_or_fetch<F, Fut, E>(
         &self,
         fetch: F,
         cache_key: &CacheKey,
         reporter: Option<Arc<dyn CacheReporter>>,
+        fetch_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<CacheMetadata, PackageCacheLayerError>
     where
         F: (Fn(PathBuf) -> Fut) + Send + 'static,
@@ -232,6 +244,7 @@ impl PackageCacheLayer {
             Some(fetch),
             reporter,
             self.validation_mode,
+            fetch_semaphore,
         )
         .await
         {
@@ -260,6 +273,18 @@ impl PackageCache {
     pub fn with_cached_origin(self) -> Self {
         Self {
             cache_origin: true,
+            ..self
+        }
+    }
+
+    /// Limits the number of packages that are fetched (downloaded and
+    /// extracted) into the cache concurrently.
+    ///
+    /// The semaphore only gates actual fetches: requesting a package that is
+    /// already present and valid in the cache does not require a permit.
+    pub fn with_fetch_concurrency_semaphore(self, fetch_semaphore: Arc<Semaphore>) -> Self {
+        Self {
+            fetch_semaphore: Some(fetch_semaphore),
             ..self
         }
     }
@@ -319,6 +344,7 @@ impl PackageCache {
         Self {
             inner: Arc::new(PackageCacheInner { layers }),
             cache_origin,
+            fetch_semaphore: None,
         }
     }
 
@@ -399,7 +425,10 @@ impl PackageCache {
         // No matches in all layers, let's write to the first writable layer
         tracing::debug!("no matches in all layers. writing to first writable layer");
         if let Some(layer) = writable_layers.first() {
-            return match layer.validate_or_fetch(fetch, &cache_key, reporter).await {
+            return match layer
+                .validate_or_fetch(fetch, &cache_key, reporter, self.fetch_semaphore.clone())
+                .await
+            {
                 Ok(cache_metadata) => Ok(cache_metadata),
                 Err(e) => Err(e.into()),
             };
@@ -686,6 +715,7 @@ async fn validate_package_common<F, Fut, E>(
     fetch: Option<F>,
     reporter: Option<Arc<dyn CacheReporter>>,
     validation_mode: ValidationMode,
+    fetch_semaphore: Option<Arc<Semaphore>>,
 ) -> Result<CacheMetadata, PackageCacheLayerError>
 where
     F: Fn(PathBuf) -> Fut + Send,
@@ -794,6 +824,19 @@ where
     // Since we hold the global cache lock, we can safely update the metadata
     // and fetch the package without worrying about concurrent modifications.
     if let Some(ref fetch_fn) = fetch {
+        // An actual fetch is required, acquire a permit before performing any
+        // side effects. Packages that validated from the cache above never
+        // reach this point and are not gated by the semaphore.
+        let _permit = match fetch_semaphore {
+            Some(semaphore) => Some(
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_err| PackageCacheLayerError::Cancelled)?,
+            ),
+            None => None,
+        };
+
         // Write the new revision
         let new_revision = cache_revision + 1;
         metadata
@@ -1507,6 +1550,93 @@ mod test {
         assert_eq!(cache_c_lock.revision(), 2);
     }
 
+    #[tokio::test]
+    async fn test_fetch_semaphore_bounds_concurrent_fetches() {
+        use std::{sync::atomic::AtomicUsize, time::Duration};
+
+        use rattler_conda_types::{PackageName, PackageRecord, VersionWithSource};
+        use tokio::sync::Semaphore;
+
+        let packages_dir = tempdir().unwrap();
+        let cache = PackageCache::new(packages_dir.path())
+            .with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(1)));
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for idx in 0..4 {
+            let cache = cache.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            tasks.push(tokio::spawn(async move {
+                let record = PackageRecord::new(
+                    PackageName::new_unchecked(format!("demo-{idx}")),
+                    "1.0".parse::<VersionWithSource>().unwrap(),
+                    "0".to_string(),
+                );
+                cache
+                    .get_or_fetch(
+                        CacheKey::from(&record),
+                        move |_destination: PathBuf| {
+                            let in_flight = in_flight.clone();
+                            let max_in_flight = max_in_flight.clone();
+                            async move {
+                                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                                max_in_flight.fetch_max(current, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
+                                Ok::<(), Infallible>(())
+                            }
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "the fetch semaphore must bound the number of concurrent fetches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_package_does_not_require_fetch_permit() {
+        use std::time::Duration;
+
+        use tokio::sync::Semaphore;
+
+        let packages_dir = tempdir().unwrap();
+        let package_path = get_test_data_dir().join("clobber/clobber-python-0.1.0-cpython.conda");
+
+        // Populate the cache.
+        PackageCache::new(packages_dir.path())
+            .get_or_fetch_from_path(&package_path, None)
+            .await
+            .unwrap();
+
+        // A fresh cache handle simulates a new process with a warm on-disk
+        // cache. The semaphore has no permits, so any attempt to fetch would
+        // block forever: a cache hit must complete without acquiring a permit.
+        let cache = PackageCache::new(packages_dir.path())
+            .with_fetch_concurrency_semaphore(Arc::new(Semaphore::new(0)));
+
+        let cache_metadata = tokio::time::timeout(
+            Duration::from_secs(60),
+            cache.get_or_fetch_from_path(&package_path, None),
+        )
+        .await
+        .expect("a cached package must not wait for a fetch permit")
+        .unwrap();
+        assert!(cache_metadata.path().is_dir());
+    }
+
     fn get_file_name_from_path(path: &Path) -> &str {
         path.file_name().unwrap().to_str().unwrap()
     }
@@ -1741,6 +1871,7 @@ mod test {
                         }
                     },
                     &key,
+                    None,
                     None,
                 )
                 .await
