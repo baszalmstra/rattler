@@ -231,10 +231,11 @@ impl PyGateway {
                     .with_reporter(rattler_repodata_gateway::IndicatifReporter::builder().finish());
             }
 
-            let repodatas = query.execute().await.map_err(PyRattlerError::from)?;
+            let output = query.execute().await.map_err(PyRattlerError::from)?;
 
             // Convert the records into a list of lists (Arc clone, not deep copy)
-            Ok(repodatas
+            Ok(output
+                .repodata
                 .into_iter()
                 .map(|r| {
                     r.iter_arc()
@@ -302,8 +303,8 @@ impl PyGateway {
                     );
                 }
 
-                let channel_names = query.execute().await.map_err(PyRattlerError::from)?;
-                all_names.extend(channel_names);
+                let output = query.execute().await.map_err(PyRattlerError::from)?;
+                all_names.extend(output.names);
             }
 
             // Collect names from custom sources directly
