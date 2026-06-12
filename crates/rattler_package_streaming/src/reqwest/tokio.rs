@@ -28,11 +28,44 @@ fn error_for_status(response: reqwest::Response) -> reqwest_middleware::Result<R
         .map_err(reqwest_middleware::Error::Reqwest)
 }
 
+/// A [`DownloadReporter`] for a download that has started: constructing one
+/// emits `on_download_start`, and consuming it with
+/// [`StartedDownloadReporter::complete`] emits `on_download_complete`. This
+/// keeps the started-state in the type instead of spread over the code paths
+/// that report progress or completion.
+#[derive(Clone)]
+struct StartedDownloadReporter(Option<Arc<dyn DownloadReporter>>);
+
+impl StartedDownloadReporter {
+    /// Reports the start of the download and returns the reporter for the
+    /// remainder of the download lifecycle.
+    fn start(reporter: Option<Arc<dyn DownloadReporter>>) -> Self {
+        if let Some(reporter) = &reporter {
+            reporter.on_download_start();
+        }
+        Self(reporter)
+    }
+
+    /// Reports download progress.
+    fn on_progress(&self, bytes_received: u64, total_bytes: Option<u64>) {
+        if let Some(reporter) = &self.0 {
+            reporter.on_download_progress(bytes_received, total_bytes);
+        }
+    }
+
+    /// Reports the completion of the download.
+    fn complete(self) {
+        if let Some(reporter) = &self.0 {
+            reporter.on_download_complete();
+        }
+    }
+}
+
 async fn get_reader(
     url: Url,
     client: reqwest_middleware::ClientWithMiddleware,
     expected_sha256: Option<Sha256Hash>,
-    reporter: Option<Arc<dyn DownloadReporter>>,
+    reporter: StartedDownloadReporter,
 ) -> Result<impl tokio::io::AsyncRead + Unpin, ExtractError> {
     // Send the request for the file
     let mut request = client.get(url.clone());
@@ -53,9 +86,7 @@ async fn get_reader(
     let mut bytes_received = Box::new(0);
     let byte_stream = response.bytes_stream().inspect_ok(move |frame| {
         *bytes_received += frame.len() as u64;
-        if let Some(reporter) = &reporter {
-            reporter.on_download_progress(*bytes_received, total_bytes);
-        }
+        reporter.on_progress(*bytes_received, total_bytes);
     });
 
     // Get the response as a stream
@@ -75,7 +106,7 @@ async fn get_reader(
 /// machinery would only add a redundant copy of the data.
 async fn extract_local_file<F>(
     url: &Url,
-    reporter: Option<Arc<dyn DownloadReporter>>,
+    reporter: StartedDownloadReporter,
     extract: F,
 ) -> Result<ExtractResult, ExtractError>
 where
@@ -91,9 +122,7 @@ where
             return Err(ExtractError::Cancelled);
         }
     };
-    if let Some(reporter) = &reporter {
-        reporter.on_download_complete();
-    }
+    reporter.complete();
     Ok(result)
 }
 
@@ -117,7 +146,7 @@ where
 /// retryable.
 async fn download_and_extract<F>(
     reader: impl tokio::io::AsyncRead + Unpin,
-    reporter: Option<Arc<dyn DownloadReporter>>,
+    reporter: StartedDownloadReporter,
     extract: F,
 ) -> Result<ExtractResult, ExtractError>
 where
@@ -129,9 +158,7 @@ where
         copy_to_pipe(reader, writer, DEFAULT_BUF_SIZE)
             .await
             .map_err(ExtractError::IoError)?;
-        if let Some(reporter) = &reporter {
-            reporter.on_download_complete();
-        }
+        reporter.complete();
         Ok(())
     };
 
@@ -186,9 +213,7 @@ pub async fn extract_tar_bz2(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    if let Some(reporter) = &reporter {
-        reporter.on_download_start();
-    }
+    let reporter = StartedDownloadReporter::start(reporter);
 
     let destination = destination.to_owned();
     if url.scheme() == "file" {
@@ -241,9 +266,7 @@ pub async fn extract_conda(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    if let Some(reporter) = &reporter {
-        reporter.on_download_start();
-    }
+    let reporter = StartedDownloadReporter::start(reporter);
 
     let destination = destination.to_owned();
     if url.scheme() == "file" {
