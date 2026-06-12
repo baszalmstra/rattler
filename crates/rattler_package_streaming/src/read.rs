@@ -70,12 +70,12 @@ pub fn extract_conda_via_streaming(
 }
 
 /// The fixed-size portion of a zip local file header.
-const ZIP_LOCAL_HEADER_LEN: usize = 30;
+pub(crate) const ZIP_LOCAL_HEADER_LEN: usize = 30;
 
 /// Returns true when a zip local file header signals that the entry's sizes
 /// are written in a trailing data descriptor (general purpose flag bit 3)
 /// rather than in the header itself.
-fn local_header_uses_data_descriptor(header: &[u8]) -> bool {
+pub(crate) fn local_header_uses_data_descriptor(header: &[u8]) -> bool {
     header.len() >= 8 && header[..4] == [0x50, 0x4b, 0x03, 0x04] && header[6] & 0x08 != 0
 }
 
@@ -137,7 +137,7 @@ pub fn extract_conda(
 /// temporary buffer: the seekable source already retains the package, so the
 /// hashes and size are computed in one linear pass and the entries are then
 /// read directly through random access.
-fn extract_conda_via_seeking(
+pub(crate) fn extract_conda_via_seeking(
     mut reader: impl Read + Seek,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {

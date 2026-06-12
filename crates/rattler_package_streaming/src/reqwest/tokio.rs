@@ -1,17 +1,23 @@
 //! Functionality to stream and extract packages directly from a
 //! [`reqwest::Url`] within a [`tokio`] async context.
 
-use std::{path::Path, sync::Arc};
+use std::{io::Write, path::Path, sync::Arc};
 
 use futures_util::stream::TryStreamExt;
 use rattler_conda_types::package::CondaArchiveType;
 use rattler_digest::Sha256Hash;
 use reqwest::Response;
+use tempfile::SpooledTempFile;
+use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 use url::Url;
+use zip::result::ZipError;
 
 use crate::{
     DownloadReporter, ExtractError, ExtractResult,
+    read::{
+        DATA_DESCRIPTOR_ERROR_MESSAGE, ZIP_LOCAL_HEADER_LEN, local_header_uses_data_descriptor,
+    },
     spooled_pipe::{SpooledPipeReader, copy_to_pipe, spooled_pipe},
 };
 
@@ -140,9 +146,6 @@ where
 /// resets under concurrent load. The extractor in turn only ever touches
 /// plain memory and a plain [`std::fs::File`], never the async runtime.
 ///
-/// With `retain` set, consumed data is kept instead of discarded so the
-/// extractor can seek back over the entire package.
-///
 /// Both halves always run to completion so no detached extraction keeps
 /// writing to the destination after this function returns. A download error
 /// is forwarded into the pipe (failing the extraction at the point the data
@@ -151,13 +154,12 @@ where
 async fn download_and_extract<F>(
     reader: impl tokio::io::AsyncRead + Unpin,
     reporter: StartedDownloadReporter,
-    retain: bool,
     extract: F,
 ) -> Result<ExtractResult, ExtractError>
 where
     F: FnOnce(&mut SpooledPipeReader) -> Result<ExtractResult, ExtractError> + Send + 'static,
 {
-    let (writer, mut pipe_reader) = spooled_pipe(SPOOL_MEMORY_LIMIT, retain);
+    let (writer, mut pipe_reader) = spooled_pipe(SPOOL_MEMORY_LIMIT);
 
     let download = async {
         copy_to_pipe(reader, writer, DEFAULT_BUF_SIZE)
@@ -229,10 +231,70 @@ pub async fn extract_tar_bz2(
     }
 
     let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-    download_and_extract(reader, reporter, false, move |pipe| {
+    download_and_extract(reader, reporter, move |pipe| {
         crate::read::extract_tar_bz2(pipe, &destination)
     })
     .await
+}
+
+/// Downloads the entire package into a spooled temporary file (in memory up
+/// to [`SPOOL_MEMORY_LIMIT`], an unlinked file beyond it) and then runs
+/// `extract` over it on a blocking thread.
+///
+/// Used for archives that need random access: their entry sizes only exist in
+/// the zip central directory at the *end* of the archive, so extraction
+/// cannot overlap the download anyway and the complete package has to be
+/// local. The sequential writes happen inline on the async task; like the
+/// pipe writer they land in memory or the OS page cache and must stay off the
+/// blocking pool.
+async fn download_to_spool_and_extract<F>(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    reporter: StartedDownloadReporter,
+    extract: F,
+) -> Result<ExtractResult, ExtractError>
+where
+    F: FnOnce(SpooledTempFile) -> Result<ExtractResult, ExtractError> + Send + 'static,
+{
+    let mut spool = SpooledTempFile::new(SPOOL_MEMORY_LIMIT);
+    let mut buf = vec![0u8; DEFAULT_BUF_SIZE];
+    loop {
+        let len = reader.read(&mut buf).await.map_err(ExtractError::IoError)?;
+        if len == 0 {
+            break;
+        }
+        spool
+            .write_all(&buf[..len])
+            .map_err(ExtractError::IoError)?;
+    }
+    reporter.complete();
+
+    match tokio::task::spawn_blocking(move || extract(spool)).await {
+        Ok(result) => result,
+        Err(err) => {
+            if let Ok(panic) = err.try_into_panic() {
+                std::panic::resume_unwind(panic);
+            }
+            Err(ExtractError::Cancelled)
+        }
+    }
+}
+
+/// Reads the fixed-size portion of the first zip local file header from the
+/// stream so the extraction strategy can be decided before any data flows.
+async fn peek_local_header(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> std::io::Result<Vec<u8>> {
+    let mut header = vec![0u8; ZIP_LOCAL_HEADER_LEN];
+    let mut filled = 0;
+    while filled < header.len() {
+        let read = reader.read(&mut header[filled..]).await?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    header.truncate(filled);
+    Ok(header)
 }
 
 /// Extracts the contents a `.conda` package archive from the specified remote
@@ -281,42 +343,57 @@ pub async fn extract_conda(
         .await;
     }
 
-    let reader = get_reader(
+    let mut reader = get_reader(
         url.clone(),
         client.clone(),
         expected_sha256,
         reporter.clone(),
     )
     .await?;
+
+    // Decide the extraction strategy from the first zip local file header:
+    // archives whose entries carry their sizes in trailing data descriptors
+    // (<https://github.com/conda/rattler/issues/794>) can only be extracted
+    // through the central directory at the end of the archive and therefore
+    // need the complete, seekable package locally. Everything else streams
+    // through a sequential pipe that needs no seeking at all.
+    let header = peek_local_header(&mut reader)
+        .await
+        .map_err(ExtractError::IoError)?;
+    let uses_data_descriptors = local_header_uses_data_descriptor(&header);
+    let reader = std::io::Cursor::new(header).chain(reader);
+
+    if uses_data_descriptors {
+        return download_to_spool_and_extract(reader, reporter, move |mut spool| {
+            crate::read::extract_conda_via_seeking(&mut spool, &destination)
+        })
+        .await;
+    }
+
     let extract_destination = destination.clone();
-    let result = download_and_extract(reader, reporter.clone(), false, move |pipe| {
-        crate::read::extract_conda(pipe, &extract_destination)
+    let result = download_and_extract(reader, reporter.clone(), move |pipe| {
+        crate::read::extract_conda_via_streaming(pipe, &extract_destination)
     })
     .await;
 
     match result {
-        // The zip data-descriptor fallback needed to seek back over data the
-        // pipe already discarded, which only happens when the streaming
-        // attempt consumed more than the pipe buffers before failing.
-        // Download the package again into a fully retaining pipe.
-        Err(error) if is_discarded_data_extract_error(&error) => {
+        // A later entry still used a data descriptor (mixed archive); the
+        // sequential pipe cannot rewind, so download the package again into
+        // a seekable spool.
+        Err(ExtractError::ZipError(ZipError::UnsupportedArchive(message)))
+            if message.contains(DATA_DESCRIPTOR_ERROR_MESSAGE) =>
+        {
             tracing::warn!(
-                "the conda package from '{url}' requires buffered extraction, but the streamed data was no longer available; downloading the package again"
+                "the conda package from '{url}' uses zip data descriptors past the first entry; downloading the package again for buffered extraction"
             );
             let reader = get_reader(url, client, expected_sha256, reporter.clone()).await?;
-            download_and_extract(reader, reporter, true, move |pipe| {
-                crate::read::extract_conda(pipe, &destination)
+            download_to_spool_and_extract(reader, reporter, move |mut spool| {
+                crate::read::extract_conda_via_seeking(&mut spool, &destination)
             })
             .await
         }
         result => result,
     }
-}
-
-/// Returns true if the extraction failed because the reader had to seek back
-/// over data the spooled pipe had already discarded.
-fn is_discarded_data_extract_error(error: &ExtractError) -> bool {
-    matches!(error, ExtractError::IoError(io) if crate::spooled_pipe::is_discarded_data_error(io))
 }
 
 /// Extracts the contents a package archive from the specified remote location.
