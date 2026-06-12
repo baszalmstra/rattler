@@ -92,9 +92,20 @@ struct State {
     /// window overflow instead of flushing it.
     reader_pos: u64,
     /// Spill file for window overflow the reader has not consumed yet.
-    /// Stream byte `n` lives at file offset `n`; only flushed ranges are ever
-    /// written (the file is sparse where data was discarded). Created lazily.
+    /// Flushed runs are packed back to back (see `flush_stream_start`), so
+    /// the file never contains holes for discarded data — important on
+    /// Windows, where NTFS physically zero-fills gaps instead of keeping
+    /// them sparse. Created lazily.
     file: Option<Arc<File>>,
+    /// Stream offset of the first byte of the current flushed run; the run
+    /// occupies file offsets `[flush_file_start, file_len)`. Because the
+    /// reader is strictly sequential, a new run only ever starts after the
+    /// previous run was fully consumed, so a single live mapping suffices.
+    flush_stream_start: u64,
+    /// File offset of the first byte of the current flushed run.
+    flush_file_start: u64,
+    /// Number of bytes written to the spill file so far.
+    file_len: u64,
     /// Total number of bytes committed to the pipe and readable.
     committed: u64,
     /// The writer finished successfully; `committed` is the final length.
@@ -134,6 +145,9 @@ pub(crate) fn spooled_pipe(memory_limit: usize) -> (SpooledPipeWriter, SpooledPi
             window_start: 0,
             reader_pos: 0,
             file: None,
+            flush_stream_start: 0,
+            flush_file_start: 0,
+            file_len: 0,
             committed: 0,
             eof: false,
             error: None,
@@ -197,7 +211,17 @@ impl SpooledPipeWriter {
                 // writer mutates the window, so the front is unchanged when
                 // the lock is re-acquired.
                 let flush: Vec<u8> = state.window.iter().take(excess).copied().collect();
-                let offset = state.window_start;
+                // Drops since the last flush leave a gap in the stream;
+                // start a new run packed directly after the previous one.
+                // The previous run is necessarily fully consumed: drops only
+                // happen below the reader position.
+                if state.flush_stream_start + (state.file_len - state.flush_file_start)
+                    != state.window_start
+                {
+                    state.flush_stream_start = state.window_start;
+                    state.flush_file_start = state.file_len;
+                }
+                let offset = state.file_len;
                 let file = if let Some(file) = &state.file {
                     file.clone()
                 } else {
@@ -210,6 +234,7 @@ impl SpooledPipeWriter {
                 state = self.shared.lock();
                 state.window.drain(..flush.len());
                 state.window_start += flush.len() as u64;
+                state.file_len += flush.len() as u64;
             }
         }
 
@@ -310,7 +335,10 @@ impl Read for SpooledPipeReader {
                 .file
                 .clone()
                 .expect("retained data below the window must have been flushed");
-            let offset = self.pos;
+            // A lagging reader is always inside the current flushed run; the
+            // writer cannot start a new one before this one is consumed.
+            debug_assert!(self.pos >= state.flush_stream_start);
+            let offset = state.flush_file_start + (self.pos - state.flush_stream_start);
             state.reader_pos = self.pos + len as u64;
             drop(state);
 
@@ -531,6 +559,53 @@ mod tests {
         runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(60), all_pipes).await })
             .expect("the pipes deadlocked on a saturated blocking pool");
+    }
+
+    /// Alternating lag and catch-up phases create multiple flushed runs.
+    /// They are packed back to back in the spill file — leaving holes for
+    /// the discarded gaps would make NTFS physically zero-fill them — and
+    /// the data must stay correct across run boundaries.
+    #[test]
+    fn flush_runs_are_packed_without_holes() {
+        let data = test_data(1024 * 1024);
+        let chunk = 32 * 1024;
+        let (mut writer, mut reader) = spooled_pipe(2 * chunk);
+
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; chunk];
+        for (index, piece) in data.chunks(chunk).enumerate() {
+            writer.write(piece).unwrap();
+            // Phases of 8 chunks: stall the reader (flushing a run), then
+            // catch up and consume in lock-step (discarding, which creates
+            // the gap before the next run).
+            let stalling = (index / 8) % 2 == 0;
+            if !stalling {
+                while received.len() < (index + 1) * chunk {
+                    let read = reader.read(&mut buf).unwrap();
+                    received.extend_from_slice(&buf[..read]);
+                }
+            }
+        }
+        let shared = writer.shared.clone();
+        writer.finish();
+
+        let file_len = {
+            let state = shared.lock();
+            let file = state.file.as_ref().expect("stalled phases must flush");
+            assert_eq!(
+                file.metadata().unwrap().len(),
+                state.file_len,
+                "the spill file must contain exactly the flushed bytes, without holes"
+            );
+            state.file_len
+        };
+        assert!(
+            file_len < data.len() as u64 / 2,
+            "discarded data must not have been written to the spill file"
+        );
+
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, data);
     }
 
     /// A writer failure is observed only after all committed data is served.
