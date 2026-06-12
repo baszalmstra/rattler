@@ -18,6 +18,10 @@
 //!    blocks on the async runtime, making it safe to use on a
 //!    `spawn_blocking` thread without risking the deadlocks async-to-sync
 //!    bridges are prone to.
+//! 3. The writer never touches tokio's blocking pool either (see
+//!    [`SpooledPipeWriter::write`]). Readers routinely occupy blocking-pool
+//!    threads while waiting for data, so any pool dependency on the write
+//!    path deadlocks once the pool is saturated with waiting readers.
 //!
 //! All data is retained until the pipe is dropped, so the reader can seek
 //! backwards over data it already consumed. The zip data-descriptor fallback
@@ -102,60 +106,62 @@ pub(crate) struct SpooledPipeWriter {
 }
 
 impl SpooledPipeWriter {
-    /// Appends `buf[..len]` to the pipe and returns the buffer for reuse.
-    /// Data within the memory limit is committed directly; the remainder is
-    /// written to the spill file on a blocking thread.
-    pub(crate) async fn write(&mut self, buf: Vec<u8>, len: usize) -> std::io::Result<Vec<u8>> {
-        debug_assert!(len <= buf.len());
-
+    /// Appends `data` to the pipe. Data within the memory limit is committed
+    /// directly; the remainder is written to the spill file.
+    ///
+    /// This is deliberately a synchronous, blocking-pool-free operation even
+    /// though it is called from async code: spill writes go to an unlinked
+    /// temporary file whose pages land in the OS page cache, which is
+    /// microseconds-fast. Dispatching them through `spawn_blocking` instead
+    /// deadlocks when the blocking pool is small: every pool thread can be
+    /// occupied by an extraction blocked on this very pipe waiting for more
+    /// data, leaving no thread to ever run the write that would unblock it
+    /// (observed with rattler-bin's `max_blocking_threads(num_cores)`). The
+    /// writer staying off the blocking pool guarantees downloads always run
+    /// to completion, which in turn guarantees blocked readers always wake.
+    pub(crate) fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         // Commit the prefix that still fits within the memory limit.
         let (spilled_offset, spill_start) = {
             let mut state = self.shared.lock();
-            let take = (self.shared.memory_limit - state.memory.len()).min(len);
+            let take = (self.shared.memory_limit - state.memory.len()).min(data.len());
             if take > 0 {
-                state.memory.extend_from_slice(&buf[..take]);
+                state.memory.extend_from_slice(&data[..take]);
                 state.committed += take as u64;
                 self.shared.progress.notify_all();
             }
             (state.committed, take)
         };
-        if spill_start == len {
-            return Ok(buf);
+        if spill_start == data.len() {
+            return Ok(());
         }
 
         // Write the remainder to the spill file. The file is shared with the
         // reader under a mutex and has no stable cursor, so every access
         // seeks explicitly.
-        let file = self.spill_file().await?;
+        let file = self.spill_file()?;
         let offset = spilled_offset - self.shared.memory_limit as u64;
-        let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        {
             let mut file = file
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&buf[spill_start..len])?;
-            Ok(buf)
-        })
-        .await
-        .map_err(std::io::Error::other)??;
+            file.write_all(&data[spill_start..])?;
+        }
 
         let mut state = self.shared.lock();
-        state.committed += (len - spill_start) as u64;
+        state.committed += (data.len() - spill_start) as u64;
         self.shared.progress.notify_all();
         drop(state);
 
-        Ok(buf)
+        Ok(())
     }
 
     /// Returns the spill file, creating it on first use.
-    async fn spill_file(&self) -> std::io::Result<Arc<Mutex<File>>> {
+    fn spill_file(&self) -> std::io::Result<Arc<Mutex<File>>> {
         if let Some(file) = self.shared.lock().file.clone() {
             return Ok(file);
         }
-        let file = tokio::task::spawn_blocking(tempfile::tempfile)
-            .await
-            .map_err(std::io::Error::other)??;
-        let file = Arc::new(Mutex::new(file));
+        let file = Arc::new(Mutex::new(tempfile::tempfile()?));
         self.shared.lock().file = Some(file.clone());
         Ok(file)
     }
@@ -314,14 +320,13 @@ pub(crate) async fn copy_to_pipe(
                 writer.finish();
                 return Ok(());
             }
-            Ok(len) => match writer.write(buf, len).await {
-                Ok(returned) => buf = returned,
-                Err(error) => {
+            Ok(len) => {
+                if let Err(error) = writer.write(&buf[..len]) {
                     let result = std::io::Error::new(error.kind(), error.to_string());
                     writer.fail(error);
                     return Err(result);
                 }
-            },
+            }
             Err(error) => {
                 let result = std::io::Error::new(error.kind(), error.to_string());
                 writer.fail(error);
@@ -347,11 +352,9 @@ mod tests {
             .collect()
     }
 
-    async fn write_chunks(writer: &mut SpooledPipeWriter, data: &[u8], chunk_size: usize) {
-        let mut buf = vec![0u8; chunk_size];
+    fn write_chunks(writer: &mut SpooledPipeWriter, data: &[u8], chunk_size: usize) {
         for chunk in data.chunks(chunk_size) {
-            buf[..chunk.len()].copy_from_slice(chunk);
-            buf = writer.write(buf, chunk.len()).await.unwrap();
+            writer.write(chunk).unwrap();
         }
     }
 
@@ -370,7 +373,7 @@ mod tests {
         let data = test_data(64 * 1024);
         let (mut writer, reader) = spooled_pipe(1024 * 1024);
 
-        write_chunks(&mut writer, &data, 8 * 1024).await;
+        write_chunks(&mut writer, &data, 8 * 1024);
         assert!(
             writer.shared.lock().file.is_none(),
             "data below the memory limit must not create a spill file"
@@ -387,7 +390,7 @@ mod tests {
         let (mut writer, reader) = spooled_pipe(64 * 1024);
         let consumer = read_to_end_blocking(reader);
 
-        write_chunks(&mut writer, &data, 13 * 1024).await;
+        write_chunks(&mut writer, &data, 13 * 1024);
         assert!(
             writer.shared.lock().file.is_some(),
             "data above the memory limit must spill to a file"
@@ -406,7 +409,7 @@ mod tests {
         let (mut writer, reader) = spooled_pipe(16 * 1024);
 
         tokio::time::timeout(Duration::from_secs(30), async {
-            write_chunks(&mut writer, &data, 64 * 1024).await;
+            write_chunks(&mut writer, &data, 64 * 1024);
             writer.finish();
         })
         .await
@@ -424,16 +427,63 @@ mod tests {
         let (mut writer, reader) = spooled_pipe(32 * 1024);
         let consumer = read_to_end_blocking(reader);
 
-        let mut buf = vec![0u8; 4 * 1024];
         for chunk in data.chunks(4 * 1024) {
             tokio::time::sleep(Duration::from_millis(2)).await;
-            buf[..chunk.len()].copy_from_slice(chunk);
-            buf = writer.write(buf, chunk.len()).await.unwrap();
+            writer.write(chunk).unwrap();
         }
         writer.finish();
 
         let (_, result) = consumer.await.unwrap();
         assert_eq!(result.unwrap(), data);
+    }
+
+    /// Regression test for a deadlock observed against rattler-bin's runtime
+    /// (`max_blocking_threads(num_cores)`): readers occupy blocking-pool
+    /// threads while waiting for pipe data, so with more pipes than pool
+    /// threads the pool is saturated by waiting readers. The writers must
+    /// make progress without the blocking pool or nothing ever wakes the
+    /// readers. Spill writes dispatched through `spawn_blocking` deadlocked
+    /// here.
+    #[test]
+    fn no_deadlock_when_blocking_pool_is_saturated_by_readers() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let all_pipes = async {
+            let pipes: Vec<_> = (0..6)
+                .map(|_| {
+                    tokio::spawn(async {
+                        let data = test_data(256 * 1024);
+                        // A memory limit far below the data size forces
+                        // every pipe to spill.
+                        let (mut writer, mut reader) = spooled_pipe(16 * 1024);
+                        let consumer = tokio::task::spawn_blocking(move || {
+                            let mut out = Vec::new();
+                            reader.read_to_end(&mut out).map(|_| out)
+                        });
+                        // Trickle the data so readers spend most of their
+                        // time blocked on the condition variable.
+                        for chunk in data.chunks(16 * 1024) {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            writer.write(chunk).unwrap();
+                        }
+                        writer.finish();
+                        assert_eq!(consumer.await.unwrap().unwrap(), data);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for pipe in pipes {
+                pipe.await.unwrap();
+            }
+        };
+
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(60), all_pipes).await })
+            .expect("the pipes deadlocked on a saturated blocking pool");
     }
 
     /// Seeking back to the start after consuming the stream re-reads the
@@ -443,7 +493,7 @@ mod tests {
         let data = test_data(512 * 1024);
         let (mut writer, reader) = spooled_pipe(64 * 1024);
 
-        write_chunks(&mut writer, &data, 32 * 1024).await;
+        write_chunks(&mut writer, &data, 32 * 1024);
         writer.finish();
 
         let (mut reader, result) = read_to_end_blocking(reader).await.unwrap();
@@ -478,7 +528,7 @@ mod tests {
         let data = test_data(128 * 1024);
         let (mut writer, mut reader) = spooled_pipe(16 * 1024);
 
-        write_chunks(&mut writer, &data, 16 * 1024).await;
+        write_chunks(&mut writer, &data, 16 * 1024);
         writer.fail(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "stream reset by peer",
@@ -502,7 +552,7 @@ mod tests {
     async fn dropped_writer_unblocks_reader_with_error() {
         let (mut writer, mut reader) = spooled_pipe(16 * 1024);
         let data = test_data(8 * 1024);
-        write_chunks(&mut writer, &data, 8 * 1024).await;
+        write_chunks(&mut writer, &data, 8 * 1024);
 
         let consumer = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();

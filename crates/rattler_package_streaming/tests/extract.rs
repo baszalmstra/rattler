@@ -667,6 +667,63 @@ mod remote {
         }
     }
 
+    /// Regression test for a deadlock observed with rattler-bin's runtime
+    /// configuration (`max_blocking_threads(num_cores)`): more concurrent
+    /// extractions than blocking-pool threads, fed by slow downloads, so the
+    /// pool is saturated with extractors waiting for data. The downloads must
+    /// be able to complete without the blocking pool, otherwise nothing ever
+    /// wakes the extractors.
+    // Skip on windows as the test package contains symbolic links
+    #[cfg_attr(target_os = "windows", ignore)]
+    #[test]
+    fn test_extract_does_not_deadlock_on_a_tiny_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let all_extractions = async {
+            let data = std::fs::read(DATA_DESCRIPTOR_PACKAGE).unwrap();
+            let url = serve_bytes(
+                "ca-certificates-2024.7.4-hbcca054_0.conda",
+                data,
+                16 * 1024,
+                Duration::from_millis(5),
+            )
+            .await;
+
+            let temp_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tiny_blocking_pool");
+            let extractions: Vec<_> = (0..6)
+                .map(|task| {
+                    let url = url.clone();
+                    let target_dir = temp_dir.join(format!("task{task}"));
+                    tokio::spawn(async move {
+                        rattler_package_streaming::reqwest::tokio::extract_conda(
+                            client(),
+                            url,
+                            &target_dir,
+                            None,
+                            None,
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            for extraction in extractions {
+                let result = extraction.await.unwrap().unwrap();
+                assert_eq!(hex::encode(result.sha256), DATA_DESCRIPTOR_SHA256);
+            }
+        };
+
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(120), all_extractions).await
+            })
+            .expect("extractions deadlocked on a saturated blocking pool");
+    }
+
     /// `file://` URLs bypass the download pipeline entirely and extract the
     /// seekable package straight from disk, including the data-descriptor
     /// fallback.
