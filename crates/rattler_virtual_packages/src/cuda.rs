@@ -331,24 +331,15 @@ pub fn detect_cuda_version() -> Option<Version> {
 /// Although the required methods in the runtime are not implemented on much older machines it is
 /// considered old enough to be usable for our use case. Since Conda doesn't provide old versions of
 /// the CUDA SDK anyway this is considered a non-issue.
+///
+/// `nvmlSystemGetCudaDriverVersion` reads the version straight from the CUDA driver library and,
+/// unlike most NVML functions, does not require `nvmlInit`. We therefore skip initialization, which
+/// avoids the expensive driver handshake / GPU attach that makes `nvmlInit` slow on Windows.
 pub fn detect_cuda_version_via_nvml() -> Option<Version> {
     // Try to open the library
     let library = nvml_library_paths()
         .iter()
         .find_map(|path| unsafe { libloading::Library::new(*path).ok() })?;
-
-    // Get the initialization function. We first try to get `nvmlInit_v2` but if we can't find that
-    // we use the `nvmlInit` function.
-    let nvml_init: Symbol<'_, unsafe extern "C" fn() -> c_int> = unsafe {
-        library
-            .get(b"nvmlInit_v2\0")
-            .or_else(|_| library.get(b"nvmlInit\0"))
-    }
-    .ok()?;
-
-    // Find the shutdown function
-    let nvml_shutdown: Symbol<'_, unsafe extern "C" fn() -> c_int> =
-        unsafe { library.get(b"nvmlShutdown\0") }.ok()?;
 
     // Find the `nvmlSystemGetCudaDriverVersion_v2` function. If that function cannot be found, fall
     // back to the `nvmlSystemGetCudaDriverVersion` function instead.
@@ -360,18 +351,9 @@ pub fn detect_cuda_version_via_nvml() -> Option<Version> {
         }
         .ok()?;
 
-    // Call the initialization function
-    if unsafe { nvml_init() } != 0 {
-        return None;
-    }
-
-    // Get the version
+    // Query the version without initializing NVML.
     let mut cuda_driver_version = MaybeUninit::uninit();
     let result = unsafe { nvml_system_get_cuda_driver_version(cuda_driver_version.as_mut_ptr()) };
-
-    // Call the shutdown function (don't care about the result of the function). Whatever happens,
-    // after calling `nvmlInit` we have to call `nvmlShutdown`.
-    let _ = unsafe { nvml_shutdown() };
 
     // If the call failed we dont have a version
     if result != 0 {
