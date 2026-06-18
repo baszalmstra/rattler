@@ -7,7 +7,7 @@
 //! The CUDA driver version represents the maximum CUDA version supported by the installed
 //! NVIDIA drivers. This is detected via:
 //!
-//! * CUDA driver library (libcuda): Standard method
+//! * NVIDIA Management Library (NVML): Standard method
 //! * nvidia-smi command: Fallback on musl systems where dynamic library loading is not supported
 //!
 //! ## CUDA Compute Capability (`__cuda_arch`)
@@ -21,7 +21,8 @@ use rattler_conda_types::Version;
 use std::process::Command;
 use std::{
     mem::MaybeUninit,
-    os::raw::{c_int, c_uint, c_ulong},
+    os::raw::{c_int, c_uint, c_ulong, c_void},
+    ptr,
     str::FromStr,
 };
 
@@ -119,14 +120,13 @@ pub fn cuda_arch() -> Option<CudaArchInfo> {
 /// Detects comprehensive CUDA information from the current system.
 ///
 /// This function performs unified detection of both CUDA driver version and compute
-/// capability by loading the CUDA library once and querying all necessary information.
+/// capability by loading NVML once and querying all necessary information.
 ///
 /// The detection process:
-/// 1. Attempts to load the CUDA driver library (`libcuda`)
-/// 2. Initializes the CUDA driver API
-/// 3. Queries the driver version (for `__cuda` virtual package)
-/// 4. Enumerates all CUDA devices and queries their compute capabilities
-/// 5. Returns the minimum compute capability across all devices (for `__cuda_arch` virtual package)
+/// 1. Attempts to load NVML (`libnvidia-ml`/`nvml.dll`)
+/// 2. Queries the driver version (for `__cuda` virtual package); this does not require init
+/// 3. Initializes NVML and enumerates all CUDA devices to query their compute capabilities
+/// 4. Returns the minimum compute capability across all devices (for `__cuda_arch` virtual package)
 ///
 /// On musl systems, only the version is detected via `nvidia-smi` since dynamic library
 /// loading is not supported.
@@ -140,173 +140,159 @@ fn detect_cuda_info() -> CudaInfo {
             arch_info: None,
         }
     } else {
-        // Try to detect via libcuda which allows us to get both version and architecture info
-        detect_cuda_info_via_libcuda()
+        // Detect via NVML, which gives us both version and architecture info from a single library
+        // and, unlike libcuda, is not affected by `CUDA_VISIBLE_DEVICES`.
+        detect_cuda_info_via_nvml()
     }
 }
 
-/// Detects CUDA version and architecture information via the CUDA driver library.
+/// Detects CUDA version and architecture information via the NVIDIA Management Library.
 ///
-/// This function loads `libcuda` and uses the CUDA Driver API to query both the driver
-/// version and device compute capabilities. This is more efficient than separate detection
-/// because the library is loaded only once.
+/// The library is loaded once and used to query both the driver version and device compute
+/// capabilities. NVML is preferred over libcuda because it is not affected by
+/// `CUDA_VISIBLE_DEVICES`.
 ///
 /// Returns a `CudaInfo` struct where:
 /// * `version` is `None` if the driver version cannot be determined
 /// * `arch_info` is `None` if no devices are present or device queries fail
-fn detect_cuda_info_via_libcuda() -> CudaInfo {
-    // Try to open the CUDA library
-    let cuda_library = match cuda_library_paths()
+fn detect_cuda_info_via_nvml() -> CudaInfo {
+    let Some(library) = nvml_library_paths()
         .iter()
         .find_map(|path| unsafe { Library::new(*path).ok() })
-    {
-        Some(lib) => lib,
-        None => {
-            return CudaInfo {
-                version: None,
-                arch_info: None,
-            };
-        }
-    };
-
-    // Get entry points from the library
-    let cu_init: Symbol<'_, unsafe extern "C" fn(c_uint) -> c_ulong> =
-        match unsafe { cuda_library.get(b"cuInit\0") } {
-            Ok(init) => init,
-            Err(_) => {
-                return CudaInfo {
-                    version: None,
-                    arch_info: None,
-                };
-            }
-        };
-
-    // Initialize the CUDA library
-    if unsafe { cu_init(0) } != 0 {
+    else {
         return CudaInfo {
             version: None,
             arch_info: None,
         };
-    }
+    };
 
-    // Detect the driver version (can succeed even without devices)
-    let version = detect_cuda_version_from_library(&cuda_library);
+    // The version can be queried without initializing NVML and even without any devices present.
+    let version = cuda_version_from_nvml_library(&library);
 
-    // Detect architecture info (requires devices to be present)
-    let arch_info = detect_cuda_arch_from_library(&cuda_library);
+    // Compute capability requires enumerating devices, which needs NVML to be initialized.
+    let arch_info = detect_cuda_arch_via_nvml(&library);
 
     CudaInfo { version, arch_info }
 }
 
-/// Detects CUDA driver version from an already-loaded CUDA library.
+/// Queries the CUDA driver version from an already-loaded NVML library.
 ///
-/// This function queries the CUDA driver version using `cuDriverGetVersion`.
-/// The version can be detected even if no GPU devices are present on the system.
-fn detect_cuda_version_from_library(cuda_library: &Library) -> Option<Version> {
-    let cu_driver_get_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_ulong> =
-        unsafe { cuda_library.get(b"cuDriverGetVersion\0") }.ok()?;
+/// `nvmlSystemGetCudaDriverVersion` reads the version straight from the CUDA driver library and
+/// does not require `nvmlInit`.
+fn cuda_version_from_nvml_library(library: &Library) -> Option<Version> {
+    // Find the `nvmlSystemGetCudaDriverVersion_v2` function. If that function cannot be found, fall
+    // back to the `nvmlSystemGetCudaDriverVersion` function instead.
+    let nvml_system_get_cuda_driver_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_int> =
+        unsafe {
+            library
+                .get(b"nvmlSystemGetCudaDriverVersion_v2\0")
+                .or_else(|_| library.get(b"nvmlSystemGetCudaDriverVersion\0"))
+        }
+        .ok()?;
 
-    // Get the version from the library
-    let mut version_int = MaybeUninit::uninit();
-    if unsafe { cu_driver_get_version(version_int.as_mut_ptr()) != 0 } {
+    let mut cuda_driver_version = MaybeUninit::uninit();
+    if unsafe { nvml_system_get_cuda_driver_version(cuda_driver_version.as_mut_ptr()) } != 0 {
         return None;
     }
-    let version = unsafe { version_int.assume_init() };
+    let version = unsafe { cuda_driver_version.assume_init() };
 
     // Convert the version integer to a version string
     Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok()
 }
 
-/// Detects CUDA compute capability from an already-loaded CUDA library.
+/// Detects CUDA compute capability from an already-loaded NVML library.
 ///
-/// This function enumerates all CUDA devices and queries their compute capabilities,
-/// returning the **minimum** compute capability found across all devices along with
-/// the name of the device that has this minimum capability.
+/// Initializes NVML, enumerates all devices, and returns the **minimum** compute capability across
+/// them. Unlike the version query, reading device compute capabilities requires NVML to be
+/// initialized (with the GPUs attached).
 ///
-/// Returns `None` if:
-/// * No CUDA devices are detected (`cuDeviceGetCount` returns 0)
-/// * Device enumeration fails
-/// * Any of the required CUDA Driver API functions cannot be loaded
-fn detect_cuda_arch_from_library(cuda_library: &Library) -> Option<CudaArchInfo> {
-    // CUDA device attribute constants for querying compute capability
-    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
-    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+/// Returns `None` if NVML cannot be initialized, no devices are present, or device queries fail.
+fn detect_cuda_arch_via_nvml(library: &Library) -> Option<CudaArchInfo> {
+    // NVML device handle (`nvmlDevice_t`) is an opaque pointer.
+    type NvmlDevice = *mut c_void;
 
-    // Get required function pointers from the library
-    let cu_device_get_count: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_ulong> =
-        unsafe { cuda_library.get(b"cuDeviceGetCount\0") }.ok()?;
+    let nvml_init: Symbol<'_, unsafe extern "C" fn() -> c_int> = unsafe {
+        library
+            .get(b"nvmlInit_v2\0")
+            .or_else(|_| library.get(b"nvmlInit\0"))
+    }
+    .ok()?;
 
-    let cu_device_get: Symbol<'_, unsafe extern "C" fn(*mut c_int, c_int) -> c_ulong> =
-        unsafe { cuda_library.get(b"cuDeviceGet\0") }.ok()?;
+    let nvml_shutdown: Symbol<'_, unsafe extern "C" fn() -> c_int> =
+        unsafe { library.get(b"nvmlShutdown\0") }.ok()?;
 
-    let cu_device_get_attribute: Symbol<
+    let nvml_device_get_count: Symbol<'_, unsafe extern "C" fn(*mut c_uint) -> c_int> = unsafe {
+        library
+            .get(b"nvmlDeviceGetCount_v2\0")
+            .or_else(|_| library.get(b"nvmlDeviceGetCount\0"))
+    }
+    .ok()?;
+
+    let nvml_device_get_handle_by_index: Symbol<
         '_,
-        unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_ulong,
-    > = unsafe { cuda_library.get(b"cuDeviceGetAttribute\0") }.ok()?;
+        unsafe extern "C" fn(c_uint, *mut NvmlDevice) -> c_int,
+    > = unsafe {
+        library
+            .get(b"nvmlDeviceGetHandleByIndex_v2\0")
+            .or_else(|_| library.get(b"nvmlDeviceGetHandleByIndex\0"))
+    }
+    .ok()?;
 
-    // Get the number of CUDA devices
-    let mut device_count = MaybeUninit::uninit();
-    if unsafe { cu_device_get_count(device_count.as_mut_ptr()) } != 0 {
+    let nvml_device_get_cuda_compute_capability: Symbol<
+        '_,
+        unsafe extern "C" fn(NvmlDevice, *mut c_int, *mut c_int) -> c_int,
+    > = unsafe { library.get(b"nvmlDeviceGetCudaComputeCapability\0") }.ok()?;
+
+    if unsafe { nvml_init() } != 0 {
         return None;
     }
-    let device_count = unsafe { device_count.assume_init() };
 
-    // No devices found
-    if device_count == 0 {
-        return None;
-    }
-
-    // Iterate through all devices to find the minimum compute capability
-    let mut min_arch: Option<CudaArchInfo> = None;
-
-    for device_idx in 0..device_count {
-        // Get device handle
-        let mut device = MaybeUninit::uninit();
-        if unsafe { cu_device_get(device.as_mut_ptr(), device_idx) } != 0 {
-            continue;
+    // Enumerate devices to find the minimum compute capability. Wrapped in a closure so we always
+    // reach the `nvmlShutdown` call below regardless of the outcome.
+    let min_arch = (|| {
+        let mut device_count = MaybeUninit::uninit();
+        if unsafe { nvml_device_get_count(device_count.as_mut_ptr()) } != 0 {
+            return None;
         }
-        let device = unsafe { device.assume_init() };
+        let device_count = unsafe { device_count.assume_init() };
 
-        // Get compute capability major version
-        let mut cc_major = MaybeUninit::uninit();
-        if unsafe {
-            cu_device_get_attribute(
-                cc_major.as_mut_ptr(),
-                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                device,
-            )
-        } != 0
-        {
-            continue;
-        }
-        let cc_major = unsafe { cc_major.assume_init() } as u32;
+        let mut min_arch: Option<CudaArchInfo> = None;
+        for device_idx in 0..device_count {
+            let mut device: NvmlDevice = ptr::null_mut();
+            if unsafe { nvml_device_get_handle_by_index(device_idx, &mut device) } != 0 {
+                continue;
+            }
 
-        // Get compute capability minor version
-        let mut cc_minor = MaybeUninit::uninit();
-        if unsafe {
-            cu_device_get_attribute(
-                cc_minor.as_mut_ptr(),
-                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                device,
-            )
-        } != 0
-        {
-            continue;
-        }
-        let cc_minor = unsafe { cc_minor.assume_init() } as u32;
+            let mut cc_major = MaybeUninit::uninit();
+            let mut cc_minor = MaybeUninit::uninit();
+            if unsafe {
+                nvml_device_get_cuda_compute_capability(
+                    device,
+                    cc_major.as_mut_ptr(),
+                    cc_minor.as_mut_ptr(),
+                )
+            } != 0
+            {
+                continue;
+            }
+            let cc_major = unsafe { cc_major.assume_init() } as u32;
+            let cc_minor = unsafe { cc_minor.assume_init() } as u32;
 
-        // Check if this is the minimum compute capability so far
-        let is_new_minimum = min_arch.as_ref().is_none_or(|min| {
-            cc_major < min.major || (cc_major == min.major && cc_minor < min.minor)
-        });
-
-        if is_new_minimum {
-            min_arch = Some(CudaArchInfo {
-                major: cc_major,
-                minor: cc_minor,
+            let is_new_minimum = min_arch.as_ref().is_none_or(|min| {
+                cc_major < min.major || (cc_major == min.major && cc_minor < min.minor)
             });
+            if is_new_minimum {
+                min_arch = Some(CudaArchInfo {
+                    major: cc_major,
+                    minor: cc_minor,
+                });
+            }
         }
-    }
+        min_arch
+    })();
+
+    // Whatever happens, after initializing NVML we have to call `nvmlShutdown`.
+    let _ = unsafe { nvml_shutdown() };
 
     min_arch
 }
@@ -341,30 +327,7 @@ pub fn detect_cuda_version_via_nvml() -> Option<Version> {
         .iter()
         .find_map(|path| unsafe { libloading::Library::new(*path).ok() })?;
 
-    // Find the `nvmlSystemGetCudaDriverVersion_v2` function. If that function cannot be found, fall
-    // back to the `nvmlSystemGetCudaDriverVersion` function instead.
-    let nvml_system_get_cuda_driver_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_int> =
-        unsafe {
-            library
-                .get(b"nvmlSystemGetCudaDriverVersion_v2\0")
-                .or_else(|_| library.get(b"nvmlSystemGetCudaDriverVersion\0"))
-        }
-        .ok()?;
-
-    // Query the version without initializing NVML.
-    let mut cuda_driver_version = MaybeUninit::uninit();
-    let result = unsafe { nvml_system_get_cuda_driver_version(cuda_driver_version.as_mut_ptr()) };
-
-    // If the call failed we dont have a version
-    if result != 0 {
-        return None;
-    }
-
-    // We can assume the value is initialized by the `nvmlSystemGetCudaDriverVersion` function.
-    let version = unsafe { cuda_driver_version.assume_init() };
-
-    // Convert the version integer to a version string
-    Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok()
+    cuda_version_from_nvml_library(&library)
 }
 
 /// Returns platform specific set of search paths for the CUDA library.
