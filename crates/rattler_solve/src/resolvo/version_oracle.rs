@@ -44,10 +44,12 @@ use version_ranges::Ranges;
 ///
 /// Version parts compare through [`version_spec_to_ranges`]; an
 /// unrepresentable part degrades to syntactic equality or `Unknown`. Build
-/// parts compare as exact strings (case-insensitive, like
-/// [`StringMatcher::matches`]): an environment has a single build value, so
-/// two different exact strings are disjoint. Glob and regex build matchers
-/// are conservatively `Unknown`.
+/// parts compare as finite sets of literal build strings (case-insensitive,
+/// like [`StringMatcher::matches`]): an exact name is a singleton and an
+/// anchored literal-alternation regex (the `_x86_64-microarch-level`
+/// `^(core2|...|zen5)$` shape) is its name set, so the relation is plain
+/// finite-set containment (see [`build_part_relation`]). Globs and any regex
+/// that is not such an alternation are conservatively `Unknown`.
 ///
 /// Any other constraining field on either spec (build number, hashes,
 /// channel, ...) restricts that spec's set in ways this oracle does not
@@ -231,18 +233,95 @@ fn build_part_relation(a: Option<&StringMatcher>, b: Option<&StringMatcher>) -> 
         (None, None) => VersionSetRelation::Equal,
         (None, Some(_)) => VersionSetRelation::Superset,
         (Some(_), None) => VersionSetRelation::Subset,
-        (Some(StringMatcher::Exact(a)), Some(StringMatcher::Exact(b))) => {
-            if a.eq_ignore_ascii_case(b) {
-                VersionSetRelation::Equal
-            } else {
-                // The environment has a single build value; two different
-                // exact strings cannot both match it. This includes
-                // __archspec per CEP 30 (one reported name, exact match).
-                VersionSetRelation::Disjoint
-            }
+        (Some(a), Some(b)) => {
+            // A build matcher is compared only when it reduces to a finite set
+            // of literal build strings: an exact name, or an anchored
+            // literal-alternation regex like the `_x86_64-microarch-level`
+            // metapackage's `^(core2|...|zen5)$`. The environment reports one
+            // build value, so the relation is plain finite-set containment
+            // (two distinct exact names are disjoint; an alternation that lists
+            // a superset of another's names is a superset). Anything that is
+            // not provably such a set (globs, `.*`, classes, quantifiers,
+            // lookaround, ...) is conservatively `Unknown`.
+            let (Some(set_a), Some(set_b)) = (literal_alternatives(a), literal_alternatives(b))
+            else {
+                return VersionSetRelation::Unknown;
+            };
+            finite_set_relation(&set_a, &set_b)
         }
-        // Glob or regex matchers: conservatively unknown.
-        _ => VersionSetRelation::Unknown,
+    }
+}
+
+/// The finite set of literal build strings a matcher denotes, or `None` when
+/// the matcher is not provably a finite literal set. An [`StringMatcher::Exact`]
+/// is the singleton set; a [`StringMatcher::Regex`] is reduced only when it is
+/// an anchored alternation of plain literals (see
+/// [`parse_anchored_literal_alternation`]); a [`StringMatcher::Glob`] is never
+/// reduced. Returning `None` is always sound: it degrades the answer to
+/// `Unknown`.
+fn literal_alternatives(matcher: &StringMatcher) -> Option<Vec<String>> {
+    match matcher {
+        StringMatcher::Exact(s) => Some(vec![s.clone()]),
+        StringMatcher::Regex(regex) => parse_anchored_literal_alternation(regex.as_str()),
+        StringMatcher::Glob(_) => None,
+    }
+}
+
+/// Recognizes an anchored alternation of plain literals, e.g.
+/// `^(core2|haswell|zen4)$`, and returns its literal set. Returns `None` for
+/// any pattern that is not exactly this shape, because rattler matches build
+/// strings with `fancy_regex` (lookaround/backreferences, i.e. non-regular
+/// languages); only patterns whose plain-set reading provably coincides with
+/// `fancy_regex`'s match semantics are reduced, everything else is left to the
+/// oracle as `Unknown`.
+fn parse_anchored_literal_alternation(pattern: &str) -> Option<Vec<String>> {
+    // Build-string regexes are anchored (CEP-29); require it explicitly.
+    let body = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    // Strip a single optional wrapping group: `^(a|b)$`. A pattern with more
+    // structure (e.g. `(a)(b)`) leaves a metacharacter in a branch below and
+    // is rejected.
+    let body = if body.starts_with('(') && body.ends_with(')') {
+        &body[1..body.len() - 1]
+    } else {
+        body
+    };
+    if body.is_empty() {
+        return None;
+    }
+    // Every branch must be a run of plain (non-metacharacter) bytes. This
+    // rejects escapes, quantifiers, character classes, nested groups, anchors
+    // and lookaround; microarchitecture build names are `[A-Za-z0-9_]+`.
+    const META: &[u8] = b".^$*+?()[]{}\\|";
+    let mut names = Vec::new();
+    for branch in body.split('|') {
+        if branch.is_empty() || branch.bytes().any(|c| META.contains(&c)) {
+            return None;
+        }
+        if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(branch)) {
+            names.push(branch.to_string());
+        }
+    }
+    Some(names)
+}
+
+/// The relation between two finite literal build-string sets. The environment
+/// reports a single build value, so the sets compare by plain
+/// (case-insensitive) membership: disjoint sets share no value, and a strict
+/// inclusion is a subset/superset. Subsumes the exact/exact case (singletons).
+fn finite_set_relation(a: &[String], b: &[String]) -> VersionSetRelation {
+    let contains = |set: &[String], v: &str| set.iter().any(|s| s.eq_ignore_ascii_case(v));
+    let subset = a.iter().all(|x| contains(b, x));
+    let superset = b.iter().all(|y| contains(a, y));
+    if subset && superset {
+        VersionSetRelation::Equal
+    } else if a.iter().all(|x| !contains(b, x)) {
+        VersionSetRelation::Disjoint
+    } else if subset {
+        VersionSetRelation::Subset
+    } else if superset {
+        VersionSetRelation::Superset
+    } else {
+        VersionSetRelation::Unknown
     }
 }
 
@@ -607,6 +686,47 @@ mod tests {
             relation("__cuda", (None, Some("x86_64")), (None, Some("x86_64_v3"))),
             Disjoint
         );
+    }
+
+    /// An anchored literal-alternation build regex (the
+    /// `_x86_64-microarch-level` metapackage shape) is read as the finite set
+    /// of its exact names, so the oracle decides set relations between such
+    /// regexes and between a regex and an exact name. The metapackage already
+    /// encodes the microarchitecture DAG into its name lists, so plain set
+    /// containment is the right answer without modeling lineage.
+    #[test]
+    fn test_relation_archspec_literal_alternation() {
+        use VersionSetRelation::*;
+        let arch = |a: &str, b: &str| relation("__archspec", (None, Some(a)), (None, Some(b)));
+
+        // A regex listing a superset of names is a superset.
+        assert_eq!(arch("^(haswell|zen2|skylake)$", "^(haswell|zen2)$"), Superset);
+        assert_eq!(arch("^(haswell|zen2)$", "^(haswell|zen2|skylake)$"), Subset);
+        // An exact name is the singleton set.
+        assert_eq!(arch("^(haswell|zen2)$", "haswell"), Superset);
+        assert_eq!(arch("haswell", "^(haswell|zen2)$"), Subset);
+        // Order and duplicates do not matter; equal sets are equal.
+        assert_eq!(arch("^(haswell|zen2)$", "^(zen2|haswell)$"), Equal);
+        assert_eq!(arch("^(haswell|haswell)$", "haswell"), Equal);
+        // Case-insensitive, like StringMatcher::matches.
+        assert_eq!(arch("^(Haswell|ZEN2)$", "^(haswell|zen2)$"), Equal);
+        // Disjoint name sets are disjoint.
+        assert_eq!(arch("^(haswell|zen2)$", "^(skylake|core2)$"), Disjoint);
+        assert_eq!(arch("^(haswell|zen2)$", "skylake"), Disjoint);
+        // Overlapping but neither-contained sets are unknown.
+        assert_eq!(arch("^(haswell|zen2)$", "^(zen2|skylake)$"), Unknown);
+        // A microarch-level pair: the v4 names are a subset of a v3-or-below
+        // listing, so the v4 regex is a subset of the v3 regex.
+        assert_eq!(
+            arch(
+                "^(x86_64_v4|zen4|zen5)$",
+                "^(x86_64_v3|zen|zen2|zen3|x86_64_v4|zen4|zen5)$"
+            ),
+            Subset
+        );
+        // A regex that is not a plain literal alternation stays unknown.
+        assert_eq!(arch("^(haswell|zen.*)$", "haswell"), Unknown);
+        assert_eq!(arch("^haswell.$", "haswell"), Unknown);
     }
 
     #[test]
