@@ -33,7 +33,8 @@ use version_ranges::Ranges;
 
 use super::{
     CondaDependencyProvider, DependencyOverride, NameType, RepoData, SolverMatchSpec,
-    SolverPackageRecord, SymbolicVirtualPackage, version_oracle::version_spec_to_ranges,
+    SolverPackageRecord, SymbolicVirtualPackage,
+    version_oracle::{version_spec_to_ranges, version_spec_to_ranges_envelope},
 };
 use crate::{
     CancellationToken, ChannelPriority, ExcludeNewer, IntoRepoData, SolveError, SolveStrategy,
@@ -188,6 +189,7 @@ fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, Str
         if group.len() < 2 || !group.iter().any(|(_, positive)| *positive) {
             continue;
         }
+        let group = drop_redundant_absent(group);
         let Some(ranges) = group_ranges(&group) else {
             continue;
         };
@@ -197,6 +199,31 @@ fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, Str
         combined.push((package, rendered));
     }
     combined
+}
+
+/// Drops `not absent` literals that a positive version match in the same
+/// group already implies: a positive version constraint requires the
+/// package to be present, so an explicit `not absent` literal is redundant.
+/// Without this the redundant literal would block range combining (an
+/// `Absent` literal makes [`group_ranges`] bail) and the package would fall
+/// back to verbose per-literal rendering. The drop is only applied when such
+/// a positive version match exists, so a `not absent` literal that is the
+/// only thing forcing presence is preserved.
+fn drop_redundant_absent<'a>(
+    group: Vec<(&'a EnvironmentLiteral, bool)>,
+) -> Vec<(&'a EnvironmentLiteral, bool)> {
+    let has_positive_match = group
+        .iter()
+        .any(|(literal, positive)| *positive && matches!(literal.kind, EnvironmentLiteralKind::Matches(_)));
+    if !has_positive_match {
+        return group;
+    }
+    group
+        .into_iter()
+        .filter(|(literal, positive)| {
+            *positive || !matches!(literal.kind, EnvironmentLiteralKind::Absent)
+        })
+        .collect()
 }
 
 /// Groups the signed literals of a condition by package, preserving
@@ -220,9 +247,12 @@ fn group_by_package(
 /// The exact version range set of a group of signed literals on one
 /// package: the intersection of the positive literals' ranges minus the
 /// negative literals' ranges. `None` when any literal is not a version-only
-/// match or its version spec is not exactly representable as ranges.
+/// match, a positive literal's version spec is not exactly representable, or
+/// a negative literal is not exactly representable yet could overlap the
+/// positive base.
 fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>> {
-    let mut result = Ranges::full();
+    // Every literal must constrain only the version.
+    let mut versions = Vec::with_capacity(group.len());
     for (literal, positive) in group {
         let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
             return None;
@@ -230,11 +260,35 @@ fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>
         if !spec_is_version_only(spec) {
             return None;
         }
-        let ranges = version_spec_to_ranges(spec.version.as_ref()?)?;
-        if *positive {
-            result = result.intersection(&ranges);
+        versions.push((spec.version.as_ref()?, *positive));
+    }
+
+    // The positive literals must be exactly representable; their
+    // intersection is the base that the negatives carve out of.
+    let mut positive = Ranges::full();
+    for (version, is_positive) in &versions {
+        if *is_positive {
+            positive = positive.intersection(&version_spec_to_ranges(version)?);
+        }
+    }
+
+    let mut result = positive.clone();
+    for (version, is_positive) in &versions {
+        if *is_positive {
+            continue;
+        }
+        if let Some(exact) = version_spec_to_ranges(version) {
+            result = result.intersection(&exact.complement());
         } else {
-            result = result.intersection(&ranges.complement());
+            // The negated spec has no exact range (e.g. a `X.0.*` prefix,
+            // ambiguous under conda zero-padding). It only changes the
+            // result if it can overlap the positive base; the envelope is a
+            // superset, so when even that is disjoint the negation removes
+            // nothing and is dropped. Otherwise the range is not exact.
+            let envelope = version_spec_to_ranges_envelope(version)?;
+            if !positive.intersection(&envelope).is_empty() {
+                return None;
+            }
         }
     }
     Some(result)
@@ -1476,16 +1530,29 @@ mod tests {
         );
     }
 
-    /// A group containing an `Absent` literal is untouched.
+    /// A `not absent` literal is redundant when a positive version literal
+    /// already implies the package is present, so it is dropped and the
+    /// group combines into the version range.
     #[test]
-    fn test_display_condition_absent_group_untouched() {
+    fn test_display_condition_drops_redundant_absent() {
         let condition = vec![
             (matches_literal("__cuda", ">=12.0"), true),
             (absent_literal("__cuda"), false),
         ];
+        assert_eq!(display_condition(&condition), "__cuda >=12.0");
+    }
+
+    /// A `not absent` literal with no positive version literal to imply it is
+    /// the only thing forcing presence, so it is kept.
+    #[test]
+    fn test_display_condition_absent_kept_without_positive_match() {
+        let condition = vec![
+            (matches_literal("__cuda", ">=13"), false),
+            (absent_literal("__cuda"), false),
+        ];
         assert_eq!(
             display_condition(&condition),
-            "__cuda >=12.0 AND not (__cuda absent)"
+            "not (__cuda >=13) AND not (__cuda absent)"
         );
     }
 
@@ -1747,7 +1814,8 @@ mod tests {
 
     /// A disjunct mixing `Absent` and `Matches` literals on the same
     /// package fails to canonicalize structurally: it is kept untouched and
-    /// only deduplicates against an identical disjunct.
+    /// only deduplicates against an identical disjunct. (Its display drops
+    /// the `not absent` literal the positive `>=12.0` already implies.)
     #[test]
     fn test_simplify_presence_keeps_uncanonicalizable_disjunct() {
         let weird = vec![
@@ -1755,9 +1823,6 @@ mod tests {
             (absent_literal("__cuda"), false),
         ];
         let presence = vec![weird.clone(), weird];
-        assert_eq!(
-            simplified(presence),
-            vec!["__cuda >=12.0 AND not (__cuda absent)"]
-        );
+        assert_eq!(simplified(presence), vec!["__cuda >=12.0"]);
     }
 }

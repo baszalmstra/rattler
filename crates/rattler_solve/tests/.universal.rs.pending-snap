@@ -1,4 +1,0 @@
-{"run_id":"1781874729-747575100","line":517,"new":{"module_name":"universal","snapshot_name":"universal_unsolvable_witness_combines_to_single_range","metadata":{"source":"crates/rattler_solve/tests/universal.rs","assertion_line":517,"expression":"condition"},"snapshot":"__cuda >=12.0 AND not (__cuda >=12.2) AND not (__cuda 11.0.*) AND not (__cuda absent)"},"old":{"module_name":"universal","metadata":{},"snapshot":"__cuda >=12.0,<12.2"}}
-{"run_id":"1781874729-747575100","line":200,"new":{"module_name":"universal","snapshot_name":"universal_cuda_unsolvable_region","metadata":{"source":"crates/rattler_solve/tests/universal.rs","assertion_line":200,"expression":"condition"},"snapshot":"__cuda >=11 AND not (__cuda >=12.1) AND not (__cuda absent)"},"old":{"module_name":"universal","metadata":{},"snapshot":"__cuda >=11,<12.1"}}
-{"run_id":"1781874729-747575100","line":236,"new":null,"old":null}
-{"run_id":"1781874729-747575100","line":275,"new":null,"old":null}

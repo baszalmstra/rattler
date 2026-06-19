@@ -176,7 +176,7 @@ fn version_part_relation(a: Option<&VersionSpec>, b: Option<&VersionSpec>) -> Ve
 /// - `and` groups: intersection, skipping branches without an envelope
 ///   (dropping a conjunct only enlarges the set).
 /// - `or` groups: union; no envelope if any branch lacks one.
-fn version_spec_to_ranges_envelope(spec: &VersionSpec) -> Option<Ranges<Version>> {
+pub(crate) fn version_spec_to_ranges_envelope(spec: &VersionSpec) -> Option<Ranges<Version>> {
     if let Some(exact) = version_spec_to_ranges(spec) {
         return Some(exact);
     }
