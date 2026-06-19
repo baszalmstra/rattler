@@ -85,12 +85,13 @@ pub struct SymbolicVirtualPackage {
 }
 
 impl SymbolicVirtualPackage {
-    /// The v1 set of symbolic virtual packages: `__cuda` (machines without
-    /// a GPU driver exist, so it is absentable), and `__archspec`, `__glibc`,
-    /// `__osx` and `__win` (not absentable: CEP 30 requires `__archspec` to
-    /// always be present, and the platform packages always exist on their
-    /// respective platforms). It is the caller's responsibility to only
-    /// model the packages that make sense for the platform being solved.
+    /// The v1 set of symbolic virtual packages: `__cuda` and `__cuda_arch`
+    /// (machines without an NVIDIA GPU exist, so they are absentable), and
+    /// `__archspec`, `__glibc`, `__osx` and `__win` (not absentable: CEP 30
+    /// requires `__archspec` to always be present, and the platform packages
+    /// always exist on their respective platforms). It is the caller's
+    /// responsibility to only model the packages that make sense for the
+    /// platform being solved.
     ///
     /// `__archspec` literals match the machine's single reported
     /// microarchitecture name exactly (CEP 30 semantics, identical to
@@ -100,6 +101,7 @@ impl SymbolicVirtualPackage {
     pub fn default_v1_set() -> Vec<SymbolicVirtualPackage> {
         [
             ("__cuda", true),
+            ("__cuda_arch", true),
             ("__archspec", false),
             ("__glibc", false),
             ("__osx", false),
