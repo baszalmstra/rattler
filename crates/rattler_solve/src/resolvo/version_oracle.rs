@@ -729,6 +729,46 @@ mod tests {
         assert_eq!(arch("^haswell.$", "haswell"), Unknown);
     }
 
+    /// Diagnostic for the `_x86_64-microarch-level` specs that appear together
+    /// in a real universal solve: the nested level regexes, the individual
+    /// name literals, and the two version forms (`1.*` and `==1`). Pins down
+    /// every relation the oracle must get right for the cell enumeration to
+    /// collapse them instead of listing them all.
+    #[test]
+    fn test_relation_archspec_microarch_level_specs() {
+        use VersionSetRelation::*;
+        let v4 = "^(cascadelake|icelake|sapphirerapids|skylake_avx512|x86_64_v4|zen4|zen5)$";
+        let v3 = "^(broadwell|cannonlake|excavator|haswell|mic_knl|skylake|x86_64_v3|zen|zen2|\
+                  zen3|cascadelake|icelake|sapphirerapids|skylake_avx512|x86_64_v4|zen4|zen5)$";
+        let base = "^(core2|k10|nocona|x86_64|bulldozer|ivybridge|nehalem|piledriver|sandybridge|\
+                    steamroller|westmere|x86_64_v2|broadwell|cannonlake|excavator|haswell|mic_knl|\
+                    skylake|x86_64_v3|zen|zen2|zen3|cascadelake|icelake|sapphirerapids|\
+                    skylake_avx512|x86_64_v4|zen4|zen5)$";
+        let rel = |va: &str, ba: &str, vb: &str, bb: &str| {
+            relation("__archspec", (Some(va), Some(ba)), (Some(vb), Some(bb)))
+        };
+
+        // The microarch-level name sets are nested: v4 ⊂ v3 ⊂ base.
+        assert_eq!(rel("1.*", v4, "1.*", v3), Subset);
+        assert_eq!(rel("1.*", v3, "1.*", base), Subset);
+        assert_eq!(rel("1.*", v4, "1.*", base), Subset);
+        assert_eq!(rel("1.*", base, "1.*", v4), Superset);
+
+        // An individual name is a subset of any regex listing it; disjoint
+        // from a regex that does not list it.
+        assert_eq!(rel("1.*", "x86_64", "1.*", base), Subset);
+        assert_eq!(rel("1.*", "zen5", "1.*", v4), Subset);
+        assert_eq!(rel("1.*", "x86_64", "1.*", v4), Disjoint);
+
+        // The two version forms in the repodata: `==1` (exact) is a subset of
+        // `1.*` (starts-with) for the same build.
+        assert_eq!(rel("==1", "core2", "1.*", "core2"), Subset);
+        assert_eq!(rel("1.*", "core2", "==1", "core2"), Superset);
+
+        // Cross version+build: `==1 core2` ⊆ `1.* base` (both parts subsets).
+        assert_eq!(rel("==1", "core2", "1.*", base), Subset);
+    }
+
     #[test]
     fn test_relation_build_strings() {
         use VersionSetRelation::*;

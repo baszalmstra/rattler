@@ -15,8 +15,9 @@ use rattler::{
     package_cache::PackageCache,
 };
 use rattler_conda_types::{
-    Channel, ChannelConfig, GenericVirtualPackage, MatchSpec, Matches, NamelessMatchSpec,
-    PackageName, ParseMatchSpecOptions, Platform, PrefixRecord, RepoDataRecord, Version,
+    Arch, Channel, ChannelConfig, GenericVirtualPackage, MatchSpec, Matches, NamelessMatchSpec,
+    PackageName, ParseMatchSpecOptions, Platform, PrefixRecord, RepoDataRecord, StringMatcher,
+    Version,
 };
 use rattler_repodata_gateway::{Gateway, RepoData, SourceConfig};
 use rattler_solve::{
@@ -591,6 +592,24 @@ fn run_universal_solve(
             ),
         };
         environment_model.push(vec![(win_lit, true)]);
+    }
+
+    // __archspec is always present (CEP 30) but its value would otherwise be
+    // unconstrained, so the solver explores impossible regions where the
+    // machine's microarchitecture is none of the platform's names (every
+    // x86_64 machine reports at least `x86_64`), producing spurious unsolvable
+    // cells. Bound it to the family baseline microarchitecture: the modeled
+    // space becomes the lowest-common-denominator machine of the family. Only
+    // x86_64 is modeled today; other families keep the unconstrained behaviour.
+    if matches!(install_platform.arch(), Some(Arch::X86_64)) {
+        let archspec_lit = EnvironmentLiteral {
+            package: PackageName::new_unchecked("__archspec"),
+            kind: EnvironmentLiteralKind::Matches(NamelessMatchSpec {
+                build: Some(StringMatcher::Exact("x86_64".to_string())),
+                ..Default::default()
+            }),
+        };
+        environment_model.push(vec![(archspec_lit, true)]);
     }
 
     // Use from_env() overrides in the universal path, matching the intent of
