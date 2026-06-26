@@ -18,8 +18,8 @@ use rattler_conda_types::{
 };
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    EnvironmentPackage, HintDependenciesAvailable, Interner, KnownDependencies, NameId,
-    PackageCandidates, Problem, SolvableId, Solver as LibSolvRsSolver, SolverCache, StringId,
+    EnvironmentPackage, HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem,
+    SolvableId, Solver as LibSolvRsSolver, SolverCache, StringId, UniversalDependencyProvider,
     UnsolvableOrCancelled, VersionSetId, VersionSetRelation, VersionSetUnionId,
     utils::{Pool, VersionSet},
 };
@@ -66,7 +66,7 @@ fn exclude_newer_reason(
 /// A virtual package that the solver treats *symbolically*: instead of
 /// injecting a concrete record describing one machine's capability, the
 /// package becomes an *environment package* whose value is unknown at solve
-/// time (a [`resolvo::PackageCandidates::Environment`] declaration).
+/// time (a [`resolvo::UniversalDependencyProvider::environment_package`] declaration).
 ///
 /// Symbolic virtual packages are the input of the universal solve: version
 /// sets used against them become environment literals, and the result is a
@@ -850,14 +850,9 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
             .sort(solvables, &mut highest_version_spec);
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
-        // Symbolic virtual packages are environment packages: their value is
-        // unknown at solve time and they have no candidate records.
-        if let Some(&environment_package) = self.symbolic_virtual_packages.get(&name) {
-            return Some(PackageCandidates::Environment(environment_package));
-        }
+    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
         match self.pool.resolve_package_name(name) {
-            NameType::Base(_) => self.records.get(&name).cloned().map(Into::into),
+            NameType::Base(_) => self.records.get(&name).cloned(),
             NameType::Extra { package, extra } => {
                 // For extras, we need to create a new candidates object
                 // that contains only the extra solvable.
@@ -866,16 +861,13 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
                     PackageName::new_unchecked(package),
                     extra.clone(),
                 );
-                Some(
-                    Candidates {
-                        candidates: vec![extra_solvable],
-                        favored: None,
-                        locked: None,
-                        excluded: Vec::new(),
-                        hint_dependencies_available: HintDependenciesAvailable::All,
-                    }
-                    .into(),
-                )
+                Some(Candidates {
+                    candidates: vec![extra_solvable],
+                    favored: None,
+                    locked: None,
+                    excluded: Vec::new(),
+                    hint_dependencies_available: HintDependenciesAvailable::All,
+                })
             }
         }
     }
@@ -1079,6 +1071,26 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
         }
     }
 
+    fn should_cancel_with_value(&self) -> Option<Box<dyn std::any::Any>> {
+        if let Some(token) = &self.cancellation_token
+            && token.is_cancelled()
+        {
+            return Some(Box::new(CancelReason::Cancelled));
+        }
+        if let Some(stop_time) = self.stop_time
+            && std::time::SystemTime::now() > stop_time
+        {
+            return Some(Box::new(CancelReason::Timeout));
+        }
+        None
+    }
+}
+
+impl UniversalDependencyProvider for CondaDependencyProvider<'_> {
+    fn environment_package(&self, name: NameId) -> Option<EnvironmentPackage> {
+        self.symbolic_virtual_packages.get(&name).copied()
+    }
+
     fn environment_version_set_relation(
         &self,
         a: VersionSetId,
@@ -1100,20 +1112,6 @@ impl DependencyProvider for CondaDependencyProvider<'_> {
             return VersionSetRelation::Unknown;
         };
         version_oracle::match_spec_relation(spec_a, spec_b)
-    }
-
-    fn should_cancel_with_value(&self) -> Option<Box<dyn std::any::Any>> {
-        if let Some(token) = &self.cancellation_token
-            && token.is_cancelled()
-        {
-            return Some(Box::new(CancelReason::Cancelled));
-        }
-        if let Some(stop_time) = self.stop_time
-            && std::time::SystemTime::now() > stop_time
-        {
-            return Some(Box::new(CancelReason::Timeout));
-        }
-        None
     }
 }
 
@@ -1432,16 +1430,23 @@ mod tests {
         .unwrap()
     }
 
-    fn get_candidates(
-        provider: &CondaDependencyProvider<'_>,
-        name: &str,
-    ) -> Option<PackageCandidates> {
+    fn get_candidates(provider: &CondaDependencyProvider<'_>, name: &str) -> Option<Candidates> {
         let name_id = provider
             .pool
             .intern_package_name(NameType::Base(name.to_owned()));
         DependencyProvider::get_candidates(provider, name_id)
             .now_or_never()
             .expect("get_candidates is synchronous for this provider")
+    }
+
+    fn get_environment_package(
+        provider: &CondaDependencyProvider<'_>,
+        name: &str,
+    ) -> Option<EnvironmentPackage> {
+        let name_id = provider
+            .pool
+            .intern_package_name(NameType::Base(name.to_owned()));
+        UniversalDependencyProvider::environment_package(provider, name_id)
     }
 
     /// Symbolic virtual packages are declared as environment packages; they
@@ -1457,10 +1462,7 @@ mod tests {
         let provider = provider_with_symbolic(&concrete, &symbolic);
 
         // The concrete virtual package keeps its candidate record.
-        assert!(matches!(
-            get_candidates(&provider, "__unix"),
-            Some(PackageCandidates::Candidates(_))
-        ));
+        assert!(get_candidates(&provider, "__unix").is_some());
 
         // __cuda can be absent (machines without a GPU exist); the others
         // are always present on their platform.
@@ -1470,12 +1472,12 @@ mod tests {
             ("__osx", false),
             ("__win", false),
         ] {
-            match get_candidates(&provider, name) {
-                Some(PackageCandidates::Environment(env)) => assert_eq!(
+            match get_environment_package(&provider, name) {
+                Some(env) => assert_eq!(
                     env.can_be_absent, can_be_absent,
                     "unexpected can_be_absent for {name}",
                 ),
-                other => panic!("expected {name} to be an environment package, got {other:?}"),
+                None => panic!("expected {name} to be an environment package"),
             }
         }
 
@@ -1540,9 +1542,6 @@ mod tests {
         }];
         let symbolic = SymbolicVirtualPackage::default_v1_set();
         let provider = provider_with_symbolic(&concrete, &symbolic);
-        assert!(matches!(
-            get_candidates(&provider, "__cuda"),
-            Some(PackageCandidates::Environment(_))
-        ));
+        assert!(get_environment_package(&provider, "__cuda").is_some());
     }
 }

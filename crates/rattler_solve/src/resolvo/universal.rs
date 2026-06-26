@@ -1,4 +1,4 @@
-﻿//! The universal solve entry point of the resolvo backend: a single solve
+//! The universal solve entry point of the resolvo backend: a single solve
 //! whose output is valid for a whole family of environments (machines with
 //! or without CUDA, any glibc above a floor, any microarchitecture, ...)
 //! instead of one concrete machine.
@@ -24,17 +24,22 @@ use std::{
 use rattler_conda_types::{
     GenericVirtualPackage, MatchSpec, NamelessMatchSpec, PackageName, PackageNameMatcher,
     ParseStrictness, RepoDataRecord, StringMatcher, Version, VersionSpec,
+    match_spec::matcher::RegexMatcher,
 };
 use resolvo::{
-    ConditionalRequirement, EnvLiteral, EnvLiteralKind, NameId, SolvableId,
-    Solver as ResolvoSolver, UniversalFailure, UniversalProblem, UniversalSolution, VersionSetId,
+    CellCondition as ResolvoCellCondition, ConditionalRequirement, EnvClause, EnvLiteral,
+    EnvironmentModel, NameId, SignedEnvLiteral, SolvableId, Solver as ResolvoSolver,
+    UniversalFailure, UniversalProblem, UniversalSolution, VersionSetId,
 };
 use version_ranges::Ranges;
 
 use super::{
     CondaDependencyProvider, DependencyOverride, NameType, RepoData, SolverMatchSpec,
     SolverPackageRecord, SymbolicVirtualPackage,
-    version_oracle::{version_spec_to_ranges, version_spec_to_ranges_envelope},
+    version_oracle::{
+        literal_alternatives, match_spec_relation, version_spec_to_ranges,
+        version_spec_to_ranges_envelope,
+    },
 };
 use crate::{
     CancellationToken, ChannelPriority, ExcludeNewer, IntoRepoData, SolveError, SolveStrategy,
@@ -131,16 +136,22 @@ pub type EnvironmentCondition = Vec<(EnvironmentLiteral, bool)>;
 /// Multiple version-only literals on the same package are combined into a
 /// single contiguous range when that is exactly equivalent: for example
 /// `__cuda >=12.0 AND not (__cuda >=13)` renders as `__cuda >=12.0,<13`.
-/// The combined range replaces the package's literals at the position of
-/// its first literal. Whenever a package's literals are not exactly
-/// representable as one contiguous interval (a build matcher or other
-/// non-version field, an `Absent` literal, no positive literal, an
-/// unconvertible version spec, or a disjoint/empty result), they fall back
-/// to the plain per-literal rendering.
+/// An explicit `not (__cuda absent)` counts as the presence constraint that
+/// makes negative-only version literals renderable, so `not (__cuda >=13)
+/// AND not (__cuda absent)` renders as `__cuda <13`. Finite build-string
+/// atom sets are also compacted when exact: redundant disjoint negations are
+/// dropped, and anchored literal alternations can subtract exact atoms.
+/// Whenever a package's literals are not exactly representable as one
+/// positive literal (for example a split version range, a non-finite build
+/// matcher, or an unconvertible version spec), they fall back to the plain
+/// per-literal rendering.
 pub fn display_condition(condition: &EnvironmentCondition) -> String {
     if condition.is_empty() {
         return "<all environments>".to_string();
     }
+
+    let simplified = simplify_condition(condition.clone());
+    let condition = &simplified;
 
     let combined = combinable_ranges(condition);
     let negation_sets = atom_negation_sets(condition);
@@ -168,12 +179,56 @@ pub fn display_condition(condition: &EnvironmentCondition) -> String {
                 parts.push(set.clone());
             }
         } else if *positive {
-            parts.push(literal.to_string());
+            parts.push(format_literal(literal));
         } else {
-            parts.push(format!("not ({literal})"));
+            parts.push(format!("not ({})", format_literal(literal)));
         }
     }
     parts.join(" AND ")
+}
+
+/// Simplifies one conjunction of signed environment literals into an
+/// equivalent, more compact conjunction where this is exactly representable
+/// in the public [`EnvironmentCondition`] shape.
+///
+/// The simplifier is intentionally conservative: it only drops literals that
+/// are provably redundant and only folds same-package version/build
+/// constraints when the result is a single positive literal. In particular,
+/// a negative-only version constraint such as `not (__cuda >=13)` is left
+/// alone because it also holds when `__cuda` is absent; with an explicit
+/// `not (__cuda absent)` presence literal it can be rendered as
+/// `__cuda <13`.
+fn simplify_condition(condition: EnvironmentCondition) -> EnvironmentCondition {
+    let mut simplified = Vec::new();
+    for (package, group) in group_by_package(&condition) {
+        let group = drop_redundant_literals(group);
+        if group.len() > 1
+            && let Some(group) = finite_build_group(package, &group)
+        {
+            simplified.extend(group);
+            continue;
+        }
+        if group.len() > 1
+            && let Some(ranges) = group_ranges(&group)
+            && let Some(rendered) = render_single_interval(&ranges)
+            && let Ok(spec) = NamelessMatchSpec::from_str(&rendered, ParseStrictness::Strict)
+        {
+            simplified.push((
+                EnvironmentLiteral {
+                    package: package.clone(),
+                    kind: EnvironmentLiteralKind::Matches(spec),
+                },
+                true,
+            ));
+            continue;
+        }
+        simplified.extend(
+            group
+                .into_iter()
+                .map(|(literal, positive)| (literal.clone(), positive)),
+        );
+    }
+    simplified
 }
 
 /// Computes, per package with more than one literal in the condition, the
@@ -185,11 +240,12 @@ fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, Str
     let mut combined = Vec::new();
     for (package, group) in group_by_package(condition) {
         // A single literal already renders as well as it can; a group
-        // without a positive literal has no range to subtract from.
-        if group.len() < 2 || !group.iter().any(|(_, positive)| *positive) {
+        // without a presence constraint has no present-value domain from
+        // which to subtract negative literals.
+        if group.len() < 2 || !group_has_presence_constraint(&group) {
             continue;
         }
-        let group = drop_redundant_absent(group);
+        let group = drop_redundant_literals(group);
         let Some(ranges) = group_ranges(&group) else {
             continue;
         };
@@ -201,29 +257,57 @@ fn combinable_ranges(condition: &EnvironmentCondition) -> Vec<(&PackageName, Str
     combined
 }
 
-/// Drops `not absent` literals that a positive version match in the same
-/// group already implies: a positive version constraint requires the
-/// package to be present, so an explicit `not absent` literal is redundant.
-/// Without this the redundant literal would block range combining (an
-/// `Absent` literal makes [`group_ranges`] bail) and the package would fall
-/// back to verbose per-literal rendering. The drop is only applied when such
-/// a positive version match exists, so a `not absent` literal that is the
-/// only thing forcing presence is preserved.
-fn drop_redundant_absent<'a>(
+/// Drops literals in one same-package conjunction group that are provably
+/// redundant from other literals in the same group.
+///
+/// - A positive `Matches` literal implies `not Absent`.
+/// - A positive `Absent` literal implies every `not Matches` literal.
+/// - A positive `Matches` literal disjoint from a negative `Matches` literal
+///   implies that negative literal.
+fn drop_redundant_literals<'a>(
     group: Vec<(&'a EnvironmentLiteral, bool)>,
 ) -> Vec<(&'a EnvironmentLiteral, bool)> {
-    let has_positive_match = group
+    let has_positive_match = group.iter().any(|(literal, positive)| {
+        *positive && matches!(literal.kind, EnvironmentLiteralKind::Matches(_))
+    });
+    let has_positive_absent = group.iter().any(|(literal, positive)| {
+        *positive && matches!(literal.kind, EnvironmentLiteralKind::Absent)
+    });
+    let positive_specs: Vec<&NamelessMatchSpec> = group
         .iter()
-        .any(|(literal, positive)| *positive && matches!(literal.kind, EnvironmentLiteralKind::Matches(_)));
-    if !has_positive_match {
-        return group;
-    }
+        .filter_map(|(literal, positive)| match (&literal.kind, *positive) {
+            (EnvironmentLiteralKind::Matches(spec), true) => Some(spec),
+            _ => None,
+        })
+        .collect();
+
     group
         .into_iter()
         .filter(|(literal, positive)| {
-            *positive || !matches!(literal.kind, EnvironmentLiteralKind::Absent)
+            if *positive {
+                return true;
+            }
+            match &literal.kind {
+                EnvironmentLiteralKind::Absent => !has_positive_match,
+                EnvironmentLiteralKind::Matches(negative) => {
+                    !has_positive_absent
+                        && !positive_specs.iter().any(|positive| {
+                            match_spec_relation(positive, negative)
+                                == resolvo::VersionSetRelation::Disjoint
+                        })
+                }
+            }
         })
         .collect()
+}
+
+/// Whether a group constrains the package to be present, either through a
+/// positive value match or an explicit `not absent` literal.
+fn group_has_presence_constraint(group: &[(&EnvironmentLiteral, bool)]) -> bool {
+    group.iter().any(|(literal, positive)| match &literal.kind {
+        EnvironmentLiteralKind::Matches(_) => *positive,
+        EnvironmentLiteralKind::Absent => !*positive,
+    })
 }
 
 /// Groups the signed literals of a condition by package, preserving
@@ -245,30 +329,41 @@ fn group_by_package(
 }
 
 /// The exact version range set of a group of signed literals on one
-/// package: the intersection of the positive literals' ranges minus the
-/// negative literals' ranges. `None` when any literal is not a version-only
-/// match, a positive literal's version spec is not exactly representable, or
-/// a negative literal is not exactly representable yet could overlap the
-/// positive base.
+/// package: the intersection of the positive literals' ranges (or the full
+/// present-value domain when `not absent` explicitly forces presence) minus
+/// the negative literals' ranges. `None` when any literal is not a
+/// version-only match/presence literal, a positive literal's version spec is
+/// not exactly representable, or a negative literal is not exactly
+/// representable yet could overlap the positive base.
 fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>> {
-    // Every literal must constrain only the version.
     let mut versions = Vec::with_capacity(group.len());
+    let mut has_presence_constraint = false;
     for (literal, positive) in group {
-        let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
-            return None;
-        };
-        if !spec_is_version_only(spec) {
-            return None;
+        match &literal.kind {
+            EnvironmentLiteralKind::Matches(spec) => {
+                if !spec_has_only_version_part(spec) {
+                    return None;
+                }
+                has_presence_constraint |= *positive;
+                versions.push((spec.version.as_ref(), *positive));
+            }
+            EnvironmentLiteralKind::Absent if !*positive => {
+                has_presence_constraint = true;
+            }
+            EnvironmentLiteralKind::Absent => return None,
         }
-        versions.push((spec.version.as_ref()?, *positive));
+    }
+    if !has_presence_constraint {
+        return None;
     }
 
     // The positive literals must be exactly representable; their
-    // intersection is the base that the negatives carve out of.
+    // intersection is the base that the negatives carve out of. An absent
+    // negative without any positive match gives a full present-value base.
     let mut positive = Ranges::full();
     for (version, is_positive) in &versions {
         if *is_positive {
-            positive = positive.intersection(&version_spec_to_ranges(version)?);
+            positive = positive.intersection(&version_spec_to_ranges_opt(*version)?);
         }
     }
 
@@ -277,7 +372,7 @@ fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>
         if *is_positive {
             continue;
         }
-        if let Some(exact) = version_spec_to_ranges(version) {
+        if let Some(exact) = version_spec_to_ranges_opt(*version) {
             result = result.intersection(&exact.complement());
         } else {
             // The negated spec has no exact range (e.g. a `X.0.*` prefix,
@@ -285,7 +380,7 @@ fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>
             // result if it can overlap the positive base; the envelope is a
             // superset, so when even that is disjoint the negation removes
             // nothing and is dropped. Otherwise the range is not exact.
-            let envelope = version_spec_to_ranges_envelope(version)?;
+            let envelope = version_spec_to_ranges_envelope_opt(*version)?;
             if !positive.intersection(&envelope).is_empty() {
                 return None;
             }
@@ -294,12 +389,26 @@ fn group_ranges(group: &[(&EnvironmentLiteral, bool)]) -> Option<Ranges<Version>
     Some(result)
 }
 
-/// Whether the spec constrains the version and nothing else. Strict by
-/// destructuring: a field added to [`NamelessMatchSpec`] fails to compile
-/// here and must be classified explicitly.
-fn spec_is_version_only(spec: &NamelessMatchSpec) -> bool {
+fn version_spec_to_ranges_opt(version: Option<&VersionSpec>) -> Option<Ranges<Version>> {
+    match version {
+        Some(version) => version_spec_to_ranges(version),
+        None => Some(Ranges::full()),
+    }
+}
+
+fn version_spec_to_ranges_envelope_opt(version: Option<&VersionSpec>) -> Option<Ranges<Version>> {
+    match version {
+        Some(version) => version_spec_to_ranges_envelope(version),
+        None => Some(Ranges::full()),
+    }
+}
+
+/// Whether the spec has no modeled field except the optional version part.
+/// Strict by destructuring: a field added to [`NamelessMatchSpec`] fails to
+/// compile here and must be classified explicitly.
+fn spec_has_only_version_part(spec: &NamelessMatchSpec) -> bool {
     let NamelessMatchSpec {
-        version,
+        version: _,
         build,
         build_number,
         file_name,
@@ -316,8 +425,7 @@ fn spec_is_version_only(spec: &NamelessMatchSpec) -> bool {
         condition,
         track_features,
     } = spec;
-    version.is_some()
-        && build.is_none()
+    build.is_none()
         && build_number.is_none()
         && file_name.is_none()
         && extras.is_none()
@@ -334,15 +442,18 @@ fn spec_is_version_only(spec: &NamelessMatchSpec) -> bool {
         && track_features.is_none()
 }
 
-/// Extracts the exact-build atom form of a spec: an optional version part
-/// plus an exact build matcher, and nothing else. Such a literal describes
-/// a single atomic value (e.g. `__archspec 1.* skylake`), so groups of them
-/// render as name sets. Strict by destructuring, like
-/// [`spec_is_version_only`].
-fn spec_as_exact_atom(spec: &NamelessMatchSpec) -> Option<(Option<&VersionSpec>, &str)> {
+/// Extracts the finite-build atom form of a spec: an optional version part
+/// plus a finite set of exact build strings, and nothing else. Such a
+/// literal describes one or more atomic values (e.g. `__archspec 1.*
+/// skylake` or `__archspec 1.* ^(skylake|zen4)$`), so groups of them render
+/// as name sets. Strict by destructuring, like
+/// [`spec_has_only_version_part`].
+fn spec_as_finite_atom_set(
+    spec: &NamelessMatchSpec,
+) -> Option<(Option<&VersionSpec>, Vec<String>)> {
     let NamelessMatchSpec {
         version,
-        build: Some(StringMatcher::Exact(name)),
+        build: Some(build),
         build_number: None,
         file_name: None,
         extras: None,
@@ -361,14 +472,17 @@ fn spec_as_exact_atom(spec: &NamelessMatchSpec) -> Option<(Option<&VersionSpec>,
     else {
         return None;
     };
-    Some((version.as_ref(), name))
+    Some((version.as_ref(), literal_alternatives(build)?))
 }
 
 /// Renders an atom name set as `<package> <version> in {a, b, c}` (names
 /// alphabetical, deduplicated; the version part is omitted when absent).
-fn format_atom_set(package: &PackageName, version: Option<&str>, names: &mut Vec<&str>) -> String {
-    names.sort_unstable();
-    names.dedup();
+fn format_atom_set(
+    package: &PackageName,
+    version: Option<&str>,
+    names: &mut Vec<String>,
+) -> String {
+    normalize_literal_names(names);
     match version {
         Some(version) => format!(
             "{} {version} in {{{}}}",
@@ -377,6 +491,108 @@ fn format_atom_set(package: &PackageName, version: Option<&str>, names: &mut Vec
         ),
         None => format!("{} in {{{}}}", package.as_normalized(), names.join(", ")),
     }
+}
+
+fn normalize_literal_names(names: &mut Vec<String>) {
+    names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+}
+
+fn contains_literal_name(names: &[String], candidate: &str) -> bool {
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(candidate))
+}
+
+fn plain_regex_literal(name: &str) -> bool {
+    const META: &[u8] = b".^$*+?()[]{}\\|";
+    !name.is_empty() && !name.bytes().any(|c| META.contains(&c))
+}
+
+fn matcher_for_literal_names(names: &[String]) -> Option<StringMatcher> {
+    match names {
+        [] => None,
+        [single] => Some(StringMatcher::Exact(single.clone())),
+        many if many.iter().all(|name| plain_regex_literal(name)) => {
+            let pattern = format!("^({})$", many.join("|"));
+            Some(StringMatcher::Regex(Box::new(
+                RegexMatcher::new(&pattern).ok()?,
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn format_literal(literal: &EnvironmentLiteral) -> String {
+    if let EnvironmentLiteralKind::Matches(spec) = &literal.kind
+        && let Some((version, mut names)) = spec_as_finite_atom_set(spec)
+        && names.len() > 1
+    {
+        return format_atom_set(
+            &literal.package,
+            version.map(ToString::to_string).as_deref(),
+            &mut names,
+        );
+    }
+    literal.to_string()
+}
+
+/// Simplifies a group of finite build-string atoms sharing the same package
+/// and version part. Positive atoms intersect their finite build sets;
+/// negative atoms subtract from that finite base. The result is represented
+/// as a single positive exact/anchored-alternation build matcher when that is
+/// possible.
+fn finite_build_group(
+    package: &PackageName,
+    group: &[(&EnvironmentLiteral, bool)],
+) -> Option<EnvironmentCondition> {
+    let mut version: Option<Option<VersionSpec>> = None;
+    let mut selected: Option<Vec<String>> = None;
+    let mut exclusions: Vec<Vec<String>> = Vec::new();
+
+    for (literal, positive) in group {
+        let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
+            return None;
+        };
+        let (spec_version, mut names) = spec_as_finite_atom_set(spec)?;
+        normalize_literal_names(&mut names);
+        let spec_version = spec_version.cloned();
+        match &version {
+            None => version = Some(spec_version.clone()),
+            Some(existing) if *existing == spec_version => {}
+            Some(_) => return None,
+        }
+        if *positive {
+            selected = Some(match selected.take() {
+                Some(current) => current
+                    .into_iter()
+                    .filter(|name| contains_literal_name(&names, name))
+                    .collect(),
+                None => names,
+            });
+        } else {
+            exclusions.push(names);
+        }
+    }
+
+    let mut selected = selected?;
+    for excluded in exclusions {
+        selected.retain(|name| !contains_literal_name(&excluded, name));
+    }
+    normalize_literal_names(&mut selected);
+    let build = matcher_for_literal_names(&selected)?;
+    let spec = NamelessMatchSpec {
+        version: version.flatten(),
+        build: Some(build),
+        ..NamelessMatchSpec::default()
+    };
+    Some(vec![(
+        EnvironmentLiteral {
+            package: package.clone(),
+            kind: EnvironmentLiteralKind::Matches(spec),
+        },
+        true,
+    )])
 }
 
 /// Computes, per package whose literals in the condition are two or more
@@ -389,13 +605,13 @@ fn atom_negation_sets(condition: &EnvironmentCondition) -> Vec<(&PackageName, St
         if group.len() < 2 || group.iter().any(|(_, positive)| *positive) {
             continue;
         }
-        let mut names: Vec<&str> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         let mut version_part: Option<Option<String>> = None;
         for (literal, _) in &group {
             let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
                 continue 'packages;
             };
-            let Some((version, name)) = spec_as_exact_atom(spec) else {
+            let Some((version, mut atom_names)) = spec_as_finite_atom_set(spec) else {
                 continue 'packages;
             };
             let rendered = version.map(ToString::to_string);
@@ -404,7 +620,7 @@ fn atom_negation_sets(condition: &EnvironmentCondition) -> Vec<(&PackageName, St
                 Some(existing) if *existing == rendered => {}
                 Some(_) => continue 'packages,
             }
-            names.push(name);
+            names.append(&mut atom_names);
         }
         let version = version_part.flatten();
         let set = format_atom_set(package, version.as_deref(), &mut names);
@@ -436,10 +652,10 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
         return "<no environment>".to_string();
     }
 
-    // The literal at `index` as a mergeable atom: positive, an exact-build
-    // atom, and the only literal of its package in the disjunct.
+    // The literal at `index` as a mergeable atom set: positive, finite-build
+    // atom(s), and the only literal of its package in the disjunct.
     let atom_at =
-        |condition: &EnvironmentCondition, index: usize| -> Option<(Option<String>, String)> {
+        |condition: &EnvironmentCondition, index: usize| -> Option<(Option<String>, Vec<String>)> {
             let (literal, positive) = &condition[index];
             if !positive {
                 return None;
@@ -447,12 +663,13 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
             let EnvironmentLiteralKind::Matches(spec) = &literal.kind else {
                 return None;
             };
-            let (version, name) = spec_as_exact_atom(spec)?;
+            let (version, mut names) = spec_as_finite_atom_set(spec)?;
+            normalize_literal_names(&mut names);
             let package_is_unique = condition
                 .iter()
                 .enumerate()
                 .all(|(other, (l, _))| other == index || l.package != literal.package);
-            package_is_unique.then(|| (version.map(ToString::to_string), name.to_string()))
+            package_is_unique.then(|| (version.map(ToString::to_string), names))
         };
 
     let mut groups: Vec<Group<'_>> = Vec::new();
@@ -474,7 +691,7 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
                 if !same_rest {
                     continue;
                 }
-                let Some((atom_version, name)) = atom_at(condition, index) else {
+                let Some((atom_version, names)) = atom_at(condition, index) else {
                     continue;
                 };
                 if condition[index].0.package != group.base[index].0.package
@@ -482,7 +699,7 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
                 {
                     continue;
                 }
-                group.names.push(name);
+                group.names.extend(names);
                 continue 'disjuncts;
             } else {
                 let differing: Vec<usize> = (0..rendered.len())
@@ -492,7 +709,7 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
                     continue;
                 };
                 let index = *index;
-                let (Some((base_version, base_name)), Some((version, name))) =
+                let (Some((base_version, base_names)), Some((version, names))) =
                     (atom_at(group.base, index), atom_at(condition, index))
                 else {
                     continue;
@@ -503,8 +720,8 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
                     continue;
                 }
                 group.slot = Some((index, base_version));
-                group.names.push(base_name);
-                group.names.push(name);
+                group.names.extend(base_names);
+                group.names.extend(names);
                 continue 'disjuncts;
             }
         }
@@ -521,7 +738,7 @@ pub fn display_presence(presence: &[EnvironmentCondition]) -> String {
         .map(|group| match &group.slot {
             None => display_condition(group.base),
             Some((index, version)) => {
-                let mut names: Vec<&str> = group.names.iter().map(String::as_str).collect();
+                let mut names = group.names.clone();
                 let set = format_atom_set(
                     &group.base[*index].0.package,
                     version.as_deref(),
@@ -616,10 +833,9 @@ struct CanonicalDisjunct {
     /// entries cannot be rendered back into literals.
     fallback: EnvironmentCondition,
 
-    /// The per-package entries, or `None` when the disjunct is structurally
-    /// uncanonicalizable (a package with both `Absent` and `Matches`
-    /// literals); such a disjunct only takes part in identical-disjunct
-    /// deduplication.
+    /// The per-package entries, or `None` when a future canonicalization
+    /// step cannot model the disjunct structurally; such a disjunct only
+    /// takes part in identical-disjunct deduplication.
     entries: Option<Vec<(PackageName, CanonicalEntry)>>,
 }
 
@@ -645,30 +861,32 @@ fn canonicalize_disjunct(condition: EnvironmentCondition) -> CanonicalDisjunct {
     }
 }
 
-/// Computes the per-package canonical entries of a disjunct, or `None` when
-/// some package's literals mix `Absent` with anything else.
+/// Computes the per-package canonical entries of a disjunct.
 fn canonical_entries(
     condition: &EnvironmentCondition,
 ) -> Option<Vec<(PackageName, CanonicalEntry)>> {
     let mut entries = Vec::new();
     for (package, group) in group_by_package(condition) {
+        let group = drop_redundant_literals(group);
+        if group.iter().any(|(literal, positive)| {
+            *positive && matches!(literal.kind, EnvironmentLiteralKind::Absent)
+        }) && group.len() != 1
+        {
+            return None;
+        }
         let has_absent = group
             .iter()
             .any(|(literal, _)| matches!(literal.kind, EnvironmentLiteralKind::Absent));
-        let entry = if has_absent {
-            // An `Absent` literal combined with any other literal on the
-            // same package is not a shape this canonicalization models.
-            if group.len() != 1 {
-                return None;
-            }
+        let entry = if has_absent && group.len() == 1 {
             CanonicalEntry::Absent(group[0].1)
-        } else if group.iter().any(|(_, positive)| *positive)
+        } else if group_has_presence_constraint(&group)
             && let Some(ranges) = group_ranges(&group)
         {
-            // A positive literal implies the package is present, so the
-            // group is exactly a version interval set. A negative-only
-            // group also holds when the package is absent, which no
-            // interval set can express; it stays `Raw`.
+            // A positive literal or `not absent` implies the package is
+            // present, so the group is exactly a version interval set. A
+            // negative-only group without an explicit presence constraint
+            // also holds when the package is absent, which no interval set
+            // can express; it stays `Raw`.
             CanonicalEntry::Ranges(ranges)
         } else {
             CanonicalEntry::Raw(
@@ -1102,24 +1320,31 @@ where
         })
         .collect();
 
-    let environment_model = environment_model
-        .iter()
-        .map(|disjunction| {
-            disjunction
-                .iter()
-                .map(|(literal, positive)| (intern_literal(&provider, literal), *positive))
-                .collect()
-        })
-        .collect();
+    let environment_model = EnvironmentModel::new(
+        environment_model
+            .iter()
+            .map(|disjunction| {
+                EnvClause::new(
+                    disjunction
+                        .iter()
+                        .map(|(literal, positive)| {
+                            SignedEnvLiteral::from((intern_literal(&provider, literal), *positive))
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
     let seed_partition = seed_partition
         .iter()
-        .map(|condition| {
-            resolvo::CellCondition(
-                condition
-                    .iter()
-                    .map(|(literal, positive)| (intern_literal(&provider, literal), *positive))
-                    .collect(),
-            )
+        .filter_map(|condition| {
+            let literals = condition
+                .iter()
+                .map(|(literal, positive)| {
+                    SignedEnvLiteral::from((intern_literal(&provider, literal), *positive))
+                })
+                .collect();
+            ResolvoCellCondition::new(literals).ok()
         })
         .collect();
 
@@ -1140,8 +1365,14 @@ where
                 conflict: conflict.display_user_friendly(&solver).to_string(),
             });
         }
+        Err(UniversalFailure::InvalidInput(e)) => {
+            return Err(SolveError::Unsolvable(vec![format!("{e:?}")]).into());
+        }
         Err(UniversalFailure::Cancelled(_)) => {
             return Err(UniversalSolveError::Cancelled);
+        }
+        Err(other) => {
+            return Err(SolveError::Unsolvable(vec![format!("{other:?}")]).into());
         }
     };
 
@@ -1156,12 +1387,12 @@ where
     });
 
     let cells = solution
-        .cells
+        .cells()
         .iter()
-        .map(|(condition, solvables)| {
+        .map(|cell| {
             (
-                convert_condition(provider, condition),
-                solvables
+                convert_condition(provider, cell.condition()),
+                cell.solvables()
                     .iter()
                     .filter_map(|&solvable| record_for_solvable(provider, solvable))
                     .collect(),
@@ -1239,17 +1470,13 @@ fn intern_literal(
     let name_id = provider
         .pool
         .intern_package_name(NameType::from(&literal.package));
-    let kind = match &literal.kind {
-        EnvironmentLiteralKind::Matches(spec) => EnvLiteralKind::Matches(
+    match &literal.kind {
+        EnvironmentLiteralKind::Matches(spec) => EnvLiteral::Matches(
             provider
                 .pool
                 .intern_version_set(name_id, spec.clone().into()),
         ),
-        EnvironmentLiteralKind::Absent => EnvLiteralKind::Absent,
-    };
-    EnvLiteral {
-        package: name_id,
-        kind,
+        EnvironmentLiteralKind::Absent => EnvLiteral::Absent(name_id),
     }
 }
 
@@ -1258,11 +1485,12 @@ fn convert_condition(
     provider: &CondaDependencyProvider<'_>,
     condition: &resolvo::CellCondition<NameId>,
 ) -> EnvironmentCondition {
-    condition
-        .0
-        .iter()
-        .map(|(literal, positive)| (convert_literal(provider, literal), *positive))
-        .collect()
+    simplify_condition(
+        condition
+            .literals()
+            .map(|signed| (convert_literal(provider, &signed.literal), signed.positive))
+            .collect(),
+    )
 }
 
 /// Converts a resolvo presence (a disjunction of cell conditions) back into
@@ -1274,8 +1502,7 @@ fn convert_presence(
 ) -> Vec<EnvironmentCondition> {
     simplify_presence(
         presence
-            .0
-            .iter()
+            .disjuncts()
             .map(|condition| convert_condition(provider, condition))
             .collect(),
     )
@@ -1286,14 +1513,19 @@ fn convert_literal(
     provider: &CondaDependencyProvider<'_>,
     literal: &EnvLiteral<NameId>,
 ) -> EnvironmentLiteral {
-    let package = package_name(provider, literal.package);
-    let kind = match literal.kind {
-        EnvLiteralKind::Matches(version_set) => {
-            EnvironmentLiteralKind::Matches(nameless_spec(provider, version_set))
-        }
-        EnvLiteralKind::Absent => EnvironmentLiteralKind::Absent,
-    };
-    EnvironmentLiteral { package, kind }
+    match *literal {
+        EnvLiteral::Matches(version_set) => EnvironmentLiteral {
+            package: package_name(
+                provider,
+                provider.pool.resolve_version_set_package_name(version_set),
+            ),
+            kind: EnvironmentLiteralKind::Matches(nameless_spec(provider, version_set)),
+        },
+        EnvLiteral::Absent(package) => EnvironmentLiteral {
+            package: package_name(provider, package),
+            kind: EnvironmentLiteralKind::Absent,
+        },
+    }
 }
 
 /// Resolves an interned name back to a conda package name. Environment
@@ -1337,19 +1569,20 @@ fn render_violation(
     match violation {
         resolvo::Violation::OverlappingCells { first, second } => format!(
             "cells {first} ({}) and {second} ({}) overlap but have different records",
-            solution.cells[first].0.display(provider),
-            solution.cells[second].0.display(provider),
+            solution.cells()[first].condition().display(provider),
+            solution.cells()[second].condition().display(provider),
         ),
         resolvo::Violation::UnprovenDisjointness { first, second } => format!(
             "cells {first} ({}) and {second} ({}) have different records and their \
              disjointness could not be proven",
-            solution.cells[first].0.display(provider),
-            solution.cells[second].0.display(provider),
+            solution.cells()[first].condition().display(provider),
+            solution.cells()[second].condition().display(provider),
         ),
         resolvo::Violation::UncoveredRegion(condition) => format!(
             "the environment region {} is not covered by any cell",
             condition.display(provider),
         ),
+        other => format!("unexpected verification violation: {other:?}"),
     }
 }
 
@@ -1516,17 +1749,31 @@ mod tests {
         assert_eq!(display_condition(&condition), "__glibc >=2.17,<2.28");
     }
 
-    /// A literal with a build matcher is not version-only and must keep the
-    /// plain per-literal rendering for its whole group.
+    /// A negative build matcher that is disjoint from a positive build
+    /// matcher is redundant and is dropped.
     #[test]
-    fn test_display_condition_build_matcher_falls_back() {
+    fn test_display_condition_drops_redundant_build_matcher() {
         let condition = vec![
             (matches_literal("__archspec", "1 x86_64_v3"), true),
             (matches_literal("__archspec", "1 x86_64_v2"), false),
         ];
+        assert_eq!(display_condition(&condition), "__archspec ==1 x86_64_v3");
+    }
+
+    /// A finite build matcher can be subtracted by negated exact build
+    /// atoms and rendered as a smaller build-name set.
+    #[test]
+    fn test_display_condition_subtracts_finite_build_set() {
+        let condition = vec![
+            (
+                matches_literal("__archspec", "1 ^(core2|haswell|zen4)$"),
+                true,
+            ),
+            (matches_literal("__archspec", "1 haswell"), false),
+        ];
         assert_eq!(
             display_condition(&condition),
-            "__archspec ==1 x86_64_v3 AND not (__archspec ==1 x86_64_v2)"
+            "__archspec ==1 in {core2, zen4}"
         );
     }
 
@@ -1542,18 +1789,16 @@ mod tests {
         assert_eq!(display_condition(&condition), "__cuda >=12.0");
     }
 
-    /// A `not absent` literal with no positive version literal to imply it is
-    /// the only thing forcing presence, so it is kept.
+    /// A `not absent` literal with no positive version literal is a presence
+    /// constraint, so negative version literals can be subtracted from the
+    /// full present-version domain.
     #[test]
-    fn test_display_condition_absent_kept_without_positive_match() {
+    fn test_display_condition_uses_not_absent_as_presence() {
         let condition = vec![
             (matches_literal("__cuda", ">=13"), false),
             (absent_literal("__cuda"), false),
         ];
-        assert_eq!(
-            display_condition(&condition),
-            "not (__cuda >=13) AND not (__cuda absent)"
-        );
+        assert_eq!(display_condition(&condition), "__cuda <13");
     }
 
     /// A group without any positive literal is untouched.
@@ -1812,12 +2057,10 @@ mod tests {
         assert_eq!(simplified(presence), vec!["__glibc >=2.17"]);
     }
 
-    /// A disjunct mixing `Absent` and `Matches` literals on the same
-    /// package fails to canonicalize structurally: it is kept untouched and
-    /// only deduplicates against an identical disjunct. (Its display drops
-    /// the `not absent` literal the positive `>=12.0` already implies.)
+    /// `not absent` participates in canonicalization: it is redundant next
+    /// to a positive value match, so duplicate disjuncts still collapse.
     #[test]
-    fn test_simplify_presence_keeps_uncanonicalizable_disjunct() {
+    fn test_simplify_presence_canonicalizes_not_absent() {
         let weird = vec![
             (matches_literal("__cuda", ">=12.0"), true),
             (absent_literal("__cuda"), false),

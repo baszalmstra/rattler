@@ -259,7 +259,7 @@ fn build_part_relation(a: Option<&StringMatcher>, b: Option<&StringMatcher>) -> 
 /// [`parse_anchored_literal_alternation`]); a [`StringMatcher::Glob`] is never
 /// reduced. Returning `None` is always sound: it degrades the answer to
 /// `Unknown`.
-fn literal_alternatives(matcher: &StringMatcher) -> Option<Vec<String>> {
+pub(crate) fn literal_alternatives(matcher: &StringMatcher) -> Option<Vec<String>> {
     match matcher {
         StringMatcher::Exact(s) => Some(vec![s.clone()]),
         StringMatcher::Regex(regex) => parse_anchored_literal_alternation(regex.as_str()),
@@ -297,7 +297,10 @@ fn parse_anchored_literal_alternation(pattern: &str) -> Option<Vec<String>> {
         if branch.is_empty() || branch.bytes().any(|c| META.contains(&c)) {
             return None;
         }
-        if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(branch)) {
+        if !names
+            .iter()
+            .any(|n: &String| n.eq_ignore_ascii_case(branch))
+        {
             names.push(branch.to_string());
         }
     }
@@ -700,7 +703,10 @@ mod tests {
         let arch = |a: &str, b: &str| relation("__archspec", (None, Some(a)), (None, Some(b)));
 
         // A regex listing a superset of names is a superset.
-        assert_eq!(arch("^(haswell|zen2|skylake)$", "^(haswell|zen2)$"), Superset);
+        assert_eq!(
+            arch("^(haswell|zen2|skylake)$", "^(haswell|zen2)$"),
+            Superset
+        );
         assert_eq!(arch("^(haswell|zen2)$", "^(haswell|zen2|skylake)$"), Subset);
         // An exact name is the singleton set.
         assert_eq!(arch("^(haswell|zen2)$", "haswell"), Superset);
