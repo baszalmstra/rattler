@@ -1,31 +1,13 @@
-//! [CEP-42] channel-relations resolution.
+//! [CEP-42] channel-relations resolution: turn the user's channel
+//! order, the discovered channels, and the declared relation edges
+//! into the final priority order.
 //!
-//! Given a set of user-specified channels, the channels reachable from
-//! them via declared `base`/`overrides` relations, and the relation
-//! edges themselves, produces the final channel priority order.
-//!
-//! The function is intentionally edge-oriented rather than
-//! channel-oriented: CEP-42 lets a single channel declare DIFFERENT
-//! relations per subdir, so collapsing them into one `base` and one
-//! `overrides` per channel is wrong (the discarded edge silently
-//! disappears from the priority graph). The caller (the
-//! [`ChannelExpander`](super::channel_expander::ChannelExpander))
-//! observes per-`(channel, platform)` relations, resolves them to
-//! edges, deduplicates exact duplicates, and passes the deduplicated
-//! edge list in.
-//!
-//! Steps performed here:
-//! 1. Build user edges from consecutive user-listed channels (user
-//!    wins; left-to-right means strictly higher to lower priority).
-//! 2. Drop any relation edge that directly contradicts the user's
-//!    explicit ordering. (Edges between two user channels where the
-//!    user listed `to` at or before `from` lose to the user. Self-loop
-//!    relation edges DO fall through to cycle detection; they are
-//!    malformed, not user conflicts.)
-//! 3. Topologically sort. User edges are inserted first, so a cycle
-//!    that mixes user and relation edges always breaks by dropping a
-//!    relation edge. Broken edges land in
-//!    [`Resolution::broken_cycle_edges`].
+//! The input is edge-oriented because CEP-42 lets different subdirs of
+//! one channel declare different relations; collapsing them into one
+//! `base`/`overrides` per channel would silently drop edges. User
+//! edges are inserted first, relation edges contradicting the explicit
+//! user order are ignored, and cycles are broken by dropping the
+//! relation edge that would close them.
 //!
 //! [CEP-42]: https://github.com/conda/ceps/blob/main/cep-0042.md
 
@@ -75,14 +57,10 @@ pub struct Resolution<K> {
     pub broken_cycle_edges: Vec<PriorityEdge<K>>,
 }
 
-/// Resolve channel priority from an explicit list of relation edges.
-///
-/// `user_channels` is the caller-supplied channel order;
-/// `discovered_channels` lists every node that should appear in the
-/// resolution (user + transitively discovered); `relation_edges`
-/// carries the deduplicated `Base` / `Override` edges. The output is
-/// fully determined by the inputs, so callers that need run-to-run
-/// determinism must pass canonically ordered slices.
+/// Resolve the priority order over `discovered_channels` from the
+/// user's channel order plus the deduplicated relation edges. The
+/// output is fully determined by the inputs; callers needing
+/// run-to-run determinism must pass canonically ordered slices.
 pub fn resolve_channel_priority<K>(
     user_channels: &[K],
     discovered_channels: &[K],
@@ -165,11 +143,9 @@ where
     }
 }
 
-/// Route `edge` to `accepted` or `ignored`. A relation edge is ignored
-/// when BOTH endpoints are user-listed AND the user placed `to` strictly
-/// before `from` (i.e. the user wants `to` to outrank `from`). Self-loop
-/// relation edges fall through to cycle detection; they are malformed
-/// metadata, not user conflicts.
+/// Ignore `edge` when both endpoints are user-listed and the user
+/// placed `to` strictly before `from`; accept it otherwise. Self-loops
+/// are accepted so they surface via cycle detection.
 fn dispatch_edge<K>(
     edge: PriorityEdge<K>,
     user_positions: &HashMap<&K, usize>,
@@ -209,11 +185,9 @@ impl<K> TopoResult<K>
 where
     K: Hash + Eq + Clone,
 {
-    /// Topological sort with user-edge-preserving cycle breaking.
-    /// Inserts edges greedily, user edges first; rejects any edge that
-    /// would close a cycle with the ones already accepted. After the
-    /// greedy pass the adjacency is acyclic and a plain post-order DFS
-    /// yields the order.
+    /// Topological sort with user-edge-preserving cycle breaking:
+    /// edges are inserted greedily (user edges first) and any edge
+    /// closing a cycle is rejected; post-order DFS yields the order.
     fn new(channels: &[K], edges: Vec<PriorityEdge<K>>) -> Self {
         // Index every node, including any edge endpoints that aren't in
         // `channels`, so no edge is silently dropped.
@@ -308,10 +282,9 @@ where
     }
 }
 
-/// Returns `true` if `target` is reachable from `start`. `start ==
-/// target` counts as reachable so self-loops register as cycles.
-/// `visited_gen`/`generation` is reusable scratch: a node is marked visited
-/// when `visited_gen[v] == *generation`, avoiding per-call buffer zeroing.
+/// Is `target` reachable from `start`? `start == target` counts, so
+/// self-loops register as cycles. `visited_gen`/`generation` is
+/// reusable scratch that avoids per-call buffer zeroing.
 fn can_reach(
     start: usize,
     target: usize,
@@ -349,9 +322,8 @@ fn can_reach(
     false
 }
 
-/// Iterative post-order DFS. Each stack frame carries a cursor into
-/// the node's adjacency list so we resume at the right neighbor after
-/// descending. Assumes `adjacency` is acyclic.
+/// Iterative post-order DFS over an acyclic `adjacency`; each frame
+/// carries a cursor into the node's neighbor list.
 fn dfs_post_order(
     start: usize,
     adjacency: &[Vec<usize>],
@@ -410,11 +382,8 @@ mod tests {
             .collect()
     }
 
-    /// Walk `registry` from `user_channels`, gather the BFS discovery
-    /// order, and build the deduplicated edge list. Mirrors what
-    /// [`ChannelExpander`](super::super::channel_expander::ChannelExpander)
-    /// does at runtime. Kept private here so the tests can exercise
-    /// the algorithm with concise inputs.
+    /// BFS `registry` from `user_channels` into the (nodes, edges)
+    /// inputs of the algorithm, mirroring the expander's discovery.
     fn build_inputs<'a>(
         user: &[&'a str],
         registry: &ChannelRegistry<'a>,

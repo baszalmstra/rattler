@@ -1,15 +1,10 @@
-//! Non-fatal warnings produced by gateway queries.
-//!
-//! Warnings are collected on the query output and surfaced to the
-//! caller, who decides whether to log them, propagate them as errors,
-//! or ignore them. New warning kinds are added as variants of
+//! Non-fatal warnings produced by gateway queries, collected on the
+//! query output. New warning kinds become variants of
 //! [`GatewayWarning`].
 
 use super::channel_expander::ChannelRelationsWarning;
 
-/// A non-fatal issue surfaced by a gateway query. Each variant wraps
-/// the typed warning for a specific subsystem so callers can match
-/// exhaustively.
+/// A non-fatal issue surfaced by a gateway query.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GatewayWarning {
     /// A non-fatal issue surfaced while resolving [CEP-42]

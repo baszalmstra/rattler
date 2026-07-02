@@ -208,10 +208,9 @@ impl Gateway {
             .await
         {
             Ok(subdir) => Ok(subdir.channel_relations().cloned()),
-            // A missing subdir has no relations. The subdir builder
-            // maps absence to `Subdir::NotFound` for every platform
-            // except noarch; catch the noarch error here so the
-            // documented `None` contract holds for all platforms.
+            // The subdir builder maps a missing subdir to `NotFound`
+            // for every platform except noarch; catch the noarch
+            // error so `None` holds for all platforms.
             Err(GatewayError::SubdirNotFoundError(_)) => Ok(None),
             Err(err) => Err(err),
         }
@@ -2714,9 +2713,8 @@ mod test {
     }
 
     /// A subdir the channel doesn't publish returns `None`, not an
-    /// error. noarch is the interesting platform: the subdir builder
-    /// propagates its absence as an error instead of `NotFound`, so
-    /// the accessor must catch it to honor the documented contract.
+    /// error. noarch matters: the subdir builder propagates its
+    /// absence as an error instead of `NotFound`.
     #[tokio::test]
     async fn test_gateway_channel_relations_missing_subdir() {
         let channel_dir = tempfile::tempdir().unwrap();
@@ -3710,11 +3708,9 @@ mod test {
         );
     }
 
-    /// A discovered channel that publishes only some platforms is
-    /// valid metadata: a missing subdir (including noarch, whose
-    /// absence the subdir builder surfaces as an error rather than
-    /// `NotFound`) must yield an empty bucket, not fail the query,
-    /// even in Strict mode.
+    /// A discovered channel publishing only some platforms is valid:
+    /// a missing subdir (even noarch) yields an empty bucket instead
+    /// of failing the query, even in Strict mode.
     #[tokio::test]
     async fn test_cep42_strict_mode_tolerates_missing_noarch_on_discovered_channel() {
         let dir = tempfile::tempdir().unwrap();
@@ -3752,11 +3748,9 @@ mod test {
         assert!(output.warnings.is_empty(), "got {:?}", output.warnings);
     }
 
-    /// Bucket anchoring must not depend on which subdir fetch wins
-    /// the network race: a channel referenced by several user
-    /// channels anchors to the earliest one in the caller's source
-    /// order, and its base priority puts it directly before that
-    /// channel.
+    /// A channel referenced by several user channels anchors to the
+    /// earliest one in the caller's source order, independent of
+    /// which fetch wins the network race.
     #[tokio::test]
     async fn test_cep42_shared_base_anchors_to_earliest_user_channel() {
         let dir = tempfile::tempdir().unwrap();

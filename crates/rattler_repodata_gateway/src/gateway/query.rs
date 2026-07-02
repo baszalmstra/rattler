@@ -20,23 +20,18 @@ use super::{
 };
 use crate::Reporter;
 
-/// Result of a successful [`RepoDataQuery::execute`]. Carries the
-/// per-source repodata buckets and any non-fatal warnings the caller
-/// may want to surface or log.
+/// Result of a successful [`RepoDataQuery::execute`].
 ///
 /// Implements [`Deref<Target = [RepoData]>`](std::ops::Deref) and
-/// [`IntoIterator`] so call sites that only care about the records
-/// can use it like a `Vec<RepoData>` (`.iter()`, `.len()`,
-/// `output[0]`, `for r in output { ... }`).
+/// [`IntoIterator`], so call sites that only need the records can use
+/// it like a `Vec<RepoData>`.
 #[derive(Debug, Default)]
 pub struct RepoDataQueryOutput {
-    /// One bucket per input source. CEP-42-discovered transitive
-    /// channels are inserted next to the user channel that introduced
-    /// them; caller-supplied custom sources keep their
-    /// caller-specified positions.
+    /// One bucket per source. CEP-42-discovered channels are inserted
+    /// next to the channel that introduced them; caller-supplied
+    /// sources keep their positions.
     pub repodata: Vec<RepoData>,
-    /// Non-fatal warnings encountered during the query. Empty when no
-    /// issues were observed.
+    /// Non-fatal warnings encountered during the query.
     pub warnings: Vec<GatewayWarning>,
 }
 
@@ -69,14 +64,13 @@ impl<'a> IntoIterator for &'a RepoDataQueryOutput {
 /// Result of a successful [`NamesQuery::execute`].
 ///
 /// Implements [`Deref<Target = [PackageName]>`](std::ops::Deref) and
-/// [`IntoIterator`] so call sites that only care about the names can
-/// use it like a `Vec<PackageName>`.
+/// [`IntoIterator`], so call sites that only need the names can use
+/// it like a `Vec<PackageName>`.
 #[derive(Debug, Default)]
 pub struct NamesQueryOutput {
     /// Distinct package names contributed by all queried subdirs.
     pub names: Vec<PackageName>,
-    /// Non-fatal warnings encountered during the query. Empty when no
-    /// issues were observed.
+    /// Non-fatal warnings encountered during the query.
     pub warnings: Vec<GatewayWarning>,
 }
 
@@ -190,11 +184,9 @@ struct SubdirHandle {
     barrier: Arc<BarrierCell<Arc<Subdir>>>,
     kind: SubdirKind,
     data: RepoData,
-    /// Index in the caller's `sources` list. `Some(i)` for sources the
-    /// caller supplied directly; `None` for transitively discovered
-    /// channels. The finalize step uses this as the "anchor" so that
-    /// caller-supplied custom sources keep their caller-specified
-    /// position even when CEP-42 reorders the channel buckets.
+    /// Index in the caller's `sources` list; `None` for transitively
+    /// discovered channels. Anchors the finalize sort so caller
+    /// sources keep their positions.
     caller_source_idx: Option<usize>,
 }
 
@@ -923,27 +915,13 @@ impl QueryExecutor {
         self.spawn_package_fetches_for_new_handle(handle_idx);
     }
 
-    /// Build the final [`RepoDataQueryOutput`].
-    ///
-    /// When CEP-42 is enabled and at least one subdir contributed a
-    /// valid relation, slot transitively discovered channels next to
-    /// the user channel that introduced them, ordered by CEP-42
-    /// priority. Caller-supplied sources (channels and custom
-    /// sources) keep their caller-specified position; in particular a
-    /// custom source is NOT pushed to the end of the result merely
-    /// because a sibling channel declared relations.
-    ///
-    /// Sort key per handle:
-    /// `(caller_anchor, cep42_priority, platform_idx, original_idx)`
-    /// where:
-    /// * `caller_anchor` is the caller's `sources` index. User
-    ///   channels and customs use their own; transitively discovered
-    ///   channels inherit the anchor of the user channel that
-    ///   introduced them.
-    /// * `cep42_priority` ranks channels within a slot (lower = higher
-    ///   priority, so bases land before the declaring channel and
-    ///   override targets land after). Customs use `0`; since each
-    ///   custom occupies its own anchor, this never collides.
+    /// Build the final [`RepoDataQueryOutput`]. When relations were
+    /// observed, buckets sort by
+    /// `(caller anchor, CEP-42 priority, platform, original index)`:
+    /// caller-supplied sources keep their positions (discovered
+    /// channels inherit the anchor of the user channel that
+    /// introduced them) and priority orders channels within an
+    /// anchor, placing bases before the declaring channel.
     fn finalize_channel_relations(mut self) -> Result<RepoDataQueryOutput, GatewayError> {
         let direct = self.direct_url_result;
         let mut handles = self.subdir_handles;
@@ -966,9 +944,7 @@ impl QueryExecutor {
                 .map(|(i, p)| (p, i))
                 .collect();
 
-            // Map every user channel URL to its caller-source index
-            // so transitively discovered channels can find the
-            // anchor of the user channel that introduced them.
+            // Caller-source index per user channel URL.
             let user_channel_caller_idx: std::collections::HashMap<ChannelUrl, usize> = handles
                 .iter()
                 .filter_map(|h| match (&h.kind, h.caller_source_idx) {
@@ -977,9 +953,8 @@ impl QueryExecutor {
                 })
                 .collect();
 
-            // Anchors derive from the final edge set and the caller's
-            // source order, so they are identical run to run
-            // regardless of fetch completion order.
+            // Anchors derive from the final edge set, independent of
+            // fetch completion order.
             let mut users_by_caller_idx: Vec<(usize, ChannelUrl)> = user_channel_caller_idx
                 .iter()
                 .map(|(url, idx)| (*idx, url.clone()))
@@ -1112,11 +1087,9 @@ fn apply_fetch_error_policy(
     platform: Platform,
     policy: FetchErrorPolicy,
 ) -> Result<(Arc<Subdir>, Option<ChannelRelationsWarning>), GatewayError> {
-    // A missing subdir on a transitively discovered channel is not a
-    // relations violation: a channel publishing only some platforms
-    // is valid. Treat it as empty in both non-Propagate policies (the
-    // subdir builder already does this for every platform except
-    // noarch, whose absence surfaces as an error).
+    // A channel publishing only some platforms is valid; treat a
+    // missing subdir as empty. The subdir builder already does this
+    // for every platform except noarch.
     if !matches!(policy, FetchErrorPolicy::Propagate)
         && matches!(err, GatewayError::SubdirNotFoundError(_))
     {

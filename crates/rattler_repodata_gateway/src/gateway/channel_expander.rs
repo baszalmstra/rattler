@@ -13,53 +13,38 @@ use super::{
     subdir::Subdir,
 };
 
-/// How a query should treat [CEP-42] `channel_relations` metadata
-/// encountered while resolving channels.
+/// How a query treats [CEP-42] `channel_relations` metadata.
 ///
-/// [CEP-42] requires that cycles and malformed metadata abort
-/// resolution. `Strict` matches that requirement. The default `Warn`
-/// mode is a deliberate non-compliant lenient fallback: cycles,
-/// malformed references, and failed discovery fetches degrade the
-/// result rather than failing the whole query, and the caller
-/// receives them as [`ChannelRelationsWarning`]s on the query output.
+/// `Strict` follows the CEP to the letter. The default `Warn` mode
+/// deliberately deviates: problems degrade the result instead of
+/// failing the query and are returned as [`ChannelRelationsWarning`]s.
 ///
 /// [CEP-42]: https://github.com/conda/ceps/blob/main/cep-0042.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelRelationsMode {
-    /// Ignore declared relations; use only the user-supplied channels.
-    /// Equivalent to setting `channel_relations_max_depth(0)`.
+    /// Ignore declared relations. Same as `channel_relations_max_depth(0)`.
     Disabled,
 
-    /// Follow relations recursively, but tolerate problems. Cycles,
-    /// malformed metadata, depth-exceeded chains, and failed
-    /// discovery fetches surface as [`ChannelRelationsWarning`]s on
-    /// the query output instead of aborting. Default. Deviates from
-    /// CEP-42 in that the latter mandates aborting on cycles and
-    /// malformed metadata.
+    /// Follow relations; report cycles, malformed metadata, and failed
+    /// discovery fetches as warnings instead of aborting.
     #[default]
     Warn,
 
-    /// Follow relations recursively and abort on any violation
-    /// (cycles, malformed references, depth exceeded,
-    /// `base == overrides`, self-relations). CEP-42 compliant.
-    /// Surfaces violations as
+    /// Follow relations; abort with
     /// [`GatewayError::ChannelRelationsError`](super::GatewayError::ChannelRelationsError)
-    /// so the executor can cancel the in-flight fetches.
+    /// on any violation.
     Strict,
 }
 
-/// One non-fatal issue surfaced while resolving CEP-42
-/// `channel_relations`. In [`ChannelRelationsMode::Warn`] these
-/// accumulate on the query output instead of failing the query; the
-/// caller decides whether to log them, surface them to the user, or
-/// ignore them. In [`ChannelRelationsMode::Strict`] each one (except
-/// [`UserOrderConflict`](ChannelRelationsWarning::UserOrderConflict),
-/// which the CEP sanctions) is instead translated into a
+/// A non-fatal CEP-42 problem, collected on the query output in
+/// [`Warn`](ChannelRelationsMode::Warn) mode. In
+/// [`Strict`](ChannelRelationsMode::Strict) mode every variant except
+/// [`UserOrderConflict`](Self::UserOrderConflict) becomes a
 /// [`GatewayError::ChannelRelationsError`](super::GatewayError::ChannelRelationsError).
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ChannelRelationsWarning {
-    /// A `base`/`overrides` reference is not a valid CEP-42 relative
-    /// path (it must start with `../`). The reference is dropped.
+    /// The reference is not a relative path starting with `../`; it is
+    /// dropped.
     #[error(
         "malformed CEP-42 reference `{reference}` declared by `{declaring}`: \
          must be a relative path starting with `../`"
@@ -71,8 +56,8 @@ pub enum ChannelRelationsWarning {
         reference: String,
     },
 
-    /// A CEP-42 reference is shaped like a valid relative path but
-    /// fails to resolve against the declaring channel's URL.
+    /// The reference fails to resolve against the declaring channel's
+    /// URL; it is dropped.
     #[error(
         "failed to resolve CEP-42 channel reference `{reference}` against `{declaring}`: {error}"
     )]
@@ -85,49 +70,44 @@ pub enum ChannelRelationsWarning {
         error: String,
     },
 
-    /// A channel declared `base` and `overrides` resolving to the
-    /// same channel URL. CEP-42 forbids this; both references are
-    /// dropped.
+    /// `base` and `overrides` resolve to the same channel; both
+    /// references are dropped.
     #[error(
         "channel `{declaring}` declares the same target `{target}` as both `base` and `overrides`"
     )]
     BaseAndOverridesSameTarget {
-        /// Channel that declared the contradiction.
+        /// Channel declaring the contradiction.
         declaring: ChannelUrl,
-        /// Channel both `base` and `overrides` resolved to.
+        /// The doubly referenced channel.
         target: ChannelUrl,
     },
 
-    /// A channel declared a `base` or `overrides` that resolves to
-    /// itself. CEP-42 forbids this; the reference is dropped.
+    /// The channel references itself; the reference is dropped.
     #[error("channel `{declaring}` declares itself as `{field}`")]
     SelfRelation {
-        /// Channel that declared the self-relation.
+        /// Channel referencing itself.
         declaring: ChannelUrl,
         /// Which field self-referenced: `"base"` or `"overrides"`.
         field: &'static str,
     },
 
-    /// A relation chain reached the configured depth limit and was
-    /// truncated. CEP-42 says this should abort resolution; `Warn`
-    /// mode tolerates it. Reported at finalize time, when the depth
-    /// of every channel is final regardless of fetch completion
-    /// order.
+    /// The reference lies beyond `channel_relations_max_depth` and was
+    /// not followed. Reported at finalize, when depths are final.
     #[error(
         "CEP-42 relation chain exceeded `channel_relations_max_depth` ({max_depth}) at `{declaring}`; \
          the reference `{reference}` was not followed"
     )]
     MaxDepthExceeded {
-        /// Channel whose relation would have crossed the depth limit.
+        /// Channel declaring the reference.
         declaring: ChannelUrl,
-        /// The reference that was not followed.
+        /// The unfollowed reference.
         reference: String,
-        /// The configured depth limit.
+        /// The configured limit.
         max_depth: usize,
     },
 
-    /// A transitively discovered channel could not be fetched. In
-    /// [`ChannelRelationsMode::Warn`] the subdir is treated as empty.
+    /// A discovered channel failed to fetch; in `Warn` mode its subdir
+    /// is treated as empty.
     #[error(
         "failed to fetch transitively discovered channel `{url}` \
          for platform `{platform}`: {error}"
@@ -141,9 +121,8 @@ pub enum ChannelRelationsWarning {
         error: String,
     },
 
-    /// A relation edge was dropped because it contradicts the
-    /// explicit user-supplied channel order. Never fatal: CEP-42
-    /// says the user's ordering wins.
+    /// The relation contradicts the explicit channel order and was
+    /// ignored. Never fatal: the user's order wins.
     #[error(
         "CEP-42 relation `{from}` -> `{to}` contradicts the explicit \
          channel order and was ignored"
@@ -155,9 +134,8 @@ pub enum ChannelRelationsWarning {
         to: ChannelUrl,
     },
 
-    /// One or more channel-relation edges were dropped to break a
-    /// cycle in the declared relations. CEP-42 says cycles must abort
-    /// resolution; `Warn` mode tolerates them by dropping back-edges.
+    /// Relation edges dropped to break a cycle in the declared
+    /// relations.
     #[error(
         "dropped {} CEP-42 relation edge(s) to break a cycle: {}",
         broken_edges.len(),
@@ -177,44 +155,30 @@ fn format_broken_edges(edges: &[(ChannelUrl, ChannelUrl)]) -> String {
         .join(", ")
 }
 
-/// Tracks CEP-42 state across a query: discovered channels, the raw
-/// relations gathered as subdirs resolve, the user's supplied channel
-/// order, and any non-fatal warnings observed along the way.
+/// CEP-42 state for a single query.
 ///
-/// The query executor calls [`ChannelExpander::observe`] on each
-/// freshly resolved subdir to get the (channel, platform) pairs it
-/// must schedule next, [`ChannelExpander::finalize`] at the end to
-/// learn the final priority order, and
-/// [`ChannelExpander::take_warnings`] to attach the accumulated
-/// warnings to the query output.
-///
-/// The final state is independent of the order in which subdir
-/// fetches complete: raw relations are kept per channel and
-/// re-derived whenever a shorter path lowers a channel's depth
-/// (relaxation), and depth-limit refusals are only reported at
-/// finalize time when every depth is final.
+/// The executor feeds each resolved subdir to [`observe`](Self::observe)
+/// and schedules the pairs it returns; [`finalize`](Self::finalize)
+/// yields the priority order and [`take_warnings`](Self::take_warnings)
+/// the collected warnings. The final state never depends on fetch
+/// completion order: declarations are kept raw and re-derived when a
+/// shorter path lowers a channel's depth, and depth refusals are only
+/// reported at finalize.
 pub(super) struct ChannelExpander {
     mode: ChannelRelationsMode,
     max_depth: usize,
     platforms: Vec<Platform>,
     user_channels: Vec<ChannelUrl>,
     discovered: HashMap<ChannelUrl, Arc<Channel>>,
-    /// Shortest known relation-hop distance from any user channel.
-    /// User channels are at depth 0.
+    /// Shortest known hop distance from any user channel (user = 0).
     depth_of: HashMap<ChannelUrl, usize>,
-    /// Raw relations observed per declaring channel, deduplicated.
-    /// Distinct subdirs may declare distinct relations; all of them
-    /// contribute edges. Kept raw so relaxation can re-derive
-    /// references that an earlier, deeper depth refused.
+    /// Raw declarations per channel, kept so relaxation can re-derive
+    /// references a deeper pass refused.
     relations_of: HashMap<ChannelUrl, Vec<ChannelRelations>>,
-    /// Deduplicated relation edges in insertion order. Edge counts
-    /// are tiny (a couple per declaring channel), so linear dedup on
-    /// the Vec beats maintaining a mirror set.
+    /// Deduplicated relation edges (tiny, so linear dedup on the Vec).
     edges: Vec<PriorityEdge<ChannelUrl>>,
     warnings: Vec<ChannelRelationsWarning>,
-    /// Rendered messages of already-recorded warnings; suppresses
-    /// duplicates from multi-platform observation and relaxation
-    /// re-processing.
+    /// Dedup keys of recorded warnings.
     emitted: HashSet<String>,
 }
 
@@ -234,9 +198,7 @@ impl ChannelExpander {
         }
     }
 
-    /// `true` when relations should be followed. `max_depth == 0` is
-    /// equivalent to [`ChannelRelationsMode::Disabled`] regardless of
-    /// the mode the caller selected.
+    /// `max_depth == 0` is equivalent to [`ChannelRelationsMode::Disabled`].
     pub fn enabled(&self) -> bool {
         !matches!(self.mode, ChannelRelationsMode::Disabled) && self.max_depth > 0
     }
@@ -249,15 +211,12 @@ impl ChannelExpander {
         &self.platforms
     }
 
-    /// `true` once any subdir has contributed a valid relation edge.
-    /// Callers use this to decide whether to reorder the result Vec.
+    /// `true` once any subdir contributed an edge; gates reordering.
     pub fn has_observed_relations(&self) -> bool {
         !self.edges.is_empty()
     }
 
-    /// Record a warning unless an identical one was already recorded
-    /// (multi-platform subdirs of one channel would otherwise report
-    /// every problem once per platform).
+    /// Record a warning unless an identical one exists.
     pub fn push_warning(&mut self, warning: ChannelRelationsWarning) {
         if self.emitted.insert(warning.to_string()) {
             self.warnings.push(warning);
@@ -276,16 +235,12 @@ impl ChannelExpander {
         Ok(())
     }
 
-    /// Drain the accumulated warnings. Idempotent: subsequent calls
-    /// return an empty vec.
+    /// Drain the accumulated warnings.
     pub fn take_warnings(&mut self) -> Vec<ChannelRelationsWarning> {
         std::mem::take(&mut self.warnings)
     }
 
-    /// Register a user-supplied channel at depth 0. Returns the
-    /// canonical URL and a shared `Arc<Channel>`. Subsequent calls for
-    /// the same URL return the existing Arc and do not duplicate the
-    /// channel in the priority input.
+    /// Register a user channel at depth 0, deduplicating repeats.
     pub fn register_user_channel(&mut self, channel: Channel) -> (ChannelUrl, Arc<Channel>) {
         let url = channel.base_url.clone();
         if let Some(existing) = self.discovered.get(&url) {
@@ -298,17 +253,13 @@ impl ChannelExpander {
         (url, arc)
     }
 
-    /// Process the relations declared by `subdir` for one
-    /// `(channel, platform)` and return any newly-discovered
-    /// `(url, channel, platform)` triples the caller must schedule.
-    /// Each new channel is fanned out over every platform the
-    /// expander was configured with.
+    /// Process one resolved subdir's relations and return the newly
+    /// discovered (url, channel, platform) pairs to schedule.
     ///
-    /// In `Strict` mode a violation (invalid reference, self-relation,
-    /// `base == overrides`, cycle) returns `Err(ChannelRelationsError)`
-    /// so the executor can abort the remaining in-flight fetches.
-    /// Depth-limit violations are deferred to [`finalize`](Self::finalize),
-    /// where depths no longer depend on fetch completion order.
+    /// `Strict` mode returns `Err` on malformed metadata or a cycle so
+    /// the executor can abort. Depth violations are deferred to
+    /// [`finalize`](Self::finalize), where they no longer depend on
+    /// fetch completion order.
     pub fn observe(
         &mut self,
         channel_url: &ChannelUrl,
@@ -354,11 +305,9 @@ impl ChannelExpander {
         Ok(pairs)
     }
 
-    /// Re-derive edges starting from `start`, relaxing depths: when a
-    /// target's known depth decreases, its stored relations are
-    /// re-processed so references an earlier (deeper) pass refused
-    /// are picked up. This makes the final edge set and depths
-    /// independent of subdir fetch completion order.
+    /// Derive edges starting from `start`. When a target's depth
+    /// improves, its stored declarations are processed again so
+    /// references a deeper pass refused are picked up.
     fn relax(
         &mut self,
         start: ChannelUrl,
@@ -384,9 +333,7 @@ impl ChannelExpander {
         Ok(())
     }
 
-    /// Derive priority edges from one raw declaration of `declaring`
-    /// at `depth`, discovering targets and scheduling relaxation of
-    /// channels whose depth improves.
+    /// Derive edges from one declaration of `declaring` at `depth`.
     fn derive_edges(
         &mut self,
         declaring: &ChannelUrl,
@@ -398,8 +345,7 @@ impl ChannelExpander {
         let base = self.resolve_field(declaring, relations.base.as_deref())?;
         let overrides = self.resolve_field(declaring, relations.overrides.as_deref())?;
 
-        // base == overrides target is malformed; drop both references
-        // so the contradictory declaration cannot influence priority.
+        // Malformed per CEP-42; drop both references.
         if let (Some(b), Some(o)) = (&base, &overrides)
             && b == o
         {
@@ -421,8 +367,7 @@ impl ChannelExpander {
                 continue;
             }
 
-            // Depth-limit refusal is silent here; finalize reports it
-            // once depths are final.
+            // Silent here; finalize reports it once depths are final.
             if depth + 1 > self.max_depth {
                 continue;
             }
@@ -447,8 +392,7 @@ impl ChannelExpander {
             let new_depth = depth + 1;
             match self.depth_of.get(&target).copied() {
                 Some(known) if new_depth < known => {
-                    // Shorter path found: relax the target so refs its
-                    // earlier, deeper pass refused get re-derived.
+                    // Shorter path: re-derive the target's refusals.
                     self.depth_of.insert(target.clone(), new_depth);
                     worklist.push(target.clone());
                 }
@@ -464,8 +408,7 @@ impl ChannelExpander {
         Ok(())
     }
 
-    /// Resolve one `base` or `overrides` reference, surfacing
-    /// invalid-syntax / unparsable-target failures per the mode.
+    /// Resolve one reference, reporting invalid or unparsable ones.
     fn resolve_field(
         &mut self,
         declaring: &ChannelUrl,
@@ -494,12 +437,9 @@ impl ChannelExpander {
         }
     }
 
-    /// Compute the final channel priority resolution.
-    ///
-    /// Reports depth-limit refusals (now that every depth is final),
-    /// user-order conflicts, and broken cycles; in `Strict` mode the
-    /// fatal ones among these return `Err`. The resolution inputs are
-    /// canonically ordered so the result is identical run to run.
+    /// Report deferred depth refusals, resolve the priority order from
+    /// canonically sorted inputs (identical run to run), and surface
+    /// ignored and broken edges.
     pub fn finalize(&mut self) -> Result<Resolution<ChannelUrl>, super::GatewayError> {
         self.report_depth_refusals()?;
 
@@ -536,12 +476,9 @@ impl ChannelExpander {
         Ok(resolution)
     }
 
-    /// Report every reference that stayed unfollowed because its
-    /// declaring channel sits at the depth limit. Runs at finalize so
-    /// the outcome does not depend on fetch completion order: a
-    /// channel's depth can only have decreased since the reference
-    /// was first seen, and relaxation already re-derived references
-    /// whose depth improved.
+    /// Report every reference left unfollowed by the depth limit.
+    /// Depths only decrease and relaxation re-derives anything that
+    /// comes within range, so at finalize a refusal is definitive.
     fn report_depth_refusals(&mut self) -> Result<(), super::GatewayError> {
         let mut refused: Vec<(ChannelUrl, Vec<ChannelRelations>)> = self
             .relations_of
@@ -591,10 +528,9 @@ impl ChannelExpander {
         Ok(())
     }
 
-    /// Fail fast on a cycle in the partial graph. Node order is
-    /// irrelevant for cycle detection, so the (cheap) user-channel
-    /// list stands in for the full node list; edge endpoints are
-    /// indexed automatically.
+    /// Fail fast on a cycle in the partial graph. Node order does not
+    /// matter for cycle detection, so the user list stands in for the
+    /// node list; edge endpoints are indexed automatically.
     fn strict_cycle_check(&self) -> Result<(), super::GatewayError> {
         let resolution =
             resolve_channel_priority(&self.user_channels, &self.user_channels, &self.edges);
@@ -612,11 +548,9 @@ impl ChannelExpander {
         )))
     }
 
-    /// Map every transitively discovered channel to the first user
-    /// channel in `user_priority` that reaches it via declared
-    /// relations. Deterministic given the final edge set; the
-    /// executor uses it to slot discovered channels next to the
-    /// user channel that introduced them.
+    /// Map each discovered channel to the first user channel in
+    /// `user_priority` that reaches it. Derived from the final edge
+    /// set, so independent of fetch completion order.
     pub fn anchors(&self, user_priority: &[ChannelUrl]) -> HashMap<ChannelUrl, ChannelUrl> {
         // Discovery arcs run declaring -> target: a Base edge stores
         // (from: target, to: declaring), an Override edge stores
@@ -639,9 +573,8 @@ impl ChannelExpander {
                     continue;
                 };
                 for &target in targets {
-                    // User channels anchor to themselves; do not
-                    // traverse through them (their own BFS pass
-                    // claims their descendants).
+                    // User channels anchor to themselves; their own
+                    // pass claims their descendants.
                     if user_set.contains(target) {
                         continue;
                     }
@@ -673,11 +606,9 @@ enum ResolveError {
     Unparsable(url::ParseError),
 }
 
-/// Validate that `reference` is a CEP-42-compliant relative path and
-/// resolve it against `declaring`. CEP-42 mandates that references be
-/// relative paths starting with `../`; absolute URLs, `./foo`, `foo`,
-/// `/foo`, `?x`, etc. are all rejected to prevent malicious metadata
-/// from pointing at attacker-controlled URLs.
+/// Validate `reference` as a CEP-42 relative path and resolve it
+/// against `declaring`. Strictness keeps malicious metadata from
+/// pointing at attacker-controlled URLs.
 fn validate_and_resolve(
     declaring: &ChannelUrl,
     reference: &str,
@@ -693,10 +624,8 @@ fn validate_and_resolve(
     Ok(ChannelUrl::from(joined))
 }
 
-/// CEP-42 requires that `base` and `overrides` be relative paths
-/// starting with `../`. No scheme, no leading `/`, no query, no
-/// fragment, and no empty path segments (one trailing `/` is
-/// allowed).
+/// Only `../`-rooted relative paths: no scheme, query, fragment,
+/// backslash, or empty path segment (one trailing `/` is allowed).
 fn is_valid_cep42_reference(reference: &str) -> bool {
     if reference.is_empty() {
         return false;
@@ -710,9 +639,8 @@ fn is_valid_cep42_reference(reference: &str) -> bool {
     if reference.contains("://") {
         return false;
     }
-    // WHATWG URL parsing treats `\` as `/` for http(s), so a
-    // backslash smuggles in path separators the segment checks below
-    // never see. Backslashes have no place in a relative channel path.
+    // WHATWG URL parsing maps `\` to `/` for http(s), smuggling in
+    // separators the segment checks below never see.
     if reference.contains('\\') {
         return false;
     }
