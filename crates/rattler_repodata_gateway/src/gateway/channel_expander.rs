@@ -710,6 +710,12 @@ fn is_valid_cep42_reference(reference: &str) -> bool {
     if reference.contains("://") {
         return false;
     }
+    // WHATWG URL parsing treats `\` as `/` for http(s), so a
+    // backslash smuggles in path separators the segment checks below
+    // never see. Backslashes have no place in a relative channel path.
+    if reference.contains('\\') {
+        return false;
+    }
     // Every segment must be non-empty; only the final segment may be
     // empty (a single trailing slash).
     let segments: Vec<&str> = reference.split('/').collect();
@@ -776,6 +782,17 @@ mod tests {
         let declaring = chan("https://example.com/bioconda/");
         assert!(matches!(
             validate_and_resolve(&declaring, "?x=1").unwrap_err(),
+            ResolveError::InvalidSyntax
+        ));
+    }
+
+    /// WHATWG URL parsing maps `\` to `/` for http(s); accepting it
+    /// would smuggle path separators past the segment checks.
+    #[test]
+    fn rejects_backslash_reference() {
+        let declaring = chan("https://example.com/bioconda/");
+        assert!(matches!(
+            validate_and_resolve(&declaring, "../\\evil.example").unwrap_err(),
             ResolveError::InvalidSyntax
         ));
     }
@@ -944,5 +961,239 @@ mod tests {
             Some(&a),
             "cf must anchor to the earliest user channel that references it"
         );
+    }
+}
+
+/// Property tests for the invariant the expander exists to uphold:
+/// the final state (edges, depths, discovered set, resolution order,
+/// anchors, warnings) is a pure function of the declared relations
+/// and never depends on the order in which subdir fetches complete.
+#[cfg(test)]
+mod proptests {
+    use std::collections::HashMap;
+
+    use proptest::prelude::*;
+    use rattler_conda_types::{Channel, ChannelRelations, ChannelUrl, Platform};
+    use url::Url;
+
+    use super::{
+        ChannelExpander, ChannelRelationsMode, PriorityEdge, Resolution, validate_and_resolve,
+    };
+
+    const NAMES: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+
+    fn chan(name: &str) -> ChannelUrl {
+        ChannelUrl::from(Url::parse(&format!("https://example.com/{name}/")).unwrap())
+    }
+
+    /// One randomly generated channel graph: per channel an optional
+    /// `base` / `overrides` target index (self-references allowed, so
+    /// the malformed paths are exercised too), how many channels the
+    /// user listed, and the depth limit.
+    #[derive(Debug, Clone)]
+    struct Scenario {
+        relations: Vec<(Option<usize>, Option<usize>)>,
+        user_count: usize,
+        max_depth: usize,
+    }
+
+    fn scenario() -> impl Strategy<Value = Scenario> {
+        (2..=NAMES.len(), 1..=3usize, 1..=4usize).prop_flat_map(|(n, user_count, max_depth)| {
+            proptest::collection::vec((proptest::option::of(0..n), proptest::option::of(0..n)), n)
+                .prop_map(move |relations| Scenario {
+                    user_count: user_count.min(relations.len()),
+                    relations,
+                    max_depth,
+                })
+        })
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        edges: Vec<PriorityEdge<ChannelUrl>>,
+        depths: Vec<(ChannelUrl, usize)>,
+        discovered: Vec<ChannelUrl>,
+        anchors: Vec<(ChannelUrl, ChannelUrl)>,
+        warnings: Vec<String>,
+        resolution: Resolution<ChannelUrl>,
+    }
+
+    /// Drive the expander like the executor does. `priority[i]` says
+    /// how quickly channel `i`'s subdir fetch completes: at every
+    /// step the discovered-but-unobserved channel with the lowest
+    /// priority is observed next.
+    fn run(sc: &Scenario, priority: &[u32]) -> Outcome {
+        let n = sc.relations.len();
+        let urls: Vec<ChannelUrl> = NAMES[..n].iter().map(|name| chan(name)).collect();
+
+        let mut ex = ChannelExpander::new(
+            ChannelRelationsMode::Warn,
+            sc.max_depth,
+            vec![Platform::Linux64],
+        );
+        let user_urls: Vec<ChannelUrl> = urls[..sc.user_count].to_vec();
+        for url in &user_urls {
+            ex.register_user_channel(Channel::from_url(url.clone()));
+        }
+
+        let mut observed = vec![false; n];
+        loop {
+            let next = (0..n)
+                .filter(|&i| !observed[i] && ex.discovered.contains_key(&urls[i]))
+                .min_by_key(|&i| (priority[i], i));
+            let Some(i) = next else { break };
+            observed[i] = true;
+
+            let (base, overrides) = sc.relations[i];
+            let relations = ChannelRelations {
+                base: base.map(|t| format!("../{}", NAMES[t])),
+                overrides: overrides.map(|t| format!("../{}", NAMES[t])),
+            };
+            if relations.is_empty() {
+                continue;
+            }
+            // Mirrors `observe` after its subdir gating.
+            let entries = ex.relations_of.entry(urls[i].clone()).or_default();
+            if entries.contains(&relations) {
+                continue;
+            }
+            entries.push(relations);
+            let mut newly = Vec::new();
+            ex.relax(urls[i].clone(), &mut newly).unwrap();
+        }
+
+        let resolution = ex.finalize().unwrap();
+        let mut edges = ex.edges.clone();
+        edges.sort();
+        let mut depths: Vec<_> = ex.depth_of.iter().map(|(u, d)| (u.clone(), *d)).collect();
+        depths.sort();
+        let mut discovered: Vec<_> = ex.discovered.keys().cloned().collect();
+        discovered.sort();
+        let mut anchors: Vec<_> = ex.anchors(&user_urls).into_iter().collect();
+        anchors.sort();
+        let mut warnings: Vec<_> = ex.take_warnings().iter().map(ToString::to_string).collect();
+        warnings.sort();
+        Outcome {
+            edges,
+            depths,
+            discovered,
+            anchors,
+            warnings,
+            resolution,
+        }
+    }
+
+    proptest! {
+        /// The observable outcome must be identical for every fetch
+        /// completion order, and the resolution must satisfy its
+        /// structural invariants.
+        #[test]
+        fn outcome_is_independent_of_fetch_completion_order(
+            sc in scenario(),
+            priority in proptest::collection::vec(any::<u32>(), NAMES.len()),
+        ) {
+            let canonical: Vec<u32> = (0..NAMES.len() as u32).collect();
+            let reference = run(&sc, &canonical);
+            let shuffled = run(&sc, &priority);
+            prop_assert_eq!(&shuffled, &reference);
+
+            // Structural invariants of the final resolution.
+            let order = &reference.resolution.order;
+            let mut sorted_order = order.clone();
+            sorted_order.sort();
+            prop_assert_eq!(
+                &sorted_order, &reference.discovered,
+                "order must be a permutation of the discovered channels"
+            );
+            let position: HashMap<&ChannelUrl, usize> =
+                order.iter().enumerate().map(|(i, u)| (u, i)).collect();
+            for edge in &reference.resolution.edges {
+                prop_assert_ne!(&edge.from, &edge.to, "kept edges must not be self-loops");
+                prop_assert!(
+                    position[&edge.from] < position[&edge.to],
+                    "kept edge {:?} -> {:?} not respected by {:?}",
+                    edge.from, edge.to, order
+                );
+            }
+            // Every discovered channel sits within the depth limit.
+            for (url, depth) in &reference.depths {
+                prop_assert!(
+                    *depth <= sc.max_depth,
+                    "{url} discovered at depth {depth} > max {}",
+                    sc.max_depth
+                );
+            }
+        }
+    }
+
+    /// The security contract of the reference validator: anything it
+    /// accepts resolves to the same origin as the declaring channel.
+    fn reference() -> impl Strategy<Value = String> {
+        let segment = prop_oneof![
+            Just("..".to_string()),
+            Just(".".to_string()),
+            Just(String::new()),
+            Just("conda-forge".to_string()),
+            Just("%2e%2e".to_string()),
+            Just("http:".to_string()),
+            Just("\\evil.example".to_string()),
+            Just("?x=1".to_string()),
+            Just("#frag".to_string()),
+            "[a-z]{1,4}".prop_map(|s| s),
+        ];
+        prop_oneof![
+            (
+                proptest::collection::vec(segment, 0..5),
+                any::<bool>(),
+                any::<bool>()
+            )
+                .prop_map(|(segments, rooted, trailing)| {
+                    let mut reference = if rooted {
+                        "../".to_string()
+                    } else {
+                        String::new()
+                    };
+                    reference.push_str(&segments.join("/"));
+                    if trailing {
+                        reference.push('/');
+                    }
+                    reference
+                }),
+            any::<String>(),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn accepted_references_never_change_origin(
+            reference in reference(),
+            base_idx in 0..3usize,
+        ) {
+            let bases = [
+                "https://example.com/scope/chan/",
+                "http://host.example:8080/a/b/",
+                "file:///tmp/repo/chan/",
+            ];
+            let base = ChannelUrl::from(Url::parse(bases[base_idx]).unwrap());
+            if let Ok(resolved) = validate_and_resolve(&base, &reference) {
+                let base_url = base.url();
+                let url = resolved.url();
+                prop_assert_eq!(url.scheme(), base_url.scheme());
+                prop_assert_eq!(url.host_str(), base_url.host_str());
+                prop_assert_eq!(
+                    url.port_or_known_default(),
+                    base_url.port_or_known_default()
+                );
+                // No empty path segments survive validation (a single
+                // trailing slash yields one trailing empty segment).
+                let segments: Vec<&str> = url.path().split('/').collect();
+                for (i, segment) in segments.iter().enumerate() {
+                    prop_assert!(
+                        !segment.is_empty() || i == 0 || i == segments.len() - 1,
+                        "empty path segment in {url}"
+                    );
+                }
+            }
+        }
     }
 }

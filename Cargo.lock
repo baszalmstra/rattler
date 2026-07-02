@@ -5461,6 +5461,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "pin-project-lite",
+ "proptest",
  "rattler_cache",
  "rattler_conda_types",
  "rattler_config",

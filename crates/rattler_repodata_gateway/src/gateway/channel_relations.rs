@@ -774,57 +774,6 @@ mod tests {
         assert!(sources.contains(&EdgeSource::Override));
     }
 
-    #[test]
-    fn user_self_edge_is_not_kept() {
-        let reg: ChannelRegistry<'_> = ChannelRegistry::new();
-        let r = resolve(&["a", "a"], &reg);
-        for edge in &r.edges {
-            assert_ne!(
-                edge.from, edge.to,
-                "Resolution::edges must not contain a self-edge"
-            );
-        }
-    }
-
-    #[test]
-    fn order_is_consistent_with_every_accepted_edge() {
-        let reg = registry([
-            ("alpha", Some("conda-forge"), Some("alpha-archive")),
-            ("beta", Some("alpha"), None),
-            ("conda-forge", None, None),
-            ("alpha-archive", None, None),
-        ]);
-        let r = resolve(&["beta"], &reg);
-        for edge in &r.edges {
-            let from_pos = r.order.iter().position(|c| c == &edge.from).unwrap();
-            let to_pos = r.order.iter().position(|c| c == &edge.to).unwrap();
-            assert!(
-                from_pos < to_pos,
-                "edge {:?} -> {:?} not respected in order {:?}",
-                edge.from,
-                edge.to,
-                r.order
-            );
-        }
-    }
-
-    #[test]
-    fn broken_cycle_edges_are_reported_in_the_resolution() {
-        let reg = registry([("a", Some("b"), None), ("b", Some("a"), None)]);
-        let r = resolve(&["a"], &reg);
-        assert!(!r.broken_cycle_edges.is_empty());
-    }
-
-    #[test]
-    fn no_broken_edges_on_a_cycle_free_graph() {
-        let reg = registry([
-            ("bioconda", Some("conda-forge"), None),
-            ("conda-forge", None, None),
-        ]);
-        let r = resolve(&["bioconda"], &reg);
-        assert!(r.broken_cycle_edges.is_empty());
-    }
-
     /// Two platforms of the same channel declaring DIFFERENT bases is
     /// valid per CEP-42. Both edges must be respected in the final
     /// order, with neither silently dropped.

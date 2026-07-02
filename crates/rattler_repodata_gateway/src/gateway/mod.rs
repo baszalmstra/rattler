@@ -2843,53 +2843,6 @@ mod test {
         assert_eq!(results.len(), 1, "no expansion in Disabled mode");
     }
 
-    /// `max_depth = 1` follows `a -> b` but stops short of `c`.
-    #[tokio::test]
-    async fn test_cep42_max_depth_truncates_recursion() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        let c = dir.path().join("c");
-        write_test_subdir(&a, "shared", "1.0.0", Some("../b"), None);
-        write_test_subdir(&b, "shared", "2.0.0", Some("../c"), None);
-        write_test_subdir(&c, "shared", "3.0.0", None, None);
-
-        let server = SimpleChannelServer::new(dir.path()).await;
-        let a_ch = Channel::from_url(server.url().join("a/").unwrap());
-
-        let gateway = Gateway::new();
-        let results = query_channels(&gateway, vec![a_ch], "shared", None, Some(1))
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 2);
-    }
-
-    /// `Strict` surfaces a broken cycle as a `GatewayError`.
-    #[tokio::test]
-    async fn test_cep42_strict_mode_errors_on_cycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        write_test_subdir(&a, "shared", "1.0.0", Some("../b"), None);
-        write_test_subdir(&b, "shared", "2.0.0", Some("../a"), None);
-
-        let server = SimpleChannelServer::new(dir.path()).await;
-        let a_ch = Channel::from_url(server.url().join("a/").unwrap());
-
-        let gateway = Gateway::new();
-        let err = query_channels(
-            &gateway,
-            vec![a_ch],
-            "shared",
-            Some(crate::ChannelRelationsMode::Strict),
-            None,
-        )
-        .await
-        .expect_err("cycle must error in Strict mode");
-        assert!(matches!(err, crate::GatewayError::ChannelRelationsError(_)));
-    }
-
     /// Regression: the Strict-mode cycle error must include the
     /// offending edges, not just a count. The check runs incrementally
     /// during `observe`, so this also asserts the message survives the
@@ -2923,25 +2876,6 @@ mod test {
             msg.contains("/a/") && msg.contains("/b/"),
             "cycle error must name the offending channels; got: {msg}"
         );
-    }
-
-    /// `Warn` (default) tolerates a broken cycle.
-    #[tokio::test]
-    async fn test_cep42_warn_mode_tolerates_cycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        write_test_subdir(&a, "shared", "1.0.0", Some("../b"), None);
-        write_test_subdir(&b, "shared", "2.0.0", Some("../a"), None);
-
-        let server = SimpleChannelServer::new(dir.path()).await;
-        let a_ch = Channel::from_url(server.url().join("a/").unwrap());
-
-        let gateway = Gateway::new();
-        let results = query_channels(&gateway, vec![a_ch], "shared", None, None)
-            .await
-            .expect("Warn mode must not error on cycle");
-        assert_eq!(results.len(), 2);
     }
 
     /// An absent discovered subdir produces an empty bucket, not an
@@ -3208,6 +3142,8 @@ mod test {
             .await
             .expect("Warn mode must not error on cycle");
 
+        // Both channels of the cycle still produce buckets.
+        assert_eq!(output.repodata.len(), 2);
         assert!(
             output.warnings.iter().any(|w| matches!(
                 w,
@@ -3459,6 +3395,8 @@ mod test {
             .execute()
             .await
             .expect("Warn must tolerate depth-exceeded");
+        // Expansion stops after `b`: buckets for `a` and `b` only.
+        assert_eq!(output.repodata.len(), 2);
         assert!(
             output.warnings.iter().any(|w| matches!(
                 w,
