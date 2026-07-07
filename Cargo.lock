@@ -4950,6 +4950,7 @@ dependencies = [
  "rand 0.10.1",
  "rattler_cache",
  "rattler_conda_types",
+ "rattler_config",
  "rattler_digest",
  "rattler_lock",
  "rattler_menuinst",
@@ -5117,12 +5118,13 @@ dependencies = [
 name = "rattler_config"
 version = "0.5.2"
 dependencies = [
- "console",
+ "dirs",
  "fs-err",
  "indexmap 2.14.0",
  "insta",
  "rattler_conda_types",
  "serde",
+ "serde_ignored",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -6333,6 +6335,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
