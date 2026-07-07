@@ -436,9 +436,10 @@ mod test {
             tools::fetch_test_conda_forge_repodata_async("linux-64")
         )
         .unwrap();
-        Channel::from_directory(
+        Channel::try_from_directory(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-data/channels/conda-forge"),
         )
+        .unwrap()
     }
 
     async fn remote_conda_forge() -> SimpleChannelServer {
@@ -547,7 +548,7 @@ mod test {
 
         let reporter = Arc::new(RevisionReporter::default());
         let gateway = Gateway::new();
-        let channel = Channel::from_directory(tempdir.path());
+        let channel = Channel::try_from_directory(tempdir.path()).unwrap();
         let records = gateway
             .query(
                 vec![channel.clone()],
@@ -637,7 +638,7 @@ mod test {
         let reporter = Arc::new(RevisionReporter::default());
         let records = Gateway::new()
             .query(
-                vec![Channel::from_directory(tempdir.path())],
+                vec![Channel::try_from_directory(tempdir.path()).unwrap()],
                 vec![Platform::NoArch],
                 vec![PackageName::from_str("demo").unwrap()],
             )
