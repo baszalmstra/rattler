@@ -11,7 +11,9 @@ use rattler_conda_types::{Channel, ChannelRelations, ChannelUrl, Platform};
 use super::{
     channel_relations::{EdgeSource, PriorityEdge, Resolution, resolve_channel_priority},
     subdir::Subdir,
+    warning::GatewayWarning,
 };
+use crate::Reporter;
 
 /// How a query treats [CEP-42] `channel_relations` metadata.
 ///
@@ -180,10 +182,17 @@ pub(super) struct ChannelExpander {
     warnings: Vec<ChannelRelationsWarning>,
     /// Dedup keys of recorded warnings.
     emitted: HashSet<String>,
+    /// Notified once per unique warning as it is recorded.
+    reporter: Option<Arc<dyn Reporter>>,
 }
 
 impl ChannelExpander {
-    pub fn new(mode: ChannelRelationsMode, max_depth: usize, platforms: Vec<Platform>) -> Self {
+    pub fn new(
+        mode: ChannelRelationsMode,
+        max_depth: usize,
+        platforms: Vec<Platform>,
+        reporter: Option<Arc<dyn Reporter>>,
+    ) -> Self {
         Self {
             mode,
             max_depth,
@@ -195,6 +204,7 @@ impl ChannelExpander {
             edges: Vec::new(),
             warnings: Vec::new(),
             emitted: HashSet::new(),
+            reporter,
         }
     }
 
@@ -216,9 +226,13 @@ impl ChannelExpander {
         !self.edges.is_empty()
     }
 
-    /// Record a warning unless an identical one exists.
+    /// Record a warning unless an identical one exists, notifying the
+    /// reporter on acceptance.
     pub fn push_warning(&mut self, warning: ChannelRelationsWarning) {
         if self.emitted.insert(warning.to_string()) {
+            if let Some(reporter) = &self.reporter {
+                reporter.on_gateway_warning(&GatewayWarning::from(warning.clone()));
+            }
             self.warnings.push(warning);
         }
     }
@@ -810,7 +824,7 @@ mod tests {
         // depths, and discovered sets.
         let run = |order: &[(&ChannelUrl, ChannelRelations)]| {
             let mut ex =
-                ChannelExpander::new(ChannelRelationsMode::Warn, 2, vec![Platform::Linux64]);
+                ChannelExpander::new(ChannelRelationsMode::Warn, 2, vec![Platform::Linux64], None);
             ex.register_user_channel(Channel::from_url(a.clone()));
             ex.register_user_channel(Channel::from_url(b.clone()));
             for (url, relations) in order {
@@ -866,7 +880,8 @@ mod tests {
         let b = chan("https://example.com/b/");
         let cf = chan("https://example.com/conda-forge/");
 
-        let mut ex = ChannelExpander::new(ChannelRelationsMode::Warn, 2, vec![Platform::Linux64]);
+        let mut ex =
+            ChannelExpander::new(ChannelRelationsMode::Warn, 2, vec![Platform::Linux64], None);
         ex.register_user_channel(Channel::from_url(a.clone()));
         ex.register_user_channel(Channel::from_url(b.clone()));
 
@@ -958,6 +973,7 @@ mod proptests {
             ChannelRelationsMode::Warn,
             sc.max_depth,
             vec![Platform::Linux64],
+            None,
         );
         let user_urls: Vec<ChannelUrl> = urls[..sc.user_count].to_vec();
         for url in &user_urls {

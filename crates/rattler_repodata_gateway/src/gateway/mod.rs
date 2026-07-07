@@ -3116,9 +3116,25 @@ mod test {
     }
 
     /// In `Warn` mode a cycle in the declared relations surfaces as a
-    /// `ChannelRelationsWarning::CycleBroken` on the query output.
+    /// `ChannelRelationsWarning::CycleBroken` on the query output and
+    /// is streamed to `Reporter::on_gateway_warning` as it happens.
     #[tokio::test]
     async fn test_cep42_warn_mode_cycle_surfaces_as_warning() {
+        #[derive(Default)]
+        struct WarningReporter {
+            messages: Mutex<Vec<String>>,
+        }
+
+        impl Reporter for Arc<WarningReporter> {
+            fn download_reporter(&self) -> Option<&dyn DownloadReporter> {
+                None
+            }
+
+            fn on_gateway_warning(&self, warning: &crate::GatewayWarning) {
+                self.messages.lock().unwrap().push(warning.to_string());
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
@@ -3128,6 +3144,7 @@ mod test {
         let server = SimpleChannelServer::new(dir.path()).await;
         let a_ch = Channel::from_url(server.url().join("a/").unwrap());
 
+        let reporter = Arc::new(WarningReporter::default());
         let gateway = Gateway::new();
         let output = gateway
             .query(
@@ -3136,6 +3153,7 @@ mod test {
                 vec![MatchSpec::from_str("shared", Strict).unwrap()],
             )
             .recursive(false)
+            .with_reporter(reporter.clone())
             .execute()
             .await
             .expect("Warn mode must not error on cycle");
@@ -3152,6 +3170,11 @@ mod test {
             "expected a CycleBroken warning; got {:?}",
             output.warnings,
         );
+
+        // The reporter saw exactly the warnings on the output.
+        let streamed = reporter.messages.lock().unwrap();
+        let collected: Vec<String> = output.warnings.iter().map(ToString::to_string).collect();
+        assert_eq!(*streamed, collected);
     }
 
     /// In `Warn` mode an invalid `base`/`overrides` reference (a

@@ -31,7 +31,8 @@ pub struct RepoDataQueryOutput {
     /// next to the channel that introduced them; caller-supplied
     /// sources keep their positions.
     pub repodata: Vec<RepoData>,
-    /// Non-fatal warnings encountered during the query.
+    /// Non-fatal warnings encountered during the query. Also streamed
+    /// to [`Reporter::on_gateway_warning`] as they are recorded.
     pub warnings: Vec<GatewayWarning>,
 }
 
@@ -70,7 +71,8 @@ impl<'a> IntoIterator for &'a RepoDataQueryOutput {
 pub struct NamesQueryOutput {
     /// Distinct package names contributed by all queried subdirs.
     pub names: Vec<PackageName>,
-    /// Non-fatal warnings encountered during the query.
+    /// Non-fatal warnings encountered during the query. Also streamed
+    /// to [`Reporter::on_gateway_warning`] as they are recorded.
     pub warnings: Vec<GatewayWarning>,
 }
 
@@ -407,6 +409,7 @@ impl QueryExecutor {
             channel_relations_mode,
             channel_relations_max_depth,
             platforms.clone(),
+            reporter.clone(),
         );
 
         // Iterate per caller-source index then per platform, so each
@@ -1259,6 +1262,7 @@ impl NamesQuery {
             self.channel_relations_mode,
             self.channel_relations_max_depth,
             self.platforms.clone(),
+            self.reporter.clone(),
         );
 
         let mut pending: FuturesUnordered<BoxFuture<NamesFetchResult>> = FuturesUnordered::new();
