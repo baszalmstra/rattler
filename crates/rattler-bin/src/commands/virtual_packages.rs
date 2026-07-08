@@ -7,9 +7,11 @@ use rattler_virtual_packages::VirtualPackageOverrides;
 pub struct Opt {}
 
 pub fn virtual_packages(_opt: Opt) -> miette::Result<()> {
-    let virtual_packages =
-        rattler_virtual_packages::VirtualPackage::detect(&VirtualPackageOverrides::from_env())
-            .into_diagnostic()?;
+    let virtual_packages = rattler_virtual_packages::VirtualPackage::detect(
+        &VirtualPackageOverrides::from_env(),
+        rattler::default_cache_dir().ok().as_deref(),
+    )
+    .into_diagnostic()?;
     for package in virtual_packages {
         println!("{}", GenericVirtualPackage::from(package.clone()));
     }

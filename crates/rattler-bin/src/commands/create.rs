@@ -243,6 +243,7 @@ pub async fn create(opt: Opt) -> miette::Result<()> {
         } else {
             rattler_virtual_packages::VirtualPackage::detect(
                 &rattler_virtual_packages::VirtualPackageOverrides::from_env(),
+                rattler::default_cache_dir().ok().as_deref(),
             )
             .map(|vpkgs| {
                 vpkgs
