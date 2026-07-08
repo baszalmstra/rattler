@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import List
+import os
+from typing import List, Optional
 import warnings
 
 from rattler.rattler import PyVirtualPackage, PyOverride, PyVirtualPackageOverrides
@@ -197,11 +198,20 @@ class VirtualPackage:
         return VirtualPackage.detect()
 
     @staticmethod
-    def detect(overrides: VirtualPackageOverrides = VirtualPackageOverrides()) -> List[VirtualPackage]:
+    def detect(
+        overrides: VirtualPackageOverrides = VirtualPackageOverrides(),
+        cache_dir: Optional[os.PathLike[str]] = None,
+    ) -> List[VirtualPackage]:
         """
         Returns virtual packages detected for the current system with the given overrides.
+
+        If `cache_dir` is given, expensive detection results (currently CUDA) are cached in that
+        directory across processes until the next reboot.
         """
-        return [VirtualPackage._from_py_virtual_package(vp) for vp in PyVirtualPackage.detect(overrides._overrides)]
+        return [
+            VirtualPackage._from_py_virtual_package(vp)
+            for vp in PyVirtualPackage.detect(overrides._overrides, cache_dir)
+        ]
 
     def into_generic(self) -> GenericVirtualPackage:
         """
