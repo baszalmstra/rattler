@@ -395,6 +395,8 @@ impl PyPrefixPlaceholder {
             inner: PrefixPlaceholder {
                 file_mode: file_mode.into(),
                 placeholder: placeholder.to_string(),
+                offsets: None,
+                shebang_length: None,
             },
         })
     }
