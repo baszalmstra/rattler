@@ -259,12 +259,25 @@ impl VirtualPackages {
         overrides: &VirtualPackageOverrides,
         cache_dir: Option<&Path>,
     ) -> Result<Self, DetectVirtualPackageError> {
+        tracing::trace!(
+            cache_dir = %cache_dir.map_or_else(
+                || "<disabled>".to_string(),
+                |path| path.display().to_string()
+            ),
+            "detecting virtual packages"
+        );
+
         let cuda = Cuda::detect_with_cache_dir(overrides.cuda.as_ref(), cache_dir)?;
+        tracing::trace!(?cuda, "detected CUDA virtual package");
         let mut cuda_arch =
             CudaArch::detect_with_cache_dir(overrides.cuda_arch.as_ref(), cache_dir)?;
+        tracing::trace!(?cuda_arch, "detected CUDA architecture virtual package");
 
         // Enforce CEP requirement: __cuda_arch must be absent when __cuda is absent
         if cuda.is_none() {
+            if cuda_arch.is_some() {
+                tracing::debug!("dropping __cuda_arch because __cuda was not detected");
+            }
             cuda_arch = None;
         }
 

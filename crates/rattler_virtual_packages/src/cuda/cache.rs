@@ -5,10 +5,10 @@
 //! results in a fresh detection. Delete the file or use the `CONDA_OVERRIDE_CUDA*` variables to
 //! bypass it.
 
-use super::{CudaArchInfo, CudaInfo};
+use super::{CudaArchInfo, CudaDetectionMethod, CudaInfo, CudaInfoSources, DetectedCudaInfo};
 use rattler_conda_types::Version;
 use serde::{Deserialize, Serialize};
-use std::{path::Path, str::FromStr};
+use std::{io::Write, path::Path, str::FromStr};
 
 const CACHE_FILE_NAME: &str = "cuda-info-v1.json";
 
@@ -68,6 +68,10 @@ struct CacheFile {
     driver_fingerprint: Option<String>,
     version: String,
     arch: Option<(u32, u32)>,
+    #[serde(default)]
+    version_source: Option<CudaDetectionMethod>,
+    #[serde(default)]
+    arch_source: Option<CudaDetectionMethod>,
 }
 
 /// Returns a fingerprint of the installed NVIDIA driver, or `None` if it cannot be determined.
@@ -105,42 +109,86 @@ fn driver_fingerprint() -> Option<String> {
     }
 }
 
-pub(super) fn read(cache_dir: &Path) -> Option<CudaInfo> {
+pub(super) fn read(cache_dir: &Path) -> Option<DetectedCudaInfo> {
     let path = cache_dir.join(CACHE_FILE_NAME);
     let Ok(content) = std::fs::read_to_string(&path) else {
-        tracing::debug!("no CUDA info cache found at {}", path.display());
+        tracing::trace!("no CUDA info cache found at {}", path.display());
         return None;
     };
     let Ok(cached) = serde_json::from_str::<CacheFile>(&content) else {
         tracing::debug!("ignoring invalid CUDA info cache at {}", path.display());
         return None;
     };
-    if !cached.boot_id.matches(&BootId::current()?) {
-        tracing::debug!("ignoring CUDA info cache from a previous boot session");
+    let Some(current_boot_id) = BootId::current() else {
+        tracing::debug!(
+            "ignoring CUDA info cache because the current boot id could not be determined"
+        );
+        return None;
+    };
+    if !cached.boot_id.matches(&current_boot_id) {
+        tracing::info!(
+            cache_path = %path.display(),
+            cached_boot_id = ?cached.boot_id,
+            current_boot_id = ?current_boot_id,
+            "invalidating CUDA info cache from a previous boot session"
+        );
         return None;
     }
-    if cached.driver_fingerprint != driver_fingerprint() {
-        tracing::debug!("ignoring CUDA info cache because the driver changed");
+    let current_driver_fingerprint = driver_fingerprint();
+    if cached.driver_fingerprint.as_ref() != current_driver_fingerprint.as_ref() {
+        tracing::info!(
+            cache_path = %path.display(),
+            cached_driver_fingerprint = ?cached.driver_fingerprint,
+            current_driver_fingerprint = ?current_driver_fingerprint,
+            "invalidating CUDA info cache because the driver changed"
+        );
         return None;
     }
-    let version = Version::from_str(&cached.version).ok()?;
-    tracing::debug!("using CUDA info cached at {}", path.display());
-    Some(CudaInfo {
-        version: Some(version),
-        arch_info: cached
-            .arch
-            .map(|(major, minor)| CudaArchInfo { major, minor }),
+    let version = match Version::from_str(&cached.version) {
+        Ok(version) => version,
+        Err(err) => {
+            tracing::debug!(
+                version = cached.version,
+                error = %err,
+                "ignoring CUDA info cache with invalid version"
+            );
+            return None;
+        }
+    };
+    tracing::trace!("using CUDA info cached at {}", path.display());
+    Some(DetectedCudaInfo {
+        info: CudaInfo {
+            version: Some(version),
+            arch_info: cached
+                .arch
+                .map(|(major, minor)| CudaArchInfo { major, minor }),
+        },
+        sources: CudaInfoSources {
+            version: cached.version_source,
+            arch: cached.arch_source,
+        },
     })
 }
 
-pub(super) fn write(cache_dir: &Path, info: &CudaInfo) {
+pub(super) fn write(cache_dir: &Path, info: &CudaInfo, sources: CudaInfoSources) {
     // Only cache when a driver was found: detection without a driver is fast anyway, and not
     // caching the negative result means a freshly installed driver is picked up immediately.
-    let Some(version) = &info.version else { return };
-    let Some(boot_id) = BootId::current() else {
+    let Some(version) = &info.version else {
+        tracing::trace!("not caching CUDA info because no CUDA driver version was detected");
         return;
     };
-    if std::fs::create_dir_all(cache_dir).is_err() {
+    let Some(boot_id) = BootId::current() else {
+        tracing::debug!(
+            "not caching CUDA info because the current boot id could not be determined"
+        );
+        return;
+    };
+    if let Err(err) = std::fs::create_dir_all(cache_dir) {
+        tracing::debug!(
+            cache_dir = %cache_dir.display(),
+            error = %err,
+            "failed to create CUDA info cache directory"
+        );
         return;
     }
     let cached = CacheFile {
@@ -148,17 +196,43 @@ pub(super) fn write(cache_dir: &Path, info: &CudaInfo) {
         driver_fingerprint: driver_fingerprint(),
         version: version.to_string(),
         arch: info.arch_info.as_ref().map(|arch| (arch.major, arch.minor)),
+        version_source: sources.version,
+        arch_source: sources.arch,
     };
     let Ok(content) = serde_json::to_string(&cached) else {
+        tracing::debug!("failed to serialize CUDA info cache entry");
         return;
     };
-    // Write-then-rename so concurrent readers never see a partial file.
+    // Write to a temporary file in the cache directory and persist it into place so concurrent
+    // readers never see a partial cache file.
     let path = cache_dir.join(CACHE_FILE_NAME);
-    let tmp = path.with_extension(format!("json.{}", std::process::id()));
-    match std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, &path)) {
-        Ok(()) => tracing::debug!("cached CUDA info at {}", path.display()),
-        Err(_) => {
-            let _ = std::fs::remove_file(&tmp);
+    let mut tmp = match tempfile::NamedTempFile::new_in(cache_dir) {
+        Ok(tmp) => tmp,
+        Err(err) => {
+            tracing::debug!(
+                cache_dir = %cache_dir.display(),
+                error = %err,
+                "failed to create temporary CUDA info cache file"
+            );
+            return;
+        }
+    };
+    if let Err(err) = tmp.write_all(content.as_bytes()) {
+        tracing::debug!(
+            cache_path = %path.display(),
+            error = %err,
+            "failed to write temporary CUDA info cache file"
+        );
+        return;
+    }
+    match tmp.persist(&path) {
+        Ok(_) => tracing::trace!("cached CUDA info at {}", path.display()),
+        Err(err) => {
+            tracing::debug!(
+                cache_path = %path.display(),
+                error = %err.error,
+                "failed to persist CUDA info cache"
+            );
         }
     }
 }

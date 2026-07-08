@@ -18,6 +18,7 @@
 use libloading::{Library, Symbol};
 use once_cell::sync::OnceCell;
 use rattler_conda_types::Version;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::{
     mem::MaybeUninit,
@@ -28,6 +29,64 @@ use std::{
 };
 
 mod cache;
+
+const NVML_SUCCESS: c_int = 0;
+const NVML_ERROR_UNINITIALIZED: c_int = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NvmlCudaVersionError {
+    MissingSymbol,
+    Nvml(c_int),
+    InvalidVersion,
+}
+
+impl NvmlCudaVersionError {
+    fn should_retry_after_init(self) -> bool {
+        matches!(self, Self::Nvml(NVML_ERROR_UNINITIALIZED))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CudaDetectionMethod {
+    NvmlNoInit,
+    NvmlInitialized,
+    Libcuda,
+    NvidiaSmi,
+}
+
+impl CudaDetectionMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NvmlNoInit => "nvml_no_init",
+            Self::NvmlInitialized => "nvml_initialized",
+            Self::Libcuda => "libcuda",
+            Self::NvidiaSmi => "nvidia_smi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CudaInfoSources {
+    pub version: Option<CudaDetectionMethod>,
+    pub arch: Option<CudaDetectionMethod>,
+}
+
+impl CudaInfoSources {
+    fn version_str(self) -> &'static str {
+        self.version
+            .map_or("<unknown>", CudaDetectionMethod::as_str)
+    }
+
+    fn arch_str(self) -> &'static str {
+        self.arch.map_or("<unknown>", CudaDetectionMethod::as_str)
+    }
+}
+
+struct DetectedCudaInfo {
+    info: CudaInfo,
+    sources: CudaInfoSources,
+}
 
 /// Validates that a string is in the format "major.minor" where both parts are digits.
 ///
@@ -83,6 +142,17 @@ pub struct CudaInfo {
     pub arch_info: Option<CudaArchInfo>,
 }
 
+fn display_cuda_version(version: Option<&Version>) -> String {
+    version.map_or_else(|| "<none>".to_string(), ToString::to_string)
+}
+
+fn display_cuda_arch(arch_info: Option<&CudaArchInfo>) -> String {
+    arch_info.map_or_else(
+        || "<none>".to_string(),
+        |arch| format!("{}.{}", arch.major, arch.minor),
+    )
+}
+
 /// Returns comprehensive CUDA information from the current platform.
 ///
 /// This function returns both the CUDA driver version and compute capability information
@@ -97,17 +167,43 @@ pub struct CudaInfo {
 /// process, so the cache directory is only used by the first call.
 pub fn cuda_info(cache_dir: Option<&Path>) -> &'static CudaInfo {
     static DETECTED_CUDA_INFO: OnceCell<CudaInfo> = OnceCell::new();
+    if let Some(info) = DETECTED_CUDA_INFO.get() {
+        tracing::trace!(?info, "using process-cached CUDA info");
+        return info;
+    }
+
     DETECTED_CUDA_INFO.get_or_init(|| {
         // Initializing the driver to detect the GPU can be slow, so the result is cached on disk
         // and reused until the next reboot.
-        if let Some(info) = cache_dir.and_then(cache::read) {
-            return info;
-        }
-        let info = detect_cuda_info();
         if let Some(cache_dir) = cache_dir {
-            cache::write(cache_dir, &info);
+            tracing::trace!(cache_dir = %cache_dir.display(), "checking CUDA info cache");
+            if let Some(cached) = cache::read(cache_dir) {
+                tracing::debug!(
+                    version = %display_cuda_version(cached.info.version.as_ref()),
+                    arch = %display_cuda_arch(cached.info.arch_info.as_ref()),
+                    version_source = cached.sources.version_str(),
+                    arch_source = cached.sources.arch_str(),
+                    "using disk-cached CUDA info"
+                );
+                return cached.info;
+            }
+        } else {
+            tracing::trace!("CUDA info disk cache disabled");
         }
-        info
+
+        tracing::trace!("detecting CUDA info from host");
+        let detected = detect_cuda_info();
+        tracing::debug!(
+            version = %display_cuda_version(detected.info.version.as_ref()),
+            arch = %display_cuda_arch(detected.info.arch_info.as_ref()),
+            version_source = detected.sources.version_str(),
+            arch_source = detected.sources.arch_str(),
+            "detected CUDA info from host"
+        );
+        if let Some(cache_dir) = cache_dir {
+            cache::write(cache_dir, &detected.info, detected.sources);
+        }
+        detected.info
     })
 }
 
@@ -148,19 +244,49 @@ pub fn cuda_arch(cache_dir: Option<&Path>) -> Option<CudaArchInfo> {
 ///
 /// On musl systems, both are detected via the `nvidia-smi` command since dynamic library
 /// loading is not supported.
-fn detect_cuda_info() -> CudaInfo {
+fn detect_cuda_info() -> DetectedCudaInfo {
     if cfg!(target_env = "musl") {
+        tracing::trace!("detecting CUDA info via nvidia-smi because musl cannot load NVML");
         // Dynamically loading a library is not supported on musl so we have to fall-back to using
         // the nvidia-smi command.
-        CudaInfo {
-            version: detect_cuda_version_via_nvidia_smi(),
-            arch_info: detect_cuda_arch_via_nvidia_smi(),
-        }
-    } else {
-        // Detect via NVML, which gives us both version and architecture info from a single library
-        // and, unlike libcuda, is not affected by `CUDA_VISIBLE_DEVICES`.
-        detect_cuda_info_via_nvml()
+        let version = detect_cuda_version_via_nvidia_smi();
+        let arch_info = detect_cuda_arch_via_nvidia_smi();
+        return DetectedCudaInfo {
+            sources: CudaInfoSources {
+                version: version.is_some().then_some(CudaDetectionMethod::NvidiaSmi),
+                arch: arch_info
+                    .is_some()
+                    .then_some(CudaDetectionMethod::NvidiaSmi),
+            },
+            info: CudaInfo { version, arch_info },
+        };
     }
+
+    tracing::trace!("detecting CUDA info via NVML");
+    // Prefer NVML because it is not affected by `CUDA_VISIBLE_DEVICES`, but fall back to the
+    // older probes so systems that expose libcuda (or nvidia-smi) without NVML still report
+    // `__cuda`.
+    let mut detected = detect_cuda_info_via_nvml();
+
+    if detected.info.version.is_none() {
+        tracing::debug!(
+            "NVML did not detect a CUDA driver version; trying libcuda/nvidia-smi fallbacks"
+        );
+        if let Some((version, source)) = detect_cuda_version_fallbacks() {
+            detected.info.version = Some(version);
+            detected.sources.version = Some(source);
+        }
+    }
+
+    if detected.info.version.is_some() && detected.info.arch_info.is_none() {
+        tracing::debug!("NVML did not detect CUDA compute capability; trying nvidia-smi fallback");
+        detected.info.arch_info = detect_cuda_arch_via_nvidia_smi();
+        if detected.info.arch_info.is_some() {
+            detected.sources.arch = Some(CudaDetectionMethod::NvidiaSmi);
+        }
+    }
+
+    detected
 }
 
 /// Detects CUDA version and architecture information via the NVIDIA Management Library.
@@ -172,31 +298,86 @@ fn detect_cuda_info() -> CudaInfo {
 /// Returns a `CudaInfo` struct where:
 /// * `version` is `None` if the driver version cannot be determined
 /// * `arch_info` is `None` if no devices are present or device queries fail
-fn detect_cuda_info_via_nvml() -> CudaInfo {
-    let Some(library) = nvml_library_paths()
-        .iter()
-        .find_map(|path| unsafe { Library::new(*path).ok() })
-    else {
-        return CudaInfo {
-            version: None,
-            arch_info: None,
+fn detect_cuda_info_via_nvml() -> DetectedCudaInfo {
+    let mut library = None;
+    for path in nvml_library_paths() {
+        match unsafe { Library::new(*path) } {
+            Ok(loaded) => {
+                tracing::trace!(library_path = *path, "loaded NVML library");
+                library = Some(loaded);
+                break;
+            }
+            Err(err) => {
+                tracing::trace!(library_path = *path, error = %err, "failed to load NVML library");
+            }
+        }
+    }
+
+    let Some(library) = library else {
+        tracing::debug!("could not load NVML library from any known path");
+        return DetectedCudaInfo {
+            info: CudaInfo {
+                version: None,
+                arch_info: None,
+            },
+            sources: CudaInfoSources::default(),
         };
     };
 
-    // The version can be queried without initializing NVML and even without any devices present.
-    let version = cuda_version_from_nvml_library(&library);
+    // Try the cheap no-init query first. Some drivers allow it, but NVML does not consistently
+    // guarantee that across platforms/versions, so retry after init only for that specific error.
+    let (version, version_source, retry_version_after_init) = match cuda_version_from_nvml_library(
+        &library,
+    ) {
+        Ok(version) => {
+            tracing::trace!(%version, "detected CUDA driver version via NVML without init");
+            (Some(version), Some(CudaDetectionMethod::NvmlNoInit), false)
+        }
+        Err(err) => {
+            let retry_after_init = err.should_retry_after_init();
+            if retry_after_init {
+                tracing::debug!(
+                    "NVML CUDA driver version query requires initialization; retrying after nvmlInit"
+                );
+            } else {
+                tracing::trace!(
+                    ?err,
+                    "CUDA driver version query via NVML without init failed"
+                );
+            }
+            (None, None, retry_after_init)
+        }
+    };
 
-    // Compute capability requires enumerating devices, which needs NVML to be initialized.
-    let arch_info = detect_cuda_arch_via_nvml(&library);
+    // Compute capability requires enumerating devices, which needs NVML to be initialized. If the
+    // no-init version query failed with NVML_ERROR_UNINITIALIZED, retry it while NVML is initialized.
+    let (initialized_version, arch_info) =
+        detect_cuda_initialized_info_via_nvml(&library, retry_version_after_init, true);
 
-    CudaInfo { version, arch_info }
+    let initialized_version_source = initialized_version
+        .as_ref()
+        .map(|_| CudaDetectionMethod::NvmlInitialized);
+    let arch_source = arch_info
+        .as_ref()
+        .map(|_| CudaDetectionMethod::NvmlInitialized);
+
+    DetectedCudaInfo {
+        info: CudaInfo {
+            version: version.or(initialized_version),
+            arch_info,
+        },
+        sources: CudaInfoSources {
+            version: version_source.or(initialized_version_source),
+            arch: arch_source,
+        },
+    }
 }
 
 /// Queries the CUDA driver version from an already-loaded NVML library.
 ///
-/// `nvmlSystemGetCudaDriverVersion` reads the version straight from the CUDA driver library and
-/// does not require `nvmlInit`.
-fn cuda_version_from_nvml_library(library: &Library) -> Option<Version> {
+/// Some drivers allow `nvmlSystemGetCudaDriverVersion` before `nvmlInit`, but others return
+/// `NVML_ERROR_UNINITIALIZED`; callers may retry after initializing NVML for that error.
+fn cuda_version_from_nvml_library(library: &Library) -> Result<Version, NvmlCudaVersionError> {
     // Find the `nvmlSystemGetCudaDriverVersion_v2` function. If that function cannot be found, fall
     // back to the `nvmlSystemGetCudaDriverVersion` function instead.
     let nvml_system_get_cuda_driver_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_int> =
@@ -205,113 +386,204 @@ fn cuda_version_from_nvml_library(library: &Library) -> Option<Version> {
                 .get(b"nvmlSystemGetCudaDriverVersion_v2\0")
                 .or_else(|_| library.get(b"nvmlSystemGetCudaDriverVersion\0"))
         }
-        .ok()?;
+        .map_err(|_err| NvmlCudaVersionError::MissingSymbol)?;
 
     let mut cuda_driver_version = MaybeUninit::uninit();
-    if unsafe { nvml_system_get_cuda_driver_version(cuda_driver_version.as_mut_ptr()) } != 0 {
-        return None;
+    let result = unsafe { nvml_system_get_cuda_driver_version(cuda_driver_version.as_mut_ptr()) };
+    if result != NVML_SUCCESS {
+        return Err(NvmlCudaVersionError::Nvml(result));
     }
     let version = unsafe { cuda_driver_version.assume_init() };
 
     // Convert the version integer to a version string
-    Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok()
+    Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10))
+        .map_err(|_err| NvmlCudaVersionError::InvalidVersion)
 }
 
-/// Detects CUDA compute capability from an already-loaded NVML library.
+/// Queries information that requires initialized NVML.
 ///
-/// Initializes NVML, enumerates all devices, and returns the **minimum** compute capability across
-/// them. Unlike the version query, reading device compute capabilities requires NVML to be
-/// initialized (with the GPUs attached).
-///
-/// Returns `None` if NVML cannot be initialized, no devices are present, or device queries fail.
-fn detect_cuda_arch_via_nvml(library: &Library) -> Option<CudaArchInfo> {
+/// Returns `(version, arch_info)`. Each field is only queried when the corresponding `query_*`
+/// argument is true. The initialized version query is a compatibility fallback for drivers that
+/// reject `nvmlSystemGetCudaDriverVersion` before `nvmlInit`.
+fn detect_cuda_initialized_info_via_nvml(
+    library: &Library,
+    query_version: bool,
+    query_arch: bool,
+) -> (Option<Version>, Option<CudaArchInfo>) {
     // NVML device handle (`nvmlDevice_t`) is an opaque pointer.
     type NvmlDevice = *mut c_void;
 
-    let nvml_init: Symbol<'_, unsafe extern "C" fn() -> c_int> = unsafe {
+    let Some(nvml_init): Option<Symbol<'_, unsafe extern "C" fn() -> c_int>> = (unsafe {
         library
             .get(b"nvmlInit_v2\0")
             .or_else(|_| library.get(b"nvmlInit\0"))
+            .ok()
+    }) else {
+        tracing::debug!("missing nvmlInit symbol");
+        return (None, None);
+    };
+
+    let Some(nvml_shutdown): Option<Symbol<'_, unsafe extern "C" fn() -> c_int>> =
+        (unsafe { library.get(b"nvmlShutdown\0").ok() })
+    else {
+        tracing::debug!("missing nvmlShutdown symbol");
+        return (None, None);
+    };
+
+    tracing::trace!(query_version, query_arch, "initializing NVML");
+    let init_result = unsafe { nvml_init() };
+    if init_result != NVML_SUCCESS {
+        tracing::debug!(return_code = init_result, "nvmlInit failed");
+        return (None, None);
     }
-    .ok()?;
 
-    let nvml_shutdown: Symbol<'_, unsafe extern "C" fn() -> c_int> =
-        unsafe { library.get(b"nvmlShutdown\0") }.ok()?;
-
-    let nvml_device_get_count: Symbol<'_, unsafe extern "C" fn(*mut c_uint) -> c_int> = unsafe {
-        library
-            .get(b"nvmlDeviceGetCount_v2\0")
-            .or_else(|_| library.get(b"nvmlDeviceGetCount\0"))
-    }
-    .ok()?;
-
-    let nvml_device_get_handle_by_index: Symbol<
-        '_,
-        unsafe extern "C" fn(c_uint, *mut NvmlDevice) -> c_int,
-    > = unsafe {
-        library
-            .get(b"nvmlDeviceGetHandleByIndex_v2\0")
-            .or_else(|_| library.get(b"nvmlDeviceGetHandleByIndex\0"))
-    }
-    .ok()?;
-
-    let nvml_device_get_cuda_compute_capability: Symbol<
-        '_,
-        unsafe extern "C" fn(NvmlDevice, *mut c_int, *mut c_int) -> c_int,
-    > = unsafe { library.get(b"nvmlDeviceGetCudaComputeCapability\0") }.ok()?;
-
-    if unsafe { nvml_init() } != 0 {
-        return None;
-    }
+    let version = if query_version {
+        match cuda_version_from_nvml_library(library) {
+            Ok(version) => {
+                tracing::debug!(%version, "detected CUDA driver version via initialized NVML");
+                Some(version)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    ?err,
+                    "CUDA driver version query via initialized NVML failed"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Enumerate devices to find the minimum compute capability. Wrapped in a closure so we always
     // reach the `nvmlShutdown` call below regardless of the outcome.
-    let min_arch = (|| {
-        let mut device_count = MaybeUninit::uninit();
-        if unsafe { nvml_device_get_count(device_count.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        let device_count = unsafe { device_count.assume_init() };
+    let arch_info = query_arch
+        .then(|| {
+            tracing::trace!("querying CUDA compute capability via NVML");
+            let nvml_device_get_count: Symbol<'_, unsafe extern "C" fn(*mut c_uint) -> c_int> =
+                match unsafe {
+                    library
+                        .get(b"nvmlDeviceGetCount_v2\0")
+                        .or_else(|_| library.get(b"nvmlDeviceGetCount\0"))
+                } {
+                    Ok(symbol) => symbol,
+                    Err(err) => {
+                        tracing::trace!(error = %err, "missing NVML device count symbol");
+                        return None;
+                    }
+                };
 
-        let mut min_arch: Option<CudaArchInfo> = None;
-        for device_idx in 0..device_count {
-            let mut device: NvmlDevice = ptr::null_mut();
-            if unsafe { nvml_device_get_handle_by_index(device_idx, &mut device) } != 0 {
-                continue;
+            let nvml_device_get_handle_by_index: Symbol<
+                '_,
+                unsafe extern "C" fn(c_uint, *mut NvmlDevice) -> c_int,
+            > = match unsafe {
+                library
+                    .get(b"nvmlDeviceGetHandleByIndex_v2\0")
+                    .or_else(|_| library.get(b"nvmlDeviceGetHandleByIndex\0"))
+            } {
+                Ok(symbol) => symbol,
+                Err(err) => {
+                    tracing::trace!(error = %err, "missing NVML device handle symbol");
+                    return None;
+                }
+            };
+
+            let nvml_device_get_cuda_compute_capability: Symbol<
+                '_,
+                unsafe extern "C" fn(NvmlDevice, *mut c_int, *mut c_int) -> c_int,
+            > = match unsafe { library.get(b"nvmlDeviceGetCudaComputeCapability\0") } {
+                Ok(symbol) => symbol,
+                Err(err) => {
+                    tracing::trace!(
+                        error = %err,
+                        "missing NVML CUDA compute capability symbol"
+                    );
+                    return None;
+                }
+            };
+
+            let mut device_count = MaybeUninit::uninit();
+            let device_count_result = unsafe { nvml_device_get_count(device_count.as_mut_ptr()) };
+            if device_count_result != NVML_SUCCESS {
+                tracing::trace!(
+                    return_code = device_count_result,
+                    "nvmlDeviceGetCount failed"
+                );
+                return None;
             }
+            let device_count = unsafe { device_count.assume_init() };
+            tracing::trace!(device_count, "enumerating CUDA devices via NVML");
 
-            let mut cc_major = MaybeUninit::uninit();
-            let mut cc_minor = MaybeUninit::uninit();
-            if unsafe {
-                nvml_device_get_cuda_compute_capability(
-                    device,
-                    cc_major.as_mut_ptr(),
-                    cc_minor.as_mut_ptr(),
-                )
-            } != 0
-            {
-                continue;
-            }
-            let cc_major = unsafe { cc_major.assume_init() } as u32;
-            let cc_minor = unsafe { cc_minor.assume_init() } as u32;
+            let mut min_arch: Option<CudaArchInfo> = None;
+            for device_idx in 0..device_count {
+                let mut device: NvmlDevice = ptr::null_mut();
+                let handle_result =
+                    unsafe { nvml_device_get_handle_by_index(device_idx, &mut device) };
+                if handle_result != NVML_SUCCESS {
+                    tracing::trace!(
+                        device_idx,
+                        return_code = handle_result,
+                        "failed to get NVML device handle"
+                    );
+                    continue;
+                }
 
-            let is_new_minimum = min_arch.as_ref().is_none_or(|min| {
-                cc_major < min.major || (cc_major == min.major && cc_minor < min.minor)
-            });
-            if is_new_minimum {
-                min_arch = Some(CudaArchInfo {
-                    major: cc_major,
-                    minor: cc_minor,
+                let mut cc_major = MaybeUninit::uninit();
+                let mut cc_minor = MaybeUninit::uninit();
+                let compute_capability_result = unsafe {
+                    nvml_device_get_cuda_compute_capability(
+                        device,
+                        cc_major.as_mut_ptr(),
+                        cc_minor.as_mut_ptr(),
+                    )
+                };
+                if compute_capability_result != NVML_SUCCESS {
+                    tracing::trace!(
+                        device_idx,
+                        return_code = compute_capability_result,
+                        "failed to get CUDA compute capability via NVML"
+                    );
+                    continue;
+                }
+                let cc_major = unsafe { cc_major.assume_init() } as u32;
+                let cc_minor = unsafe { cc_minor.assume_init() } as u32;
+                tracing::trace!(
+                    device_idx,
+                    major = cc_major,
+                    minor = cc_minor,
+                    "detected CUDA compute capability via NVML"
+                );
+
+                let is_new_minimum = min_arch.as_ref().is_none_or(|min| {
+                    cc_major < min.major || (cc_major == min.major && cc_minor < min.minor)
                 });
+                if is_new_minimum {
+                    min_arch = Some(CudaArchInfo {
+                        major: cc_major,
+                        minor: cc_minor,
+                    });
+                }
             }
-        }
-        min_arch
-    })();
+            if let Some(arch) = min_arch.as_ref() {
+                tracing::debug!(
+                    major = arch.major,
+                    minor = arch.minor,
+                    "selected minimum CUDA compute capability"
+                );
+            } else {
+                tracing::debug!("no CUDA compute capability detected via NVML");
+            }
+            min_arch
+        })
+        .flatten();
 
     // Whatever happens, after initializing NVML we have to call `nvmlShutdown`.
-    let _ = unsafe { nvml_shutdown() };
+    let shutdown_result = unsafe { nvml_shutdown() };
+    if shutdown_result != NVML_SUCCESS {
+        tracing::debug!(return_code = shutdown_result, "nvmlShutdown failed");
+    }
 
-    min_arch
+    (version, arch_info)
 }
 
 /// Attempts to detect the version of CUDA present in the current operating system by employing the
@@ -322,8 +594,28 @@ pub fn detect_cuda_version() -> Option<Version> {
         // the nvidia-smi command.
         detect_cuda_version_via_nvidia_smi()
     } else {
-        detect_cuda_version_via_nvml()
+        detect_cuda_version_via_nvml().or_else(|| {
+            tracing::debug!(
+                "NVML did not detect a CUDA driver version; trying libcuda/nvidia-smi fallbacks"
+            );
+            detect_cuda_version_fallbacks().map(|(version, _source)| version)
+        })
     }
+}
+
+fn detect_cuda_version_fallbacks() -> Option<(Version, CudaDetectionMethod)> {
+    if cfg!(target_env = "musl") {
+        return detect_cuda_version_via_nvidia_smi()
+            .map(|version| (version, CudaDetectionMethod::NvidiaSmi));
+    }
+
+    let version = detect_cuda_version_via_libcuda();
+    if let Some(version) = version {
+        return Some((version, CudaDetectionMethod::Libcuda));
+    }
+
+    tracing::debug!("libcuda did not detect a CUDA driver version; trying nvidia-smi fallback");
+    detect_cuda_version_via_nvidia_smi().map(|version| (version, CudaDetectionMethod::NvidiaSmi))
 }
 
 /// Attempts to detect the version of CUDA present in the current operating system by loading the
@@ -335,16 +627,40 @@ pub fn detect_cuda_version() -> Option<Version> {
 /// considered old enough to be usable for our use case. Since Conda doesn't provide old versions of
 /// the CUDA SDK anyway this is considered a non-issue.
 ///
-/// `nvmlSystemGetCudaDriverVersion` reads the version straight from the CUDA driver library and,
-/// unlike most NVML functions, does not require `nvmlInit`. We therefore skip initialization, which
-/// avoids the expensive driver handshake / GPU attach that makes `nvmlInit` slow on Windows.
+/// Some drivers can answer `nvmlSystemGetCudaDriverVersion` without `nvmlInit`, avoiding the
+/// expensive driver handshake / GPU attach that makes `nvmlInit` slow on Windows. If that no-init
+/// query fails, this falls back to querying while NVML is initialized.
 pub fn detect_cuda_version_via_nvml() -> Option<Version> {
     // Try to open the library
-    let library = nvml_library_paths()
-        .iter()
-        .find_map(|path| unsafe { libloading::Library::new(*path).ok() })?;
+    let mut library = None;
+    for path in nvml_library_paths() {
+        match unsafe { libloading::Library::new(*path) } {
+            Ok(loaded) => {
+                tracing::trace!(library_path = *path, "loaded NVML library");
+                library = Some(loaded);
+                break;
+            }
+            Err(err) => {
+                tracing::trace!(library_path = *path, error = %err, "failed to load NVML library");
+            }
+        }
+    }
+    let library = library?;
 
-    cuda_version_from_nvml_library(&library)
+    match cuda_version_from_nvml_library(&library) {
+        Ok(version) => {
+            tracing::trace!(%version, "detected CUDA driver version via NVML without init");
+            Some(version)
+        }
+        Err(err) if err.should_retry_after_init() => {
+            tracing::debug!(?err, "retrying CUDA driver version query after nvmlInit");
+            detect_cuda_initialized_info_via_nvml(&library, true, false).0
+        }
+        Err(err) => {
+            tracing::debug!(?err, "CUDA driver version query via NVML failed");
+            None
+        }
+    }
 }
 
 /// Returns platform specific set of search paths for the CUDA library.
@@ -392,30 +708,67 @@ fn nvml_library_paths() -> &'static [&'static str] {
 /// have this limitation.
 pub fn detect_cuda_version_via_libcuda() -> Option<Version> {
     // Try to open the library
-    let cuda_library = cuda_library_paths()
-        .iter()
-        .find_map(|path| unsafe { libloading::Library::new(*path).ok() })?;
+    let mut cuda_library = None;
+    for path in cuda_library_paths() {
+        match unsafe { libloading::Library::new(*path) } {
+            Ok(loaded) => {
+                tracing::trace!(library_path = *path, "loaded CUDA driver library");
+                cuda_library = Some(loaded);
+                break;
+            }
+            Err(err) => {
+                tracing::trace!(
+                    library_path = *path,
+                    error = %err,
+                    "failed to load CUDA driver library"
+                );
+            }
+        }
+    }
+    let cuda_library = cuda_library?;
 
     // Get entry points from the library
     let cu_init: Symbol<'_, unsafe extern "C" fn(c_uint) -> c_ulong> =
-        unsafe { cuda_library.get(b"cuInit\0") }.ok()?;
+        match unsafe { cuda_library.get(b"cuInit\0") } {
+            Ok(symbol) => symbol,
+            Err(err) => {
+                tracing::debug!(error = %err, "missing cuInit symbol");
+                return None;
+            }
+        };
     let cu_driver_get_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_ulong> =
-        unsafe { cuda_library.get(b"cuDriverGetVersion\0") }.ok()?;
+        match unsafe { cuda_library.get(b"cuDriverGetVersion\0") } {
+            Ok(symbol) => symbol,
+            Err(err) => {
+                tracing::debug!(error = %err, "missing cuDriverGetVersion symbol");
+                return None;
+            }
+        };
 
     // Initialize the CUDA library
-    if unsafe { cu_init(0) } != 0 {
+    let init_result = unsafe { cu_init(0) };
+    if init_result != 0 {
+        tracing::debug!(return_code = init_result, "cuInit failed");
         return None;
     }
 
     // Get the version from the library
     let mut version_int = MaybeUninit::uninit();
-    if unsafe { cu_driver_get_version(version_int.as_mut_ptr()) != 0 } {
+    let version_result = unsafe { cu_driver_get_version(version_int.as_mut_ptr()) };
+    if version_result != 0 {
+        tracing::debug!(return_code = version_result, "cuDriverGetVersion failed");
         return None;
     }
     let version = unsafe { version_int.assume_init() };
 
     // Convert the version integer to a version string
-    Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok()
+    let version = Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok();
+    if let Some(version) = &version {
+        tracing::trace!(%version, "detected CUDA driver version via libcuda");
+    } else {
+        tracing::trace!("failed to parse CUDA driver version reported by libcuda");
+    }
+    version
 }
 
 /// Returns platform specific set of search paths for the CUDA library.
@@ -469,9 +822,10 @@ fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
             regex::Regex::new("<cuda_version>(.*)<\\/cuda_version>").unwrap()
         });
 
+    tracing::trace!("detecting CUDA driver version via nvidia-smi");
     // Invoke the "nvidia-smi" command to query the driver version that is usually installed when
     // Cuda drivers are installed.
-    let nvidia_smi_output = Command::new("nvidia-smi")
+    let nvidia_smi_output = match Command::new("nvidia-smi")
         // Display GPU or unit info
         .arg("--query")
         // Show unit, rather than GPU, attributes
@@ -486,7 +840,22 @@ fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
         // environment.
         .env_remove("CUDA_VISIBLE_DEVICES")
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to run nvidia-smi for CUDA driver version");
+            return None;
+        }
+    };
+
+    if !nvidia_smi_output.status.success() {
+        tracing::debug!(
+            status = %nvidia_smi_output.status,
+            stderr = %String::from_utf8_lossy(&nvidia_smi_output.stderr),
+            "nvidia-smi CUDA driver version query failed"
+        );
+        return None;
+    }
 
     // Convert the output to Utf8. The conversion is lossy so it might contain some illegal
     // characters. If that is the case we simply assume the version in the file also wont make sense
@@ -494,11 +863,27 @@ fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
     let output = String::from_utf8_lossy(&nvidia_smi_output.stdout);
 
     // Extract the version from the XML
-    let version_match = CUDA_VERSION_RE.captures(&output)?;
-    let version_str = version_match.get(1)?.as_str();
+    let Some(version_match) = CUDA_VERSION_RE.captures(&output) else {
+        tracing::trace!("nvidia-smi output did not contain a CUDA driver version");
+        return None;
+    };
+    let Some(version_match) = version_match.get(1) else {
+        tracing::trace!("nvidia-smi CUDA driver version match was empty");
+        return None;
+    };
+    let version_str = version_match.as_str();
 
     // Parse and return
-    Version::from_str(version_str).ok()
+    match Version::from_str(version_str) {
+        Ok(version) => {
+            tracing::trace!(%version, "detected CUDA driver version via nvidia-smi");
+            Some(version)
+        }
+        Err(err) => {
+            tracing::trace!(version = version_str, error = %err, "failed to parse nvidia-smi CUDA driver version");
+            None
+        }
+    }
 }
 
 /// Attempts to detect the CUDA compute capability by executing the "nvidia-smi" command and
@@ -508,17 +893,29 @@ fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
 /// also works on musl systems. The `compute_cap` query field requires a reasonably modern driver
 /// (roughly R510+); on older drivers the command fails and `None` is returned.
 fn detect_cuda_arch_via_nvidia_smi() -> Option<CudaArchInfo> {
-    let nvidia_smi_output = Command::new("nvidia-smi")
+    tracing::trace!("detecting CUDA compute capability via nvidia-smi");
+    let nvidia_smi_output = match Command::new("nvidia-smi")
         // Query the compute capability of every GPU as plain CSV, one line per GPU.
         .arg("--query-gpu=compute_cap")
         .arg("--format=csv,noheader")
         // See `detect_cuda_version_via_nvidia_smi` for why this variable is removed.
         .env_remove("CUDA_VISIBLE_DEVICES")
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to run nvidia-smi for CUDA compute capability");
+            return None;
+        }
+    };
 
     // On drivers that do not support the `compute_cap` field the command exits with an error.
     if !nvidia_smi_output.status.success() {
+        tracing::debug!(
+            status = %nvidia_smi_output.status,
+            stderr = %String::from_utf8_lossy(&nvidia_smi_output.stderr),
+            "nvidia-smi CUDA compute capability query failed"
+        );
         return None;
     }
 
@@ -526,14 +923,30 @@ fn detect_cuda_arch_via_nvidia_smi() -> Option<CudaArchInfo> {
 
     // Find the minimum compute capability across all devices
     let mut min_arch: Option<CudaArchInfo> = None;
-    for line in output.lines() {
+    for (device_idx, line) in output.lines().enumerate() {
         let line = line.trim();
         let Some((major, minor)) = line.split_once('.') else {
+            tracing::trace!(
+                device_idx,
+                line,
+                "ignoring invalid nvidia-smi compute capability line"
+            );
             continue;
         };
         let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+            tracing::trace!(
+                device_idx,
+                line,
+                "ignoring unparsable nvidia-smi compute capability line"
+            );
             continue;
         };
+        tracing::trace!(
+            device_idx,
+            major,
+            minor,
+            "detected CUDA compute capability via nvidia-smi"
+        );
 
         let is_new_minimum = min_arch
             .as_ref()
@@ -541,6 +954,16 @@ fn detect_cuda_arch_via_nvidia_smi() -> Option<CudaArchInfo> {
         if is_new_minimum {
             min_arch = Some(CudaArchInfo { major, minor });
         }
+    }
+
+    if let Some(arch) = min_arch.as_ref() {
+        tracing::debug!(
+            major = arch.major,
+            minor = arch.minor,
+            "selected minimum CUDA compute capability from nvidia-smi"
+        );
+    } else {
+        tracing::debug!("no CUDA compute capability detected via nvidia-smi");
     }
 
     min_arch
@@ -597,6 +1020,7 @@ mod test {
                 version: None,
                 arch_info: None,
             },
+            CudaInfoSources::default(),
         );
         assert!(cache::read(dir.path()).is_none());
 
@@ -604,15 +1028,35 @@ mod test {
             version: Some(Version::from_str("12.4").unwrap()),
             arch_info: Some(CudaArchInfo { major: 8, minor: 6 }),
         };
-        cache::write(dir.path(), &info);
+        let sources = CudaInfoSources {
+            version: Some(CudaDetectionMethod::NvmlInitialized),
+            arch: Some(CudaDetectionMethod::NvidiaSmi),
+        };
+        cache::write(dir.path(), &info, sources);
 
         if cache::BootId::current().is_none() {
             // Cannot key the cache without a boot id on this platform
             return;
         }
         let cached = cache::read(dir.path()).unwrap();
-        assert_eq!(cached.version, info.version);
-        assert_eq!(cached.arch_info, info.arch_info);
+        assert_eq!(cached.info.version, info.version);
+        assert_eq!(cached.info.arch_info, info.arch_info);
+        assert_eq!(cached.sources, sources);
+
+        // Updating the cache should atomically replace the previous file.
+        let updated_info = CudaInfo {
+            version: Some(Version::from_str("12.5").unwrap()),
+            arch_info: None,
+        };
+        let updated_sources = CudaInfoSources {
+            version: Some(CudaDetectionMethod::Libcuda),
+            arch: None,
+        };
+        cache::write(dir.path(), &updated_info, updated_sources);
+        let cached = cache::read(dir.path()).unwrap();
+        assert_eq!(cached.info.version, updated_info.version);
+        assert_eq!(cached.info.arch_info, updated_info.arch_info);
+        assert_eq!(cached.sources, updated_sources);
     }
 
     #[test]
@@ -623,6 +1067,10 @@ mod test {
             &CudaInfo {
                 version: Some(Version::from_str("12.4").unwrap()),
                 arch_info: None,
+            },
+            CudaInfoSources {
+                version: Some(CudaDetectionMethod::NvmlNoInit),
+                arch: None,
             },
         );
         let path = dir.path().join("cuda-info-v1.json");
