@@ -22,9 +22,12 @@ use std::process::Command;
 use std::{
     mem::MaybeUninit,
     os::raw::{c_int, c_uint, c_ulong, c_void},
+    path::Path,
     ptr,
     str::FromStr,
 };
+
+mod cache;
 
 /// Validates that a string is in the format "major.minor" where both parts are digits.
 ///
@@ -88,17 +91,32 @@ pub struct CudaInfo {
 ///
 /// This is more efficient than calling [`cuda_version`] and [`cuda_arch`] separately
 /// because the CUDA library is loaded only once.
-pub fn cuda_info() -> &'static CudaInfo {
+///
+/// `cache_dir` is the directory used to cache the detection result across processes until the
+/// next reboot; pass `None` to disable the on-disk cache. Detection runs at most once per
+/// process, so the cache directory is only used by the first call.
+pub fn cuda_info(cache_dir: Option<&Path>) -> &'static CudaInfo {
     static DETECTED_CUDA_INFO: OnceCell<CudaInfo> = OnceCell::new();
-    DETECTED_CUDA_INFO.get_or_init(detect_cuda_info)
+    DETECTED_CUDA_INFO.get_or_init(|| {
+        // Initializing the driver to detect the GPU can be slow, so the result is cached on disk
+        // and reused until the next reboot.
+        if let Some(info) = cache_dir.and_then(cache::read) {
+            return info;
+        }
+        let info = detect_cuda_info();
+        if let Some(cache_dir) = cache_dir {
+            cache::write(cache_dir, &info);
+        }
+        info
+    })
 }
 
 /// Returns the maximum CUDA version available on the current platform.
 ///
 /// This corresponds to the `__cuda` virtual package. The result is cached,
-/// so subsequent calls are very fast.
-pub fn cuda_version() -> Option<Version> {
-    cuda_info().version.clone()
+/// so subsequent calls are very fast. See [`cuda_info`] for the `cache_dir` semantics.
+pub fn cuda_version(cache_dir: Option<&Path>) -> Option<Version> {
+    cuda_info(cache_dir).version.clone()
 }
 
 /// Returns CUDA compute capability information from the current platform.
@@ -111,9 +129,10 @@ pub fn cuda_version() -> Option<Version> {
 /// * No CUDA devices are detected
 /// * Device enumeration fails
 ///
-/// The result is cached, so subsequent calls are very fast.
-pub fn cuda_arch() -> Option<CudaArchInfo> {
-    cuda_info().arch_info.clone()
+/// The result is cached, so subsequent calls are very fast. See [`cuda_info`] for the `cache_dir`
+/// semantics.
+pub fn cuda_arch(cache_dir: Option<&Path>) -> Option<CudaArchInfo> {
+    cuda_info(cache_dir).arch_info.clone()
 }
 
 /// Detects comprehensive CUDA information from the current system.
@@ -551,7 +570,7 @@ mod test {
 
     #[test]
     pub fn test_cuda_info() {
-        let info = cuda_info();
+        let info = cuda_info(None);
         println!("CUDA Info: {info:?}");
         if let Some(ref arch) = info.arch_info {
             println!("  Compute capability: {}.{}", arch.major, arch.minor);
@@ -560,8 +579,76 @@ mod test {
 
     #[test]
     pub fn test_cuda_arch() {
-        let arch = cuda_arch();
+        let arch = cuda_arch(None);
         println!("CUDA Arch: {arch:?}");
+    }
+
+    #[test]
+    fn test_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Nothing cached yet
+        assert!(cache::read(dir.path()).is_none());
+
+        // Negative results are not cached
+        cache::write(
+            dir.path(),
+            &CudaInfo {
+                version: None,
+                arch_info: None,
+            },
+        );
+        assert!(cache::read(dir.path()).is_none());
+
+        let info = CudaInfo {
+            version: Some(Version::from_str("12.4").unwrap()),
+            arch_info: Some(CudaArchInfo { major: 8, minor: 6 }),
+        };
+        cache::write(dir.path(), &info);
+
+        if cache::BootId::current().is_none() {
+            // Cannot key the cache without a boot id on this platform
+            return;
+        }
+        let cached = cache::read(dir.path()).unwrap();
+        assert_eq!(cached.version, info.version);
+        assert_eq!(cached.arch_info, info.arch_info);
+    }
+
+    #[test]
+    fn test_cache_invalidated_after_driver_change() {
+        let dir = tempfile::tempdir().unwrap();
+        cache::write(
+            dir.path(),
+            &CudaInfo {
+                version: Some(Version::from_str("12.4").unwrap()),
+                arch_info: None,
+            },
+        );
+        let path = dir.path().join("cuda-info-v1.json");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            // Nothing was cached because this platform has no boot id
+            return;
+        };
+
+        // A cache file written with a different driver installed is ignored
+        let mut cached: serde_json::Value = serde_json::from_str(&content).unwrap();
+        cached["driver_fingerprint"] = "definitely-stale".into();
+        std::fs::write(&path, serde_json::to_string(&cached).unwrap()).unwrap();
+        assert!(cache::read(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_cache_invalidated_after_reboot() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A cache file from a different boot session is ignored
+        std::fs::write(
+            dir.path().join("cuda-info-v1.json"),
+            r#"{"boot_id":"not-the-current-boot","driver_fingerprint":null,"version":"12.4","arch":[8,6]}"#,
+        )
+        .unwrap();
+        assert!(cache::read(dir.path()).is_none());
     }
 
     #[test]
