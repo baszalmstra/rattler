@@ -18,6 +18,7 @@ rattler_conda_types = { workspace = true, default-features = false }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 archspec = { workspace = true }
@@ -31,4 +32,3 @@ windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] 
 
 [dev-dependencies]
 temp-env = { workspace = true }
-tempfile = { workspace = true }
