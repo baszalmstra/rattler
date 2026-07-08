@@ -5624,9 +5624,12 @@ dependencies = [
  "rattler_conda_types",
  "regex",
  "serde",
+ "serde_json",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "windows-sys 0.61.2",
  "winver",
 ]
 
