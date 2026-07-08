@@ -673,7 +673,6 @@ impl CudaArch {
     /// * No CUDA drivers are installed
     /// * No CUDA devices are detected
     /// * Device enumeration fails
-    /// * The system is using musl libc (dynamic library loading not supported)
     pub fn current() -> Option<Self> {
         cuda::cuda_arch().map(|arch_info| Self {
             version: Version::from_str(&format!("{}.{}", arch_info.major, arch_info.minor))

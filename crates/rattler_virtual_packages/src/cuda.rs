@@ -110,7 +110,6 @@ pub fn cuda_version() -> Option<Version> {
 /// * No CUDA drivers are installed
 /// * No CUDA devices are detected
 /// * Device enumeration fails
-/// * The system is using musl libc (dynamic library loading not supported)
 ///
 /// The result is cached, so subsequent calls are very fast.
 pub fn cuda_arch() -> Option<CudaArchInfo> {
@@ -128,16 +127,15 @@ pub fn cuda_arch() -> Option<CudaArchInfo> {
 /// 3. Initializes NVML and enumerates all CUDA devices to query their compute capabilities
 /// 4. Returns the minimum compute capability across all devices (for `__cuda_arch` virtual package)
 ///
-/// On musl systems, only the version is detected via `nvidia-smi` since dynamic library
+/// On musl systems, both are detected via the `nvidia-smi` command since dynamic library
 /// loading is not supported.
 fn detect_cuda_info() -> CudaInfo {
     if cfg!(target_env = "musl") {
         // Dynamically loading a library is not supported on musl so we have to fall-back to using
-        // the nvidia-smi command. Architecture detection requires library loading, so it's
-        // unavailable on musl.
+        // the nvidia-smi command.
         CudaInfo {
             version: detect_cuda_version_via_nvidia_smi(),
-            arch_info: None,
+            arch_info: detect_cuda_arch_via_nvidia_smi(),
         }
     } else {
         // Detect via NVML, which gives us both version and architecture info from a single library
@@ -484,6 +482,51 @@ fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
     Version::from_str(version_str).ok()
 }
 
+/// Attempts to detect the CUDA compute capability by executing the "nvidia-smi" command and
+/// querying the `compute_cap` field of every GPU, returning the **minimum** across all devices.
+///
+/// Like [`detect_cuda_version_via_nvidia_smi`] this does not dynamically load a library and thus
+/// also works on musl systems. The `compute_cap` query field requires a reasonably modern driver
+/// (roughly R510+); on older drivers the command fails and `None` is returned.
+fn detect_cuda_arch_via_nvidia_smi() -> Option<CudaArchInfo> {
+    let nvidia_smi_output = Command::new("nvidia-smi")
+        // Query the compute capability of every GPU as plain CSV, one line per GPU.
+        .arg("--query-gpu=compute_cap")
+        .arg("--format=csv,noheader")
+        // See `detect_cuda_version_via_nvidia_smi` for why this variable is removed.
+        .env_remove("CUDA_VISIBLE_DEVICES")
+        .output()
+        .ok()?;
+
+    // On drivers that do not support the `compute_cap` field the command exits with an error.
+    if !nvidia_smi_output.status.success() {
+        return None;
+    }
+
+    let output = String::from_utf8_lossy(&nvidia_smi_output.stdout);
+
+    // Find the minimum compute capability across all devices
+    let mut min_arch: Option<CudaArchInfo> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        let Some((major, minor)) = line.split_once('.') else {
+            continue;
+        };
+        let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+            continue;
+        };
+
+        let is_new_minimum = min_arch
+            .as_ref()
+            .is_none_or(|min| major < min.major || (major == min.major && minor < min.minor));
+        if is_new_minimum {
+            min_arch = Some(CudaArchInfo { major, minor });
+        }
+    }
+
+    min_arch
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -498,6 +541,12 @@ mod test {
     pub fn doesnt_crash_nvidia_smi() {
         let version = detect_cuda_version_via_nvidia_smi();
         println!("Cuda {version:?}");
+    }
+
+    #[test]
+    pub fn doesnt_crash_nvidia_smi_arch() {
+        let arch = detect_cuda_arch_via_nvidia_smi();
+        println!("Cuda arch {arch:?}");
     }
 
     #[test]
