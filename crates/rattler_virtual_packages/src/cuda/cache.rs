@@ -18,7 +18,11 @@
 use super::{CudaArchInfo, CudaDetectionMethod, CudaInfo, CudaInfoSources, DetectedCudaInfo};
 use rattler_conda_types::Version;
 use serde::{Deserialize, Serialize};
-use std::{io::Write, path::Path, str::FromStr};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 const CACHE_FILE_NAME: &str = "cuda-info-v1.json";
 
@@ -33,9 +37,20 @@ const ARCH_MISSING_TTL_SECS: u64 = 10 * 60;
 const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
 /// Identifies a single boot session of the machine.
+///
+/// All variants are compiled on every platform so the comparison logic can be unit-tested
+/// anywhere; `current` only ever produces the variants that exist on the host platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(super) struct BootId(String);
+#[serde(rename_all = "snake_case")]
+pub(super) enum BootId {
+    /// The kernel's per-boot UUID from `/proc/sys/kernel/random/boot_id` (Linux).
+    Uuid(String),
+    /// The prefetcher boot counter from the registry, incremented once per boot (Windows).
+    BootCount(u32),
+    /// A boot time in unix seconds derived from the uptime (Windows fallback). The derivation
+    /// drifts a little between processes, which `matches` absorbs with a tolerance.
+    BootTime(u64),
+}
 
 impl BootId {
     /// Returns the identifier of the current boot session, or `None` if it cannot be determined
@@ -45,27 +60,23 @@ impl BootId {
         {
             // The kernel generates a fresh UUID on every boot.
             let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-            Some(Self(id.trim().to_owned()))
+            Some(Self::Uuid(id.trim().to_owned()))
         }
         #[cfg(target_os = "windows")]
         {
             // Prefer the prefetcher boot counter: it increments exactly once per boot and involves
             // no clock arithmetic, so it cannot be confused by reboots or clock steps.
             if let Some(count) = windows_boot_count() {
-                return Some(Self(format!("bootcount:{count}")));
+                return Some(Self::BootCount(count));
             }
-            // Fall back to deriving the boot time from the uptime. The derivation drifts a little
-            // between processes, which `matches` absorbs.
+            // Fall back to deriving the boot time from the uptime.
             let uptime_secs =
                 unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() } / 1000;
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_secs();
-            Some(Self(format!(
-                "boottime:{}",
-                now_secs.checked_sub(uptime_secs)?
-            )))
+            Some(Self::BootTime(now_secs.checked_sub(uptime_secs)?))
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
@@ -75,27 +86,14 @@ impl BootId {
 
     /// Returns true if both identifiers refer to the same boot session.
     pub(super) fn matches(&self, other: &Self) -> bool {
-        // Identical identifiers (Linux boot UUIDs, Windows boot counters, or equal boot times)
-        // always refer to the same session.
-        if self.0 == other.0 {
-            return true;
+        match (self, other) {
+            // Two derived boot times can drift a few seconds between processes; treat them as the
+            // same session when they are within tolerance.
+            (Self::BootTime(a), Self::BootTime(b)) => boot_times_within_tolerance(*a, *b),
+            // Everything else (boot UUIDs, boot counters, or mixed kinds) must match exactly; two
+            // different kinds never refer to the same session.
+            _ => self == other,
         }
-        // Two derived boot times can drift a few seconds between processes; treat them as the same
-        // session when they are within tolerance. A `bootcount:` never matches a `boottime:` here
-        // because the prefixes differ and the equality check above already failed.
-        if let (Some(a), Some(b)) = (
-            self.0.strip_prefix("boottime:"),
-            other.0.strip_prefix("boottime:"),
-        ) && let (Ok(a), Ok(b)) = (a.parse::<u64>(), b.parse::<u64>())
-        {
-            return boot_times_within_tolerance(a, b);
-        }
-        false
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_raw(raw: &str) -> Self {
-        Self(raw.to_owned())
     }
 }
 
@@ -142,16 +140,47 @@ fn windows_boot_count() -> Option<u32> {
     if status == 0 { Some(data) } else { None }
 }
 
+/// Identifies the installed NVIDIA driver.
+///
+/// Drivers can be updated without a reboot, so the boot session alone is not enough to key the
+/// cache on. All variants are compiled on every platform so they can be unit-tested anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DriverFingerprint {
+    /// The version of the loaded `nvidia` kernel module (Linux), which changes when the driver is
+    /// updated and the module is reloaded.
+    Module { version: String },
+    /// The identity of the NVML library file on disk (Windows, WSL2), which driver updates
+    /// replace.
+    File {
+        path: PathBuf,
+        mtime_secs: u64,
+        len: u64,
+    },
+}
+
+/// Identifies the set of host-visible GPUs.
+///
+/// This distinguishes containers that share a cache volume but see different GPU subsets, and it
+/// changes when GPUs are hot-plugged or unplugged within a boot session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct DeviceFingerprint {
+    /// Sorted PCI bus ids of the GPUs the driver exposes under `/proc/driver/nvidia/gpus`.
+    pub(super) gpus: Vec<String>,
+    /// Sorted `/dev/nvidiaN` device nodes that are present.
+    pub(super) device_nodes: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
     /// The boot session during which detection ran.
     boot_id: BootId,
     /// Fingerprint of the installed driver when detection ran. Required: entries without a driver
     /// fingerprint cannot be trusted, so they are neither written nor read.
-    driver_fingerprint: String,
+    driver_fingerprint: DriverFingerprint,
     /// Fingerprint of the host-visible GPUs when detection ran, or `None` if it could not be
     /// determined on this platform.
-    device_fingerprint: Option<String>,
+    device_fingerprint: Option<DeviceFingerprint>,
     /// Unix seconds at which the entry was written, used for the TTL.
     written_at: u64,
     version: String,
@@ -170,8 +199,8 @@ struct CacheFile {
 /// the call sites in `cuda.rs`.
 pub(super) struct CacheEnv {
     pub(super) boot_id: Option<BootId>,
-    pub(super) driver_fingerprint: Option<String>,
-    pub(super) device_fingerprint: Option<String>,
+    pub(super) driver_fingerprint: Option<DriverFingerprint>,
+    pub(super) device_fingerprint: Option<DeviceFingerprint>,
     pub(super) now: u64,
 }
 
@@ -211,32 +240,30 @@ const LIBNVIDIA_ML_ABSOLUTE_PATHS: &[&str] = &[
 
 /// Fingerprints a file by its path, modification time and length, or `None` if it does not exist.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn file_fingerprint(path: &Path) -> Option<String> {
+fn file_fingerprint(path: &Path) -> Option<DriverFingerprint> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata
         .modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
-    Some(format!(
-        "file:{}|{}|{}",
-        path.display(),
-        mtime.as_secs(),
-        metadata.len()
-    ))
+    Some(DriverFingerprint::File {
+        path: path.to_path_buf(),
+        mtime_secs: mtime.as_secs(),
+        len: metadata.len(),
+    })
 }
 
 /// Returns a fingerprint of the installed NVIDIA driver, or `None` if it cannot be determined.
-///
-/// Drivers can be updated without a reboot, so the boot session alone is not enough to key the
-/// cache on. Each source is prefixed so fingerprints from different sources cannot collide.
-fn driver_fingerprint() -> Option<String> {
+fn driver_fingerprint() -> Option<DriverFingerprint> {
     #[cfg(target_os = "linux")]
     {
         // The version of the loaded kernel module, which changes when the driver is updated and
         // the module is reloaded.
         if let Ok(version) = std::fs::read_to_string("/sys/module/nvidia/version") {
-            return Some(format!("module:{}", version.trim()));
+            return Some(DriverFingerprint::Module {
+                version: version.trim().to_owned(),
+            });
         }
         // WSL2 (and similar setups) has no `/sys/module/nvidia`, so fall back to fingerprinting the
         // libnvidia-ml file the detector would load.
@@ -285,10 +312,7 @@ fn is_nvidia_device_node(name: &str) -> bool {
 }
 
 /// Returns a fingerprint of the host-visible GPUs, or `None` if it cannot be determined.
-///
-/// This distinguishes containers that share a cache volume but see different GPU subsets, and it
-/// changes when GPUs are hot-plugged or unplugged within a boot session.
-fn device_fingerprint() -> Option<String> {
+fn device_fingerprint() -> Option<DeviceFingerprint> {
     #[cfg(target_os = "linux")]
     {
         // PCI bus ids of the GPUs the driver exposes to us.
@@ -319,11 +343,10 @@ fn device_fingerprint() -> Option<String> {
         if !has_gpus_dir && devices.is_empty() {
             return None;
         }
-        Some(format!(
-            "gpus:[{}];dev:[{}]",
-            gpus.join(","),
-            devices.join(",")
-        ))
+        Some(DeviceFingerprint {
+            gpus,
+            device_nodes: devices,
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -367,8 +390,8 @@ pub(super) fn read_with_env(env: &CacheEnv, cache_dir: &Path) -> Option<Detected
     if &cached.driver_fingerprint != current_driver_fingerprint {
         tracing::info!(
             cache_path = %path.display(),
-            cached_driver_fingerprint = %cached.driver_fingerprint,
-            current_driver_fingerprint = %current_driver_fingerprint,
+            cached_driver_fingerprint = ?cached.driver_fingerprint,
+            current_driver_fingerprint = ?current_driver_fingerprint,
             "invalidating CUDA info cache because the driver changed"
         );
         return None;

@@ -1272,7 +1272,8 @@ mod test {
         println!("CUDA Arch: {arch:?}");
     }
 
-    /// Builds a fully specified, deterministic cache environment for the tests.
+    /// Builds a fully specified, deterministic cache environment for the tests. The `driver`
+    /// string becomes a kernel-module fingerprint and the `device` string a single GPU bus id.
     fn fake_env(
         boot: &str,
         driver: Option<&str>,
@@ -1280,9 +1281,14 @@ mod test {
         now: u64,
     ) -> cache::CacheEnv {
         cache::CacheEnv {
-            boot_id: Some(cache::BootId::from_raw(boot)),
-            driver_fingerprint: driver.map(str::to_owned),
-            device_fingerprint: device.map(str::to_owned),
+            boot_id: Some(cache::BootId::Uuid(boot.to_owned())),
+            driver_fingerprint: driver.map(|version| cache::DriverFingerprint::Module {
+                version: version.to_owned(),
+            }),
+            device_fingerprint: device.map(|gpu| cache::DeviceFingerprint {
+                gpus: vec![gpu.to_owned()],
+                device_nodes: Vec::new(),
+            }),
             now,
         }
     }
@@ -1425,7 +1431,7 @@ mod test {
         // A hand-written cache file is rejected when the current fingerprint is unavailable.
         std::fs::write(
             dir.path().join("cuda-info-v1.json"),
-            r#"{"boot_id":"boot-1","driver_fingerprint":"driver-1","device_fingerprint":"dev-1","written_at":1000,"version":"12.4","arch":[8,6]}"#,
+            r#"{"boot_id":{"uuid":"boot-1"},"driver_fingerprint":{"module":{"version":"driver-1"}},"device_fingerprint":{"gpus":["dev-1"],"device_nodes":[]},"written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();
         assert!(cache::read_with_env(&no_driver, dir.path()).is_none());
@@ -1440,13 +1446,13 @@ mod test {
         // A cache file written with a different driver installed is ignored.
         std::fs::write(
             dir.path().join("cuda-info-v1.json"),
-            r#"{"boot_id":"boot-1","driver_fingerprint":"module:535.0","device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
+            r#"{"boot_id":{"uuid":"boot-1"},"driver_fingerprint":{"module":{"version":"535.0"}},"device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();
-        let stale = fake_env("boot-1", Some("module:550.0"), None, 1_000);
+        let stale = fake_env("boot-1", Some("550.0"), None, 1_000);
         assert!(cache::read_with_env(&stale, dir.path()).is_none());
         // The original driver still reads.
-        let current = fake_env("boot-1", Some("module:535.0"), None, 1_000);
+        let current = fake_env("boot-1", Some("535.0"), None, 1_000);
         assert!(cache::read_with_env(&current, dir.path()).is_some());
     }
 
@@ -1456,7 +1462,7 @@ mod test {
         // A cache file from a different boot session is ignored.
         std::fs::write(
             dir.path().join("cuda-info-v1.json"),
-            r#"{"boot_id":"boot-A","driver_fingerprint":"driver-1","device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
+            r#"{"boot_id":{"uuid":"boot-A"},"driver_fingerprint":{"module":{"version":"driver-1"}},"device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();
         let other_boot = fake_env("boot-B", Some("driver-1"), None, 1_000);
@@ -1474,17 +1480,17 @@ mod test {
         assert!(cache::boot_times_within_tolerance(1_120, 1_000));
         assert!(!cache::boot_times_within_tolerance(1_000, 1_121));
 
-        // Two `boottime:` values match within tolerance.
-        let a = cache::BootId::from_raw("boottime:1000");
-        let b = cache::BootId::from_raw("boottime:1050");
+        // Two derived boot times match within tolerance.
+        let a = cache::BootId::BootTime(1000);
+        let b = cache::BootId::BootTime(1050);
         assert!(a.matches(&b));
-        let c = cache::BootId::from_raw("boottime:2000");
+        let c = cache::BootId::BootTime(2000);
         assert!(!a.matches(&c));
 
-        // Identical strings always match; a `bootcount:` never matches a `boottime:`.
-        let count = cache::BootId::from_raw("bootcount:5");
-        assert!(count.matches(&cache::BootId::from_raw("bootcount:5")));
-        assert!(!count.matches(&cache::BootId::from_raw("bootcount:6")));
+        // Boot counters must match exactly, and a boot counter never matches a boot time.
+        let count = cache::BootId::BootCount(5);
+        assert!(count.matches(&cache::BootId::BootCount(5)));
+        assert!(!count.matches(&cache::BootId::BootCount(6)));
         assert!(!count.matches(&a));
     }
 
