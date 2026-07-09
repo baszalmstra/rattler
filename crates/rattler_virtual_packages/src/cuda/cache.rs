@@ -20,7 +20,7 @@ use rattler_conda_types::Version;
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path, str::FromStr};
 
-const CACHE_FILE_NAME: &str = "cuda-info-v2.json";
+const CACHE_FILE_NAME: &str = "cuda-info-v1.json";
 
 /// Full detections (with compute capability) are trusted for a day; the fingerprints catch most
 /// changes sooner, so this is only a staleness backstop.
