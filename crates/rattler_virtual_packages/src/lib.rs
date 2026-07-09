@@ -159,6 +159,33 @@ pub trait EnvOverride: Sized {
             Self::detect_with_fallback(ov, Self::detect_from_host)
         })
     }
+
+    /// Detect the virtual package for the current system, using `cache_dir` for any on-disk
+    /// detection cache.
+    ///
+    /// The default implementation ignores `cache_dir` and defers to
+    /// [`EnvOverride::detect_from_host`]. Virtual packages with an expensive detection step (such
+    /// as CUDA) override this to thread the cache directory through.
+    fn detect_from_host_with_cache_dir(
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        let _ = cache_dir;
+        Self::detect_from_host()
+    }
+
+    /// Like [`EnvOverride::detect`] but funnels the host detection through
+    /// [`EnvOverride::detect_from_host_with_cache_dir`] so an on-disk detection cache can be used.
+    fn detect_cached(
+        ov: Option<&Override>,
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        ov.map_or_else(
+            || Self::detect_from_host_with_cache_dir(cache_dir),
+            |ov| {
+                Self::detect_with_fallback(ov, || Self::detect_from_host_with_cache_dir(cache_dir))
+            },
+        )
+    }
 }
 
 /// An enum that represents all virtual package types provided by this library.
@@ -411,7 +438,7 @@ impl VirtualPackage {
     /// the versions could not be properly detected.
     #[deprecated(
         since = "1.1.0",
-        note = "Use `VirtualPackage::detect(&VirtualPackageOverrides::default())` instead."
+        note = "Use `VirtualPackage::detect(&VirtualPackageOverrides::default(), None)` instead."
     )]
     pub fn current() -> Result<Vec<Self>, DetectVirtualPackageError> {
         Self::detect(&VirtualPackageOverrides::default(), None)
@@ -640,10 +667,7 @@ impl Cuda {
         ov: Option<&Override>,
         cache_dir: Option<&Path>,
     ) -> Result<Option<Self>, DetectVirtualPackageError> {
-        match ov {
-            Some(ov) => Self::detect_with_fallback(ov, || Ok(Self::current(cache_dir))),
-            None => Ok(Self::current(cache_dir)),
-        }
+        <Self as EnvOverride>::detect_cached(ov, cache_dir)
     }
 }
 
@@ -661,6 +685,11 @@ impl EnvOverride for Cuda {
     }
     fn detect_from_host() -> Result<Option<Self>, DetectVirtualPackageError> {
         Ok(Self::current(None))
+    }
+    fn detect_from_host_with_cache_dir(
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        Ok(Self::current(cache_dir))
     }
     const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_CUDA";
 }
@@ -727,10 +756,7 @@ impl CudaArch {
         ov: Option<&Override>,
         cache_dir: Option<&Path>,
     ) -> Result<Option<Self>, DetectVirtualPackageError> {
-        match ov {
-            Some(ov) => Self::detect_with_fallback(ov, || Ok(Self::current(cache_dir))),
-            None => Ok(Self::current(cache_dir)),
-        }
+        <Self as EnvOverride>::detect_cached(ov, cache_dir)
     }
 }
 
@@ -749,6 +775,12 @@ impl EnvOverride for CudaArch {
 
     fn detect_from_host() -> Result<Option<Self>, DetectVirtualPackageError> {
         Ok(Self::current(None))
+    }
+
+    fn detect_from_host_with_cache_dir(
+        cache_dir: Option<&Path>,
+    ) -> Result<Option<Self>, DetectVirtualPackageError> {
+        Ok(Self::current(cache_dir))
     }
 
     const DEFAULT_ENV_NAME: &'static str = "CONDA_OVERRIDE_CUDA_ARCH";

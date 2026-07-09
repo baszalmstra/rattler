@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
-    mem::MaybeUninit,
-    os::raw::{c_int, c_uint, c_ulong, c_void},
+    os::raw::{c_int, c_uint, c_void},
     path::Path,
     ptr,
     str::FromStr,
@@ -87,6 +86,22 @@ impl CudaInfoSources {
 struct DetectedCudaInfo {
     info: CudaInfo,
     sources: CudaInfoSources,
+}
+
+/// Converts a CUDA driver version integer (as reported by NVML/libcuda) into a [`Version`].
+///
+/// The integer is encoded as `major * 1000 + minor * 10` (e.g. `12040` for CUDA 12.4). Because the
+/// FFI out-parameters are zero-initialized, an implausible value (such as `0` from an out-param the
+/// driver never wrote, a negative value, or a nonsensically large one) can slip through even on a
+/// `SUCCESS` return. Only values whose CUDA major version lies in `1..=99` are accepted; anything
+/// else is rejected so that garbage never propagates (or gets cached).
+fn parse_cuda_driver_version(version: c_int) -> Option<Version> {
+    // CUDA major version 1..=99, i.e. the encoded integer must be within [1000, 99990].
+    if !(1000..=99_990).contains(&version) {
+        tracing::trace!(version, "rejecting implausible CUDA driver version integer");
+        return None;
+    }
+    Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok()
 }
 
 /// Validates that a string is in the format "major.minor" where both parts are digits.
@@ -292,13 +307,18 @@ pub fn cuda_arch(cache_dir: Option<&Path>) -> Option<CudaArchInfo> {
 /// On musl systems, both are detected via the `nvidia-smi` command since dynamic library
 /// loading is not supported.
 fn detect_cuda_info() -> DetectedCudaInfo {
-    if cfg!(target_env = "musl") {
+    let mut detected = if cfg!(target_env = "musl") {
         tracing::trace!("detecting CUDA info via nvidia-smi because musl cannot load NVML");
         // Dynamically loading a library is not supported on musl so we have to fall-back to using
         // the nvidia-smi command.
         let version = detect_cuda_version_via_nvidia_smi();
-        let arch_info = detect_cuda_arch_via_nvidia_smi();
-        return DetectedCudaInfo {
+        // Only query the compute capability when the driver version was found. On a GPU-less musl
+        // system the version query already failed, so running the arch query too would just spawn
+        // another doomed process and could produce an inconsistent `{version: None, arch: Some}`.
+        let arch_info = version
+            .as_ref()
+            .and_then(|_| detect_cuda_arch_via_nvidia_smi());
+        DetectedCudaInfo {
             sources: CudaInfoSources {
                 version: version.is_some().then_some(CudaDetectionMethod::NvidiaSmi),
                 arch: arch_info
@@ -306,31 +326,48 @@ fn detect_cuda_info() -> DetectedCudaInfo {
                     .then_some(CudaDetectionMethod::NvidiaSmi),
             },
             info: CudaInfo { version, arch_info },
-        };
-    }
+        }
+    } else {
+        tracing::trace!("detecting CUDA info via NVML");
+        // Prefer NVML because it is not affected by `CUDA_VISIBLE_DEVICES`, but fall back to the
+        // older probes so systems that expose libcuda (or nvidia-smi) without NVML still report
+        // `__cuda`.
+        let mut detected = detect_cuda_info_via_nvml();
 
-    tracing::trace!("detecting CUDA info via NVML");
-    // Prefer NVML because it is not affected by `CUDA_VISIBLE_DEVICES`, but fall back to the
-    // older probes so systems that expose libcuda (or nvidia-smi) without NVML still report
-    // `__cuda`.
-    let mut detected = detect_cuda_info_via_nvml();
+        if detected.info.version.is_none() {
+            tracing::debug!(
+                "NVML did not detect a CUDA driver version; trying libcuda/nvidia-smi fallbacks"
+            );
+            if let Some((version, source)) = detect_cuda_version_fallbacks() {
+                detected.info.version = Some(version);
+                detected.sources.version = Some(source);
+            }
+        }
 
-    if detected.info.version.is_none() {
+        if detected.info.version.is_some() && detected.info.arch_info.is_none() {
+            tracing::debug!(
+                "NVML did not detect CUDA compute capability; trying nvidia-smi fallback"
+            );
+            detected.info.arch_info = detect_cuda_arch_via_nvidia_smi();
+            if detected.info.arch_info.is_some() {
+                detected.sources.arch = Some(CudaDetectionMethod::NvidiaSmi);
+            }
+        }
+
+        detected
+    };
+
+    // Normalization for all paths: `__cuda_arch` is meaningless without `__cuda`. If no driver
+    // version was detected, drop any compute capability so callers can never observe
+    // arch-without-version.
+    if detected.info.version.is_none()
+        && (detected.info.arch_info.is_some() || detected.sources.arch.is_some())
+    {
         tracing::debug!(
-            "NVML did not detect a CUDA driver version; trying libcuda/nvidia-smi fallbacks"
+            "dropping CUDA compute capability because no CUDA driver version was detected"
         );
-        if let Some((version, source)) = detect_cuda_version_fallbacks() {
-            detected.info.version = Some(version);
-            detected.sources.version = Some(source);
-        }
-    }
-
-    if detected.info.version.is_some() && detected.info.arch_info.is_none() {
-        tracing::debug!("NVML did not detect CUDA compute capability; trying nvidia-smi fallback");
-        detected.info.arch_info = detect_cuda_arch_via_nvidia_smi();
-        if detected.info.arch_info.is_some() {
-            detected.sources.arch = Some(CudaDetectionMethod::NvidiaSmi);
-        }
+        detected.info.arch_info = None;
+        detected.sources.arch = None;
     }
 
     detected
@@ -371,50 +408,47 @@ fn detect_cuda_info_via_nvml() -> DetectedCudaInfo {
         };
     };
 
-    // Try the cheap no-init query first. Some drivers allow it, but NVML does not consistently
-    // guarantee that across platforms/versions, so retry after init only for that specific error.
-    let (version, version_source, retry_version_after_init) = match cuda_version_from_nvml_library(
-        &library,
-    ) {
+    // Attempt the cheap no-init query. Some drivers answer `nvmlSystemGetCudaDriverVersion` before
+    // `nvmlInit`, but it is not officially supported, so this result is only used as a fall back for
+    // when `nvmlInit` itself fails below.
+    let no_init_version = match cuda_version_from_nvml_library(&library) {
         Ok(version) => {
             tracing::trace!(%version, "detected CUDA driver version via NVML without init");
-            (Some(version), Some(CudaDetectionMethod::NvmlNoInit), false)
+            Some(version)
         }
         Err(err) => {
-            let retry_after_init = err.should_retry_after_init();
-            if retry_after_init {
-                tracing::debug!(
-                    "NVML CUDA driver version query requires initialization; retrying after nvmlInit"
-                );
-            } else {
-                tracing::trace!(
-                    ?err,
-                    "CUDA driver version query via NVML without init failed"
-                );
-            }
-            (None, None, retry_after_init)
+            tracing::trace!(
+                ?err,
+                "CUDA driver version query via NVML without init failed"
+            );
+            None
         }
     };
 
-    // Compute capability requires enumerating devices, which needs NVML to be initialized. If the
-    // no-init version query failed with NVML_ERROR_UNINITIALIZED, retry it while NVML is initialized.
+    // Compute capability requires enumerating devices, which needs NVML to be initialized. Since
+    // NVML is being initialized anyway, query the driver version while initialized too and prefer
+    // that officially supported result over the no-init query.
     let (initialized_version, arch_info) =
-        detect_cuda_initialized_info_via_nvml(&library, retry_version_after_init, true);
+        detect_cuda_initialized_info_via_nvml(&library, true, true);
 
-    let initialized_version_source = initialized_version
-        .as_ref()
-        .map(|_| CudaDetectionMethod::NvmlInitialized);
+    // Prefer the version obtained from initialized NVML whenever it is available; only fall back to
+    // the no-init value when `nvmlInit` (and thus the initialized query) did not produce one.
+    let (version, version_source) = if let Some(version) = initialized_version {
+        (Some(version), Some(CudaDetectionMethod::NvmlInitialized))
+    } else if let Some(version) = no_init_version {
+        (Some(version), Some(CudaDetectionMethod::NvmlNoInit))
+    } else {
+        (None, None)
+    };
+
     let arch_source = arch_info
         .as_ref()
         .map(|_| CudaDetectionMethod::NvmlInitialized);
 
     DetectedCudaInfo {
-        info: CudaInfo {
-            version: version.or(initialized_version),
-            arch_info,
-        },
+        info: CudaInfo { version, arch_info },
         sources: CudaInfoSources {
-            version: version_source.or(initialized_version_source),
+            version: version_source,
             arch: arch_source,
         },
     }
@@ -435,16 +469,16 @@ fn cuda_version_from_nvml_library(library: &Library) -> Result<Version, NvmlCuda
         }
         .map_err(|_err| NvmlCudaVersionError::MissingSymbol)?;
 
-    let mut cuda_driver_version = MaybeUninit::uninit();
-    let result = unsafe { nvml_system_get_cuda_driver_version(cuda_driver_version.as_mut_ptr()) };
+    // Zero-initialize the out-parameter so that a driver returning `NVML_SUCCESS` without actually
+    // writing it yields a deterministic `0`, which `parse_cuda_driver_version` rejects, rather than
+    // undefined behavior from reading uninitialized memory.
+    let mut cuda_driver_version: c_int = 0;
+    let result = unsafe { nvml_system_get_cuda_driver_version(&mut cuda_driver_version) };
     if result != NVML_SUCCESS {
         return Err(NvmlCudaVersionError::Nvml(result));
     }
-    let version = unsafe { cuda_driver_version.assume_init() };
 
-    // Convert the version integer to a version string
-    Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10))
-        .map_err(|_err| NvmlCudaVersionError::InvalidVersion)
+    parse_cuda_driver_version(cuda_driver_version).ok_or(NvmlCudaVersionError::InvalidVersion)
 }
 
 /// Queries information that requires initialized NVML.
@@ -549,8 +583,8 @@ fn detect_cuda_initialized_info_via_nvml(
                 }
             };
 
-            let mut device_count = MaybeUninit::uninit();
-            let device_count_result = unsafe { nvml_device_get_count(device_count.as_mut_ptr()) };
+            let mut device_count: c_uint = 0;
+            let device_count_result = unsafe { nvml_device_get_count(&mut device_count) };
             if device_count_result != NVML_SUCCESS {
                 tracing::trace!(
                     return_code = device_count_result,
@@ -558,7 +592,6 @@ fn detect_cuda_initialized_info_via_nvml(
                 );
                 return None;
             }
-            let device_count = unsafe { device_count.assume_init() };
             tracing::trace!(device_count, "enumerating CUDA devices via NVML");
 
             let mut min_arch: Option<CudaArchInfo> = None;
@@ -575,14 +608,10 @@ fn detect_cuda_initialized_info_via_nvml(
                     continue;
                 }
 
-                let mut cc_major = MaybeUninit::uninit();
-                let mut cc_minor = MaybeUninit::uninit();
+                let mut cc_major: c_int = 0;
+                let mut cc_minor: c_int = 0;
                 let compute_capability_result = unsafe {
-                    nvml_device_get_cuda_compute_capability(
-                        device,
-                        cc_major.as_mut_ptr(),
-                        cc_minor.as_mut_ptr(),
-                    )
+                    nvml_device_get_cuda_compute_capability(device, &mut cc_major, &mut cc_minor)
                 };
                 if compute_capability_result != NVML_SUCCESS {
                     tracing::trace!(
@@ -592,8 +621,8 @@ fn detect_cuda_initialized_info_via_nvml(
                     );
                     continue;
                 }
-                let cc_major = unsafe { cc_major.assume_init() } as u32;
-                let cc_minor = unsafe { cc_minor.assume_init() } as u32;
+                let cc_major = cc_major as u32;
+                let cc_minor = cc_minor as u32;
                 tracing::trace!(
                     device_idx,
                     major = cc_major,
@@ -774,8 +803,10 @@ pub fn detect_cuda_version_via_libcuda() -> Option<Version> {
     }
     let cuda_library = cuda_library?;
 
-    // Get entry points from the library
-    let cu_init: Symbol<'_, unsafe extern "C" fn(c_uint) -> c_ulong> =
+    // Get entry points from the library. `CUresult` is a 32-bit enum, so these are declared to
+    // return `c_int` (matching the NVML declarations); on some ABIs the upper bits of a wider
+    // return register are unspecified.
+    let cu_init: Symbol<'_, unsafe extern "C" fn(c_uint) -> c_int> =
         match unsafe { cuda_library.get(b"cuInit\0") } {
             Ok(symbol) => symbol,
             Err(err) => {
@@ -783,7 +814,7 @@ pub fn detect_cuda_version_via_libcuda() -> Option<Version> {
                 return None;
             }
         };
-    let cu_driver_get_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_ulong> =
+    let cu_driver_get_version: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_int> =
         match unsafe { cuda_library.get(b"cuDriverGetVersion\0") } {
             Ok(symbol) => symbol,
             Err(err) => {
@@ -799,17 +830,17 @@ pub fn detect_cuda_version_via_libcuda() -> Option<Version> {
         return None;
     }
 
-    // Get the version from the library
-    let mut version_int = MaybeUninit::uninit();
-    let version_result = unsafe { cu_driver_get_version(version_int.as_mut_ptr()) };
+    // Get the version from the library. The out-parameter is zero-initialized so that a driver
+    // returning success without writing it yields a deterministic `0`, which is rejected below.
+    let mut version_int: c_int = 0;
+    let version_result = unsafe { cu_driver_get_version(&mut version_int) };
     if version_result != 0 {
         tracing::debug!(return_code = version_result, "cuDriverGetVersion failed");
         return None;
     }
-    let version = unsafe { version_int.assume_init() };
 
     // Convert the version integer to a version string
-    let version = Version::from_str(&format!("{}.{}", version / 1000, (version % 1000) / 10)).ok();
+    let version = parse_cuda_driver_version(version_int);
     if let Some(version) = &version {
         tracing::trace!(%version, "detected CUDA driver version via libcuda");
     } else {
@@ -864,11 +895,6 @@ fn cuda_library_paths() -> &'static [&'static str] {
 /// dynamically load a library which might not be supported on all systems. The downside is that
 /// executing a subprocess is generally slower and more prone to errors.
 fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
-    static CUDA_VERSION_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| {
-            regex::Regex::new("<cuda_version>(.*)<\\/cuda_version>").unwrap()
-        });
-
     tracing::trace!("detecting CUDA driver version via nvidia-smi");
     // Invoke the "nvidia-smi" command to query the driver version that is usually installed when
     // Cuda drivers are installed.
@@ -895,22 +921,35 @@ fn detect_cuda_version_via_nvidia_smi() -> Option<Version> {
         }
     };
 
+    // nvidia-smi can exit non-zero in degraded-but-parseable states (e.g. one GPU lost while others
+    // are healthy) where the XML still contains a usable `<cuda_version>`. Log the failure but still
+    // attempt to parse stdout instead of bailing out on the exit status.
     if !nvidia_smi_output.status.success() {
         tracing::debug!(
             status = %nvidia_smi_output.status,
             stderr = %String::from_utf8_lossy(&nvidia_smi_output.stderr),
-            "nvidia-smi CUDA driver version query failed"
+            "nvidia-smi CUDA driver version query exited non-zero; attempting to parse output anyway"
         );
-        return None;
     }
 
     // Convert the output to Utf8. The conversion is lossy so it might contain some illegal
     // characters. If that is the case we simply assume the version in the file also wont make sense
     // during parsing.
     let output = String::from_utf8_lossy(&nvidia_smi_output.stdout);
+    parse_nvidia_smi_cuda_version(&output)
+}
+
+/// Extracts the CUDA driver version from the XML output produced by `nvidia-smi --query -u -x`.
+///
+/// Returns `None` if the `<cuda_version>` element is missing or cannot be parsed as a [`Version`].
+fn parse_nvidia_smi_cuda_version(output: &str) -> Option<Version> {
+    static CUDA_VERSION_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| {
+            regex::Regex::new("<cuda_version>(.*)<\\/cuda_version>").unwrap()
+        });
 
     // Extract the version from the XML
-    let Some(version_match) = CUDA_VERSION_RE.captures(&output) else {
+    let Some(version_match) = CUDA_VERSION_RE.captures(output) else {
         tracing::trace!("nvidia-smi output did not contain a CUDA driver version");
         return None;
     };
@@ -956,18 +995,28 @@ fn detect_cuda_arch_via_nvidia_smi() -> Option<CudaArchInfo> {
         }
     };
 
-    // On drivers that do not support the `compute_cap` field the command exits with an error.
+    // On drivers that do not support the `compute_cap` field the command exits with an error, but it
+    // can also exit non-zero while still reporting some healthy GPUs on stdout. Log the failure but
+    // still attempt to parse whatever was produced instead of bailing out on the exit status.
     if !nvidia_smi_output.status.success() {
         tracing::debug!(
             status = %nvidia_smi_output.status,
             stderr = %String::from_utf8_lossy(&nvidia_smi_output.stderr),
-            "nvidia-smi CUDA compute capability query failed"
+            "nvidia-smi CUDA compute capability query exited non-zero; attempting to parse output anyway"
         );
-        return None;
     }
 
     let output = String::from_utf8_lossy(&nvidia_smi_output.stdout);
+    parse_nvidia_smi_compute_capabilities(&output)
+}
 
+/// Parses the CSV output of `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` and returns
+/// the **minimum** compute capability across all parseable GPU lines.
+///
+/// Each line is expected to be a `major.minor` value. Lines that are not in that format (such as
+/// `[N/A]` reported for a GPU whose capability is unknown, or other junk) are skipped while still
+/// using the valid ones. Returns `None` if no line could be parsed.
+fn parse_nvidia_smi_compute_capabilities(output: &str) -> Option<CudaArchInfo> {
     // Find the minimum compute capability across all devices
     let mut min_arch: Option<CudaArchInfo> = None;
     for (device_idx, line) in output.lines().enumerate() {
@@ -1324,5 +1373,86 @@ mod test {
         assert!(!is_valid_cuda_version_format("eight.six"));
         assert!(!is_valid_cuda_version_format("8-6"));
         assert!(!is_valid_cuda_version_format("8_6"));
+    }
+
+    #[test]
+    fn test_parse_cuda_driver_version() {
+        // Valid values are decoded as `major.minor`.
+        assert_eq!(
+            parse_cuda_driver_version(12_040),
+            Some(Version::from_str("12.4").unwrap())
+        );
+        assert_eq!(
+            parse_cuda_driver_version(11_080),
+            Some(Version::from_str("11.8").unwrap())
+        );
+        // Smallest plausible value (CUDA major 1).
+        assert_eq!(
+            parse_cuda_driver_version(1_000),
+            Some(Version::from_str("1.0").unwrap())
+        );
+        // Largest plausible value (CUDA major 99).
+        assert_eq!(
+            parse_cuda_driver_version(99_990),
+            Some(Version::from_str("99.99").unwrap())
+        );
+
+        // Implausible values are rejected rather than propagating garbage.
+        assert_eq!(parse_cuda_driver_version(0), None);
+        assert_eq!(parse_cuda_driver_version(-1), None);
+        assert_eq!(parse_cuda_driver_version(999), None);
+        assert_eq!(parse_cuda_driver_version(100_000), None);
+        assert_eq!(parse_cuda_driver_version(c_int::MAX), None);
+        assert_eq!(parse_cuda_driver_version(c_int::MIN), None);
+    }
+
+    #[test]
+    fn test_parse_nvidia_smi_cuda_version() {
+        // A representative fragment of the `nvidia-smi --query -u -x` XML output.
+        let xml = "<nvidia_smi_log>\n  <cuda_version>12.4</cuda_version>\n</nvidia_smi_log>";
+        assert_eq!(
+            parse_nvidia_smi_cuda_version(xml),
+            Some(Version::from_str("12.4").unwrap())
+        );
+
+        // Missing the tag entirely.
+        assert_eq!(
+            parse_nvidia_smi_cuda_version("<nvidia_smi_log></nvidia_smi_log>"),
+            None
+        );
+
+        // Empty input.
+        assert_eq!(parse_nvidia_smi_cuda_version(""), None);
+    }
+
+    #[test]
+    fn test_parse_nvidia_smi_compute_capabilities() {
+        // Multiple GPUs: the minimum capability is selected.
+        assert_eq!(
+            parse_nvidia_smi_compute_capabilities("8.6\n7.5\n9.0"),
+            Some(CudaArchInfo { major: 7, minor: 5 })
+        );
+
+        // Junk and `[N/A]`-style lines are skipped while the valid ones are still used. Here the
+        // valid minimum line (7.5) is retained even though another GPU reports `[N/A]`.
+        assert_eq!(
+            parse_nvidia_smi_compute_capabilities("8.6\n[N/A]\n7.5\ngarbage"),
+            Some(CudaArchInfo { major: 7, minor: 5 })
+        );
+
+        // A line that is unparsable as numbers (`x.y`) is skipped as well.
+        assert_eq!(
+            parse_nvidia_smi_compute_capabilities("x.y\n8.0"),
+            Some(CudaArchInfo { major: 8, minor: 0 })
+        );
+
+        // All lines are junk: nothing is detected.
+        assert_eq!(
+            parse_nvidia_smi_compute_capabilities("[N/A]\ngarbage\n"),
+            None
+        );
+
+        // Empty input.
+        assert_eq!(parse_nvidia_smi_compute_capabilities(""), None);
     }
 }
