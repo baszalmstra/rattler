@@ -20,6 +20,7 @@ use once_cell::sync::OnceCell;
 use rattler_conda_types::Version;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     mem::MaybeUninit,
     os::raw::{c_int, c_uint, c_ulong, c_void},
@@ -162,22 +163,45 @@ fn display_cuda_arch(arch_info: Option<&CudaArchInfo>) -> String {
 /// This is more efficient than calling [`cuda_version`] and [`cuda_arch`] separately
 /// because the CUDA library is loaded only once.
 ///
-/// `cache_dir` is the directory used to cache the detection result across processes until the
-/// next reboot; pass `None` to disable the on-disk cache. Detection runs at most once per
-/// process, so the cache directory is only used by the first call.
+/// Detection runs at most once per process; the in-memory result is reused afterwards. The on-disk
+/// cache, however, is synced lazily: the first call that is given a `cache_dir` reads from and/or
+/// writes to it. A call that passes `None` (e.g. `EnvOverride::detect_from_host`) does not disable
+/// the disk cache for the rest of the process — a later call passing `Some(cache_dir)` still
+/// persists the already-detected result. Pass `None` from every call to fully disable the disk
+/// cache.
 pub fn cuda_info(cache_dir: Option<&Path>) -> &'static CudaInfo {
-    static DETECTED_CUDA_INFO: OnceCell<CudaInfo> = OnceCell::new();
-    if let Some(info) = DETECTED_CUDA_INFO.get() {
-        tracing::trace!(?info, "using process-cached CUDA info");
-        return info;
+    static DETECTED_CUDA_INFO: OnceCell<DetectedCudaInfo> = OnceCell::new();
+    // Whether the in-memory result has been synced with the on-disk cache (read from it or written
+    // to it). This lets a later call with a `cache_dir` persist a result first detected without one.
+    static PERSISTED: AtomicBool = AtomicBool::new(false);
+    cuda_info_impl(
+        &cache::CacheEnv::current(),
+        &DETECTED_CUDA_INFO,
+        &PERSISTED,
+        cache_dir,
+    )
+}
+
+/// Core of [`cuda_info`], generic over the state so it can be unit-tested with local state instead
+/// of the process-global statics.
+fn cuda_info_impl<'a>(
+    env: &cache::CacheEnv,
+    state: &'a OnceCell<DetectedCudaInfo>,
+    persisted: &AtomicBool,
+    cache_dir: Option<&Path>,
+) -> &'a CudaInfo {
+    if let Some(detected) = state.get() {
+        tracing::trace!(info = ?detected.info, "using process-cached CUDA info");
+        maybe_persist(env, detected, persisted, cache_dir);
+        return &detected.info;
     }
 
-    DETECTED_CUDA_INFO.get_or_init(|| {
+    let detected = state.get_or_init(|| {
         // Initializing the driver to detect the GPU can be slow, so the result is cached on disk
-        // and reused until the next reboot.
+        // and reused until the cache is invalidated (reboot, driver change, GPU change, TTL).
         if let Some(cache_dir) = cache_dir {
             tracing::trace!(cache_dir = %cache_dir.display(), "checking CUDA info cache");
-            if let Some(cached) = cache::read(cache_dir) {
+            if let Some(cached) = cache::read_with_env(env, cache_dir) {
                 tracing::debug!(
                     version = %display_cuda_version(cached.info.version.as_ref()),
                     arch = %display_cuda_arch(cached.info.arch_info.as_ref()),
@@ -185,7 +209,9 @@ pub fn cuda_info(cache_dir: Option<&Path>) -> &'static CudaInfo {
                     arch_source = cached.sources.arch_str(),
                     "using disk-cached CUDA info"
                 );
-                return cached.info;
+                // We are now in sync with disk; no need to write it back.
+                persisted.store(true, Ordering::Relaxed);
+                return cached;
             }
         } else {
             tracing::trace!("CUDA info disk cache disabled");
@@ -200,11 +226,32 @@ pub fn cuda_info(cache_dir: Option<&Path>) -> &'static CudaInfo {
             arch_source = detected.sources.arch_str(),
             "detected CUDA info from host"
         );
-        if let Some(cache_dir) = cache_dir {
-            cache::write(cache_dir, &detected.info, detected.sources);
-        }
-        detected.info
-    })
+        detected
+    });
+
+    // Persist a freshly detected result if this (or a later) call supplied a cache directory.
+    maybe_persist(env, detected, persisted, cache_dir);
+    &detected.info
+}
+
+/// Writes the detected result to disk once, if a cache directory is available and it has not been
+/// synced with disk yet. A benign race may write twice, which is safe because the write replaces
+/// the file atomically.
+fn maybe_persist(
+    env: &cache::CacheEnv,
+    detected: &DetectedCudaInfo,
+    persisted: &AtomicBool,
+    cache_dir: Option<&Path>,
+) {
+    let Some(cache_dir) = cache_dir else {
+        return;
+    };
+    if persisted.load(Ordering::Relaxed) {
+        return;
+    }
+    cache::write_with_env(env, cache_dir, &detected.info, detected.sources);
+    // The flag means "we have synced with disk"; set it regardless of write's best-effort outcome.
+    persisted.store(true, Ordering::Relaxed);
 }
 
 /// Returns the maximum CUDA version available on the current platform.
@@ -1006,15 +1053,45 @@ mod test {
         println!("CUDA Arch: {arch:?}");
     }
 
+    /// Builds a fully specified, deterministic cache environment for the tests.
+    fn fake_env(
+        boot: &str,
+        driver: Option<&str>,
+        device: Option<&str>,
+        now: u64,
+    ) -> cache::CacheEnv {
+        cache::CacheEnv {
+            boot_id: Some(cache::BootId::from_raw(boot)),
+            driver_fingerprint: driver.map(str::to_owned),
+            device_fingerprint: device.map(str::to_owned),
+            now,
+        }
+    }
+
+    fn full_info() -> (CudaInfo, CudaInfoSources) {
+        (
+            CudaInfo {
+                version: Some(Version::from_str("12.4").unwrap()),
+                arch_info: Some(CudaArchInfo { major: 8, minor: 6 }),
+            },
+            CudaInfoSources {
+                version: Some(CudaDetectionMethod::NvmlInitialized),
+                arch: Some(CudaDetectionMethod::NvidiaSmi),
+            },
+        )
+    }
+
     #[test]
     fn test_cache_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        let env = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 1_000);
 
-        // Nothing cached yet
-        assert!(cache::read(dir.path()).is_none());
+        // Nothing cached yet.
+        assert!(cache::read_with_env(&env, dir.path()).is_none());
 
-        // Negative results are not cached
-        cache::write(
+        // Negative results are not cached.
+        cache::write_with_env(
+            &env,
             dir.path(),
             &CudaInfo {
                 version: None,
@@ -1022,23 +1099,11 @@ mod test {
             },
             CudaInfoSources::default(),
         );
-        assert!(cache::read(dir.path()).is_none());
+        assert!(cache::read_with_env(&env, dir.path()).is_none());
 
-        let info = CudaInfo {
-            version: Some(Version::from_str("12.4").unwrap()),
-            arch_info: Some(CudaArchInfo { major: 8, minor: 6 }),
-        };
-        let sources = CudaInfoSources {
-            version: Some(CudaDetectionMethod::NvmlInitialized),
-            arch: Some(CudaDetectionMethod::NvidiaSmi),
-        };
-        cache::write(dir.path(), &info, sources);
-
-        if cache::BootId::current().is_none() {
-            // Cannot key the cache without a boot id on this platform
-            return;
-        }
-        let cached = cache::read(dir.path()).unwrap();
+        let (info, sources) = full_info();
+        cache::write_with_env(&env, dir.path(), &info, sources);
+        let cached = cache::read_with_env(&env, dir.path()).unwrap();
         assert_eq!(cached.info.version, info.version);
         assert_eq!(cached.info.arch_info, info.arch_info);
         assert_eq!(cached.sources, sources);
@@ -1052,51 +1117,186 @@ mod test {
             version: Some(CudaDetectionMethod::Libcuda),
             arch: None,
         };
-        cache::write(dir.path(), &updated_info, updated_sources);
-        let cached = cache::read(dir.path()).unwrap();
+        cache::write_with_env(&env, dir.path(), &updated_info, updated_sources);
+        let cached = cache::read_with_env(&env, dir.path()).unwrap();
         assert_eq!(cached.info.version, updated_info.version);
         assert_eq!(cached.info.arch_info, updated_info.arch_info);
         assert_eq!(cached.sources, updated_sources);
     }
 
     #[test]
+    fn test_cache_ttl_version_only_vs_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_env = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 1_000);
+
+        // A version-only entry (transient arch failure) is readable immediately but expires after
+        // ten minutes.
+        let version_only = CudaInfo {
+            version: Some(Version::from_str("12.4").unwrap()),
+            arch_info: None,
+        };
+        cache::write_with_env(
+            &write_env,
+            dir.path(),
+            &version_only,
+            CudaInfoSources::default(),
+        );
+        assert!(cache::read_with_env(&write_env, dir.path()).is_some());
+        let just_before = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 1_000 + 600);
+        assert!(cache::read_with_env(&just_before, dir.path()).is_some());
+        let after_10m = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 1_000 + 601);
+        assert!(cache::read_with_env(&after_10m, dir.path()).is_none());
+
+        // A full entry is still readable at that same age (it uses the 24h TTL) but expires past a
+        // day.
+        let (info, sources) = full_info();
+        cache::write_with_env(&write_env, dir.path(), &info, sources);
+        assert!(cache::read_with_env(&after_10m, dir.path()).is_some());
+        let after_24h = fake_env(
+            "boot-1",
+            Some("driver-1"),
+            Some("dev-1"),
+            1_000 + 24 * 3600 + 1,
+        );
+        assert!(cache::read_with_env(&after_24h, dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_cache_rejects_future_write_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_env = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 10_000);
+        let (info, sources) = full_info();
+        cache::write_with_env(&write_env, dir.path(), &info, sources);
+
+        // Written more than five minutes in the future (clock stepped backwards): rejected.
+        let past = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 10_000 - 301);
+        assert!(cache::read_with_env(&past, dir.path()).is_none());
+        // Within the tolerated skew: still accepted.
+        let slight_past = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 10_000 - 299);
+        assert!(cache::read_with_env(&slight_past, dir.path()).is_some());
+    }
+
+    #[test]
+    fn test_cache_invalidated_on_device_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = fake_env("boot-1", Some("driver-1"), Some("dev-a"), 1_000);
+        let (info, sources) = full_info();
+        cache::write_with_env(&env, dir.path(), &info, sources);
+
+        // A different device fingerprint (e.g. another container / hot-plugged GPU) invalidates.
+        let other_device = fake_env("boot-1", Some("driver-1"), Some("dev-b"), 1_000);
+        assert!(cache::read_with_env(&other_device, dir.path()).is_none());
+        // `Some` cached versus `None` current also invalidates.
+        let no_device = fake_env("boot-1", Some("driver-1"), None, 1_000);
+        assert!(cache::read_with_env(&no_device, dir.path()).is_none());
+        // The matching fingerprint still reads.
+        assert!(cache::read_with_env(&env, dir.path()).is_some());
+    }
+
+    #[test]
+    fn test_cache_requires_driver_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (info, sources) = full_info();
+
+        // Without a current driver fingerprint nothing is written.
+        let no_driver = fake_env("boot-1", None, Some("dev-1"), 1_000);
+        cache::write_with_env(&no_driver, dir.path(), &info, sources);
+        assert!(!dir.path().join("cuda-info-v2.json").exists());
+
+        // A hand-written cache file is rejected when the current fingerprint is unavailable.
+        std::fs::write(
+            dir.path().join("cuda-info-v2.json"),
+            r#"{"boot_id":"boot-1","driver_fingerprint":"driver-1","device_fingerprint":"dev-1","written_at":1000,"version":"12.4","arch":[8,6]}"#,
+        )
+        .unwrap();
+        assert!(cache::read_with_env(&no_driver, dir.path()).is_none());
+        // With a driver fingerprint available it reads.
+        let with_driver = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 1_000);
+        assert!(cache::read_with_env(&with_driver, dir.path()).is_some());
+    }
+
+    #[test]
     fn test_cache_invalidated_after_driver_change() {
         let dir = tempfile::tempdir().unwrap();
-        cache::write(
-            dir.path(),
-            &CudaInfo {
-                version: Some(Version::from_str("12.4").unwrap()),
-                arch_info: None,
-            },
-            CudaInfoSources {
-                version: Some(CudaDetectionMethod::NvmlNoInit),
-                arch: None,
-            },
-        );
-        let path = dir.path().join("cuda-info-v1.json");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            // Nothing was cached because this platform has no boot id
-            return;
-        };
-
-        // A cache file written with a different driver installed is ignored
-        let mut cached: serde_json::Value = serde_json::from_str(&content).unwrap();
-        cached["driver_fingerprint"] = "definitely-stale".into();
-        std::fs::write(&path, serde_json::to_string(&cached).unwrap()).unwrap();
-        assert!(cache::read(dir.path()).is_none());
+        // A cache file written with a different driver installed is ignored.
+        std::fs::write(
+            dir.path().join("cuda-info-v2.json"),
+            r#"{"boot_id":"boot-1","driver_fingerprint":"module:535.0","device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
+        )
+        .unwrap();
+        let stale = fake_env("boot-1", Some("module:550.0"), None, 1_000);
+        assert!(cache::read_with_env(&stale, dir.path()).is_none());
+        // The original driver still reads.
+        let current = fake_env("boot-1", Some("module:535.0"), None, 1_000);
+        assert!(cache::read_with_env(&current, dir.path()).is_some());
     }
 
     #[test]
     fn test_cache_invalidated_after_reboot() {
         let dir = tempfile::tempdir().unwrap();
-
-        // A cache file from a different boot session is ignored
+        // A cache file from a different boot session is ignored.
         std::fs::write(
-            dir.path().join("cuda-info-v1.json"),
-            r#"{"boot_id":"not-the-current-boot","driver_fingerprint":null,"version":"12.4","arch":[8,6]}"#,
+            dir.path().join("cuda-info-v2.json"),
+            r#"{"boot_id":"boot-A","driver_fingerprint":"driver-1","device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();
-        assert!(cache::read(dir.path()).is_none());
+        let other_boot = fake_env("boot-B", Some("driver-1"), None, 1_000);
+        assert!(cache::read_with_env(&other_boot, dir.path()).is_none());
+        // The same boot session still reads.
+        let same_boot = fake_env("boot-A", Some("driver-1"), None, 1_000);
+        assert!(cache::read_with_env(&same_boot, dir.path()).is_some());
+    }
+
+    #[test]
+    fn test_boot_time_tolerance() {
+        // The extracted numeric comparison, testable on every platform.
+        assert!(cache::boot_times_within_tolerance(1_000, 1_000));
+        assert!(cache::boot_times_within_tolerance(1_000, 1_120));
+        assert!(cache::boot_times_within_tolerance(1_120, 1_000));
+        assert!(!cache::boot_times_within_tolerance(1_000, 1_121));
+
+        // Two `boottime:` values match within tolerance.
+        let a = cache::BootId::from_raw("boottime:1000");
+        let b = cache::BootId::from_raw("boottime:1050");
+        assert!(a.matches(&b));
+        let c = cache::BootId::from_raw("boottime:2000");
+        assert!(!a.matches(&c));
+
+        // Identical strings always match; a `bootcount:` never matches a `boottime:`.
+        let count = cache::BootId::from_raw("bootcount:5");
+        assert!(count.matches(&cache::BootId::from_raw("bootcount:5")));
+        assert!(!count.matches(&cache::BootId::from_raw("bootcount:6")));
+        assert!(!count.matches(&a));
+    }
+
+    #[test]
+    fn test_late_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = fake_env("boot-1", Some("driver-1"), Some("dev-1"), 1_000);
+
+        // Pre-seed the state with a known detection result, as if detection had already run.
+        let state: OnceCell<DetectedCudaInfo> = OnceCell::new();
+        let (info, sources) = full_info();
+        let _ = state.set(DetectedCudaInfo { info, sources });
+        let persisted = AtomicBool::new(false);
+
+        // A call with no cache directory does not persist to disk.
+        cuda_info_impl(&env, &state, &persisted, None);
+        assert!(!persisted.load(Ordering::Relaxed));
+        assert!(cache::read_with_env(&env, dir.path()).is_none());
+
+        // A later call with a cache directory persists the already-detected result.
+        cuda_info_impl(&env, &state, &persisted, Some(dir.path()));
+        assert!(persisted.load(Ordering::Relaxed));
+        let cached = cache::read_with_env(&env, dir.path()).unwrap();
+        assert_eq!(
+            cached.info.version,
+            Some(Version::from_str("12.4").unwrap())
+        );
+        assert_eq!(
+            cached.info.arch_info,
+            Some(CudaArchInfo { major: 8, minor: 6 })
+        );
     }
 
     #[test]

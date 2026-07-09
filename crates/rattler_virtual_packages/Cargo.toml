@@ -28,7 +28,10 @@ plist = { workspace = true }
 
 [target.'cfg(target_os="windows")'.dependencies]
 winver = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
+windows-sys = { workspace = true, features = [
+    "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+] }
 
 [dev-dependencies]
 temp-env = { workspace = true }
