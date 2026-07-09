@@ -8,7 +8,8 @@
 //! NVIDIA drivers. This is detected via:
 //!
 //! * NVIDIA Management Library (NVML): Standard method
-//! * nvidia-smi command: Fallback on musl systems where dynamic library loading is not supported
+//! * CUDA driver library (libcuda) and the nvidia-smi command: Fallbacks for systems without
+//!   NVML, and for musl systems where dynamic library loading is not supported
 //!
 //! ## CUDA Compute Capability (`__cuda_arch`)
 //!
@@ -351,6 +352,19 @@ fn detect_cuda_info() -> DetectedCudaInfo {
             detected.info.arch_info = detect_cuda_arch_via_nvidia_smi();
             if detected.info.arch_info.is_some() {
                 detected.sources.arch = Some(CudaDetectionMethod::NvidiaSmi);
+            }
+        }
+
+        // Last resort for platforms that ship libcuda but neither NVML nor nvidia-smi (e.g.
+        // Jetson/Tegra). libcuda comes last because its device enumeration is affected by
+        // `CUDA_VISIBLE_DEVICES`.
+        if detected.info.version.is_some() && detected.info.arch_info.is_none() {
+            tracing::debug!(
+                "nvidia-smi did not detect CUDA compute capability; trying libcuda fallback"
+            );
+            detected.info.arch_info = detect_cuda_arch_via_libcuda();
+            if detected.info.arch_info.is_some() {
+                detected.sources.arch = Some(CudaDetectionMethod::Libcuda);
             }
         }
 
@@ -849,6 +863,162 @@ pub fn detect_cuda_version_via_libcuda() -> Option<Version> {
     version
 }
 
+/// Attempts to detect the CUDA compute capability by loading the CUDA driver library and
+/// enumerating all devices, returning the **minimum** compute capability across all devices.
+///
+/// This is the fallback for platforms that ship libcuda but neither NVML nor nvidia-smi (e.g.
+/// Jetson/Tegra). Device enumeration through libcuda is affected by `CUDA_VISIBLE_DEVICES`, so
+/// the NVML and nvidia-smi probes are preferred.
+fn detect_cuda_arch_via_libcuda() -> Option<CudaArchInfo> {
+    // CUDA device attribute constants for querying compute capability
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+
+    // Try to open the library
+    let mut cuda_library = None;
+    for path in cuda_library_paths() {
+        match unsafe { libloading::Library::new(*path) } {
+            Ok(loaded) => {
+                tracing::trace!(library_path = *path, "loaded CUDA driver library");
+                cuda_library = Some(loaded);
+                break;
+            }
+            Err(err) => {
+                tracing::trace!(
+                    library_path = *path,
+                    error = %err,
+                    "failed to load CUDA driver library"
+                );
+            }
+        }
+    }
+    let cuda_library = cuda_library?;
+
+    // Get entry points from the library. `CUresult` is a 32-bit enum, so these are declared to
+    // return `c_int`.
+    let cu_init: Symbol<'_, unsafe extern "C" fn(c_uint) -> c_int> =
+        match unsafe { cuda_library.get(b"cuInit\0") } {
+            Ok(symbol) => symbol,
+            Err(err) => {
+                tracing::debug!(error = %err, "missing cuInit symbol");
+                return None;
+            }
+        };
+    let cu_device_get_count: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> c_int> =
+        match unsafe { cuda_library.get(b"cuDeviceGetCount\0") } {
+            Ok(symbol) => symbol,
+            Err(err) => {
+                tracing::debug!(error = %err, "missing cuDeviceGetCount symbol");
+                return None;
+            }
+        };
+    let cu_device_get: Symbol<'_, unsafe extern "C" fn(*mut c_int, c_int) -> c_int> =
+        match unsafe { cuda_library.get(b"cuDeviceGet\0") } {
+            Ok(symbol) => symbol,
+            Err(err) => {
+                tracing::debug!(error = %err, "missing cuDeviceGet symbol");
+                return None;
+            }
+        };
+    let cu_device_get_attribute: Symbol<
+        '_,
+        unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int,
+    > = match unsafe { cuda_library.get(b"cuDeviceGetAttribute\0") } {
+        Ok(symbol) => symbol,
+        Err(err) => {
+            tracing::debug!(error = %err, "missing cuDeviceGetAttribute symbol");
+            return None;
+        }
+    };
+
+    // Initialize the CUDA library
+    let init_result = unsafe { cu_init(0) };
+    if init_result != 0 {
+        tracing::debug!(return_code = init_result, "cuInit failed");
+        return None;
+    }
+
+    // Get the number of CUDA devices
+    let mut device_count: c_int = 0;
+    let device_count_result = unsafe { cu_device_get_count(&mut device_count) };
+    if device_count_result != 0 {
+        tracing::trace!(return_code = device_count_result, "cuDeviceGetCount failed");
+        return None;
+    }
+    tracing::trace!(device_count, "enumerating CUDA devices via libcuda");
+
+    // Iterate through all devices to find the minimum compute capability
+    let mut min_arch: Option<CudaArchInfo> = None;
+    for device_idx in 0..device_count {
+        let mut device: c_int = 0;
+        let device_result = unsafe { cu_device_get(&mut device, device_idx) };
+        if device_result != 0 {
+            tracing::trace!(
+                device_idx,
+                return_code = device_result,
+                "failed to get CUDA device handle"
+            );
+            continue;
+        }
+
+        let mut cc_major: c_int = 0;
+        let mut cc_minor: c_int = 0;
+        let major_result = unsafe {
+            cu_device_get_attribute(
+                &mut cc_major,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                device,
+            )
+        };
+        let minor_result = unsafe {
+            cu_device_get_attribute(
+                &mut cc_minor,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                device,
+            )
+        };
+        if major_result != 0 || minor_result != 0 {
+            tracing::trace!(
+                device_idx,
+                major_return_code = major_result,
+                minor_return_code = minor_result,
+                "failed to get CUDA compute capability via libcuda"
+            );
+            continue;
+        }
+        let cc_major = cc_major as u32;
+        let cc_minor = cc_minor as u32;
+        tracing::trace!(
+            device_idx,
+            major = cc_major,
+            minor = cc_minor,
+            "detected CUDA compute capability via libcuda"
+        );
+
+        let is_new_minimum = min_arch.as_ref().is_none_or(|min| {
+            cc_major < min.major || (cc_major == min.major && cc_minor < min.minor)
+        });
+        if is_new_minimum {
+            min_arch = Some(CudaArchInfo {
+                major: cc_major,
+                minor: cc_minor,
+            });
+        }
+    }
+
+    if let Some(arch) = min_arch.as_ref() {
+        tracing::debug!(
+            major = arch.major,
+            minor = arch.minor,
+            "selected minimum CUDA compute capability from libcuda"
+        );
+    } else {
+        tracing::debug!("no CUDA compute capability detected via libcuda");
+    }
+
+    min_arch
+}
+
 /// Returns platform specific set of search paths for the CUDA library.
 ///
 /// On Windows and Linux, the CUDA library is installed by the NVIDIA driver package, and is
@@ -1250,11 +1420,11 @@ mod test {
         // Without a current driver fingerprint nothing is written.
         let no_driver = fake_env("boot-1", None, Some("dev-1"), 1_000);
         cache::write_with_env(&no_driver, dir.path(), &info, sources);
-        assert!(!dir.path().join("cuda-info-v2.json").exists());
+        assert!(!dir.path().join("cuda-info-v1.json").exists());
 
         // A hand-written cache file is rejected when the current fingerprint is unavailable.
         std::fs::write(
-            dir.path().join("cuda-info-v2.json"),
+            dir.path().join("cuda-info-v1.json"),
             r#"{"boot_id":"boot-1","driver_fingerprint":"driver-1","device_fingerprint":"dev-1","written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();
@@ -1269,7 +1439,7 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         // A cache file written with a different driver installed is ignored.
         std::fs::write(
-            dir.path().join("cuda-info-v2.json"),
+            dir.path().join("cuda-info-v1.json"),
             r#"{"boot_id":"boot-1","driver_fingerprint":"module:535.0","device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();
@@ -1285,7 +1455,7 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         // A cache file from a different boot session is ignored.
         std::fs::write(
-            dir.path().join("cuda-info-v2.json"),
+            dir.path().join("cuda-info-v1.json"),
             r#"{"boot_id":"boot-A","driver_fingerprint":"driver-1","device_fingerprint":null,"written_at":1000,"version":"12.4","arch":[8,6]}"#,
         )
         .unwrap();

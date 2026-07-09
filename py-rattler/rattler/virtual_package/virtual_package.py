@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-from typing import List, Optional
+from typing import List, Optional, Union
 import warnings
 
 from rattler.rattler import PyVirtualPackage, PyOverride, PyVirtualPackageOverrides
@@ -200,7 +200,7 @@ class VirtualPackage:
     @staticmethod
     def detect(
         overrides: VirtualPackageOverrides = VirtualPackageOverrides(),
-        cache_dir: Optional[os.PathLike[str]] = None,
+        cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
     ) -> List[VirtualPackage]:
         """
         Returns virtual packages detected for the current system with the given overrides.
