@@ -1,0 +1,229 @@
+name: Detect breaking changes - Comment
+
+on:
+  workflow_run:
+    workflows: [Detect breaking changes]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Fork runs can omit pull_requests, so use one conservative fallback group.
+  group: >-
+    breaking-changes-comment-${{
+      github.event.workflow_run.pull_requests[0].number ||
+      'unassociated'
+    }}
+  cancel-in-progress: false
+
+jobs:
+  comment-on-pr:
+    name: Comment on pull request
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download result artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          name: semver-check-result
+          path: semver-artifact
+          run-id: ${{ github.event.workflow_run.id }}
+
+      # The artifact was produced by a job that compiled pull-request code and
+      # must therefore be treated as untrusted input. Bind it to this workflow
+      # run and its associated PR before granting it any influence over comments.
+      - name: Validate result artifact
+        id: result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          pr_number=$(cat semver-artifact/pr_number)
+          run_sha=$(cat semver-artifact/run_sha)
+          head_sha=$(cat semver-artifact/head_sha)
+          base_sha=$(cat semver-artifact/base_sha)
+          result=$(cat semver-artifact/result)
+
+          if [[ ! "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number: $pr_number" >&2
+            exit 1
+          fi
+          for sha in "$run_sha" "$head_sha" "$base_sha"; do
+            if [[ ! "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+              echo "Invalid git SHA: $sha" >&2
+              exit 1
+            fi
+          done
+          # Depending on the event shape, workflow_run.head_sha can be either
+          # the pull request head or its synthetic merge commit.
+          if [[ "$run_sha" != "$RUN_HEAD_SHA" && "$head_sha" != "$RUN_HEAD_SHA" ]]; then
+            echo "Artifact does not belong to workflow run $RUN_ID" >&2
+            exit 1
+          fi
+          if [[ "$result" != success && "$result" != failure && "$result" != error ]]; then
+            echo "Invalid semver result: $result" >&2
+            exit 1
+          fi
+          # A failed origin workflow never has authority to resolve or create a
+          # breaking-change comment, regardless of the artifact's claim.
+          if [[ "$RUN_CONCLUSION" != success ]]; then
+            result=error
+          fi
+
+          pr_data=$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" \
+            --jq '[.state, .head.sha, .base.sha, .head.repo.full_name, .head.ref] | @tsv')
+          IFS=$'\t' read -r pr_state current_head_sha current_base_sha current_head_repository current_head_branch <<< "$pr_data"
+
+          associated_prs=$(mktemp)
+          gh api --paginate \
+            "repos/${REPOSITORY}/actions/runs/${RUN_ID}/pull_requests" \
+            --jq '.[].number' > "$associated_prs"
+          if ! grep -Fxq "$pr_number" "$associated_prs"; then
+            # workflow_run can omit pull_requests for forks. In that case, bind
+            # the artifact to the trusted source repository and branch instead.
+            if [[ "$current_head_repository" != "$RUN_HEAD_REPOSITORY" || "$current_head_branch" != "$RUN_HEAD_BRANCH" ]]; then
+              echo "PR $pr_number is not associated with workflow run $RUN_ID" >&2
+              exit 1
+            fi
+          fi
+
+          stale=false
+          if [[ "$pr_state" != open || "$head_sha" != "$current_head_sha" || "$base_sha" != "$current_base_sha" ]]; then
+            stale=true
+            echo "Ignoring stale result for PR $pr_number"
+          fi
+
+          {
+            echo "pr_number=$pr_number"
+            echo "head_sha=$head_sha"
+            echo "base_sha=$base_sha"
+            echo "result=$result"
+            echo "stale=$stale"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render failure comment
+        if: steps.result.outputs.stale == 'false' && steps.result.outputs.result == 'failure'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          raw = Path("semver-artifact/logs").read_bytes().decode("utf-8", errors="replace")
+          raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+          raw = "".join(
+              character
+              for character in raw
+              if character in "\n\t" or (ord(character) >= 32 and ord(character) != 127)
+          )
+
+          if not raw.strip():
+              raw = "No detailed output was captured. See the workflow run for details."
+
+          # Indented Markdown cannot be escaped by untrusted log lines containing
+          # backticks or HTML, unlike a fenced code block.
+          details = "\n".join(f"    {line}" for line in raw.rstrip().splitlines())
+          details_bytes = details.encode("utf-8")
+          details_limit = 48_000
+          if len(details_bytes) > details_limit:
+              tail = details_bytes[-(details_limit - 100):].decode("utf-8", errors="replace")
+              newline = tail.find("\n")
+              if newline >= 0:
+                  tail = tail[newline + 1:]
+              else:
+                  tail = f"    {tail}"
+              details = f"    [earlier output truncated]\n{tail}"
+
+          body = (
+              "<!-- cargo-semver-checks-comment -->\n"
+              "`cargo-semver-checks` detected API breaking changes compared with "
+              "the pull request's base revision.\n\n"
+              "<details>\n"
+              "<summary>Details</summary>\n\n"
+              f"{details}\n\n"
+              "</details>\n"
+          )
+          Path("semver-comment.md").write_text(body, encoding="utf-8")
+          PY
+
+      - name: Create or update failure comment
+        if: steps.result.outputs.stale == 'false' && steps.result.outputs.result == 'failure'
+        env:
+          BASE_SHA: ${{ steps.result.outputs.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.result.outputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          pr_data=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '[.state, .head.sha, .base.sha] | @tsv')
+          IFS=$'\t' read -r pr_state current_head_sha current_base_sha <<< "$pr_data"
+          if [[ "$pr_state" != open || "$HEAD_SHA" != "$current_head_sha" || "$BASE_SHA" != "$current_base_sha" ]]; then
+            echo "Skipping stale result for PR $PR_NUMBER"
+            exit 0
+          fi
+
+          comments=$(mktemp)
+          gh api --paginate \
+            "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(
+              .user.login == "github-actions[bot]"
+              and (.body | contains("<!-- cargo-semver-checks-comment -->"))
+            ) | .id' > "$comments"
+          mapfile -t comment_ids < "$comments"
+
+          body=$(cat semver-comment.md)
+          if (( ${#comment_ids[@]} > 0 )); then
+            gh api "repos/${REPOSITORY}/issues/comments/${comment_ids[0]}" \
+              --method PATCH \
+              --raw-field body="$body"
+            for duplicate_id in "${comment_ids[@]:1}"; do
+              gh api "repos/${REPOSITORY}/issues/comments/${duplicate_id}" --method DELETE
+            done
+          else
+            gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --method POST \
+              --raw-field body="$body"
+          fi
+
+      - name: Delete resolved failure comment
+        if: steps.result.outputs.stale == 'false' && steps.result.outputs.result == 'success'
+        env:
+          BASE_SHA: ${{ steps.result.outputs.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.result.outputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          pr_data=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '[.state, .head.sha, .base.sha] | @tsv')
+          IFS=$'\t' read -r pr_state current_head_sha current_base_sha <<< "$pr_data"
+          if [[ "$pr_state" != open || "$HEAD_SHA" != "$current_head_sha" || "$BASE_SHA" != "$current_base_sha" ]]; then
+            echo "Skipping stale result for PR $PR_NUMBER"
+            exit 0
+          fi
+
+          comments=$(mktemp)
+          gh api --paginate \
+            "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(
+              .user.login == "github-actions[bot]"
+              and (.body | contains("<!-- cargo-semver-checks-comment -->"))
+            ) | .id' > "$comments"
+          while read -r comment_id; do
+            if [[ -n "$comment_id" ]]; then
+              gh api "repos/${REPOSITORY}/issues/comments/${comment_id}" --method DELETE
+            fi
+          done < "$comments"

@@ -1,0 +1,148 @@
+name: Detect breaking changes
+
+on:
+  pull_request:
+    types: [edited, opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: breaking-changes-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-semver:
+    name: Check semver
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          lfs: false
+          persist-credentials: false
+          submodules: recursive
+
+      # Use a complete checkout instead of cargo-semver-checks' --baseline-rev.
+      # The latter extracts the git tree without initializing our libsolv submodule.
+      - name: Checkout base revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          lfs: false
+          path: .semver-baseline
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+          submodules: recursive
+
+      - name: Determine changed public crates
+        id: packages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASELINE_ROOT: .semver-baseline
+        run: |
+          packages=$(bash scripts/changed-public-crates.sh "$BASE_SHA" "$BASELINE_ROOT")
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "Changed public crates: ${packages:-none}"
+
+      - name: Install Rust toolchain
+        if: steps.packages.outputs.packages != ''
+        run: rustup show
+
+      # Keep this version aligned with the release-plz action.
+      - name: Install cargo-semver-checks
+        if: steps.packages.outputs.packages != ''
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-semver-checks@0.48
+
+      - name: Cache Rust build artifacts
+        if: steps.packages.outputs.packages != ''
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run cargo-semver-checks
+        id: semver
+        if: steps.packages.outputs.packages != ''
+        env:
+          BASELINE_ROOT: .semver-baseline
+          PACKAGES: ${{ steps.packages.outputs.packages }}
+        run: |
+          package_args=()
+          read -ra packages <<< "${PACKAGES:-}"
+          for package in "${packages[@]}"; do
+            package_args+=(--package "$package")
+          done
+
+          set +e
+          cargo semver-checks check-release \
+            --manifest-path Cargo.toml \
+            --baseline-root "$BASELINE_ROOT" \
+            --release-type minor \
+            "${package_args[@]}" \
+            > >(tee /tmp/semver-stdout.txt) \
+            2> >(tee /tmp/semver-stderr.txt >&2)
+          exit_code=$?
+          wait
+          set -e
+
+          cat /tmp/semver-stdout.txt /tmp/semver-stderr.txt > /tmp/semver-output.txt
+          last_stderr_line=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/semver-stderr.txt \
+            | tr '\r' '\n' \
+            | sed '/^[[:space:]]*$/d' \
+            | tail -n 1)
+
+          if [[ "$exit_code" -eq 0 ]]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          elif [[ "$last_stderr_line" == *"semver requires new major version:"* ]]; then
+            # Breaking changes are reported through a PR comment rather than a
+            # failing status check, because they can be intentional.
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "::error::cargo-semver-checks failed without detecting an API breaking change"
+            exit "$exit_code"
+          fi
+
+      - name: Stage result artifact
+        if: always()
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CHECK_RESULT: ${{ steps.semver.outputs.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PACKAGES: ${{ steps.packages.outputs.packages }}
+          PACKAGES_OUTCOME: ${{ steps.packages.outcome }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$PACKAGES_OUTCOME" != success ]]; then
+            result=error
+          elif [[ -z "$PACKAGES" ]]; then
+            result=success
+          else
+            result=${CHECK_RESULT:-error}
+          fi
+
+          mkdir -p semver-artifact
+          printf '%s\n' "$PR_NUMBER" > semver-artifact/pr_number
+          printf '%s\n' "$RUN_SHA" > semver-artifact/run_sha
+          printf '%s\n' "$HEAD_SHA" > semver-artifact/head_sha
+          printf '%s\n' "$BASE_SHA" > semver-artifact/base_sha
+          printf '%s\n' "$result" > semver-artifact/result
+
+          if [[ -f /tmp/semver-output.txt ]]; then
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/semver-output.txt \
+              | tr '\r' '\n' \
+              | tail -c 200000 > semver-artifact/logs
+          else
+            : > semver-artifact/logs
+          fi
+
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: semver-check-result
+          path: semver-artifact/
+          retention-days: 1
