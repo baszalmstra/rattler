@@ -251,6 +251,12 @@ def check-ref [base_ref: string] {
     $attempt.outcome
 }
 
+def resolve-ref [reference: string] {
+    run-command $"resolving git reference ($reference)" {
+        ^git -C $repo_root rev-parse $reference
+    } | str trim
+}
+
 # Write the artifact consumed by the privileged workflow_run workflow.
 def write-artifact [directory: string, outcome: record, metadata: record] {
     mkdir $directory
@@ -273,7 +279,7 @@ def "main ci" [base_ref: string, artifact_dir: string] {
         pr_number: $env.PR_NUMBER
         run_sha: $env.RUN_SHA
         head_sha: $env.HEAD_SHA
-        base_sha: $env.BASE_SHA
+        base_sha: (resolve-ref $base_ref)
     }
 
     try {

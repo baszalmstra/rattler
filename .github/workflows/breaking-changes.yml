@@ -43,11 +43,12 @@ jobs:
 
       - name: Run cargo-semver-checks
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_SHA: ${{ github.sha }}
-        run: nu scripts/check-breaking-changes.nu ci "$BASE_SHA" semver-artifact
+        # HEAD is GitHub's synthetic merge commit. Its first parent is the exact
+        # base revision used for this run.
+        run: nu scripts/check-breaking-changes.nu ci "HEAD^1" semver-artifact
 
       - name: Upload result artifact
         if: always()

@@ -56,8 +56,23 @@ def validate-run-source [
     }
 }
 
-def is-stale [pr: record, head_sha: string, base_sha: string] {
-    $pr.state != "open" or $pr.head.sha != $head_sha or $pr.base.sha != $base_sha
+# pull_request.base.sha can lag behind the base branch. The first parent of
+# GitHub's current synthetic merge commit is the exact base used by PR checks.
+def current-base-sha [repository: string, pr: record] {
+    let merge_sha = ($pr.merge_commit_sha? | default "")
+    if ($merge_sha | is-empty) {
+        return ""
+    }
+    let merge_commit = (gh-command ["api", $"repos/($repository)/commits/($merge_sha)"] | from json)
+    if ($merge_commit.parents | is-empty) {
+        ""
+    } else {
+        $merge_commit.parents | first | get sha
+    }
+}
+
+def is-stale [pr: record, current_base_sha: string, head_sha: string, base_sha: string] {
+    $pr.state != "open" or $pr.head.sha != $head_sha or $current_base_sha != $base_sha
 }
 
 def find-comments [repository: string, pr_number: string] {
@@ -152,7 +167,8 @@ def main [artifact_dir: string] {
         $run_head_repository
         $run_head_branch)
 
-    if (is-stale $pr $head_sha $base_sha) {
+    let pr_base_sha = (current-base-sha $repository $pr)
+    if (is-stale $pr $pr_base_sha $head_sha $base_sha) {
         print $"Ignoring stale result for PR ($pr_number)"
         return
     }
@@ -164,7 +180,8 @@ def main [artifact_dir: string] {
     # Re-fetch immediately before mutation. Combined with workflow concurrency,
     # this prevents an old run from changing a newer PR result.
     let current_pr = (get-pr $repository $pr_number)
-    if (is-stale $current_pr $head_sha $base_sha) {
+    let current_base_sha = (current-base-sha $repository $current_pr)
+    if (is-stale $current_pr $current_base_sha $head_sha $base_sha) {
         print $"Skipping stale result for PR ($pr_number)"
         return
     }
