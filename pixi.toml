@@ -86,7 +86,7 @@ lint = { features = ["lint"], solve-group = "default" }
 # Breaking API change detection
 #------------------------------
 [feature.semver-check.dependencies]
-nushell = ">=0.106.1,<0.107"
+nushell = "*"
 
 [feature.semver-check.tasks]
 breaking-changes = "nu scripts/check-breaking-changes.nu"
