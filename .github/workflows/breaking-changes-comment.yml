@@ -37,10 +37,10 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Install Nushell
-        uses: hustcer/setup-nu@ccd5bb5426b05a32009c2ba967946231f3919c97 # v3.25
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
-          version: "0.106.1"
+          environments: semver-check
 
       - name: Download result artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -59,4 +59,4 @@ jobs:
           RUN_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-        run: nu scripts/update-breaking-change-comment.nu semver-artifact
+        run: pixi run -e semver-check update-breaking-change-comment semver-artifact

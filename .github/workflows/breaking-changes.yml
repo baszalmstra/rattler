@@ -24,10 +24,10 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install Nushell
-        uses: hustcer/setup-nu@ccd5bb5426b05a32009c2ba967946231f3919c97 # v3.25
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
-          version: "0.106.1"
+          environments: semver-check
 
       - name: Install Rust toolchain
         run: rustup show
@@ -48,7 +48,7 @@ jobs:
           RUN_SHA: ${{ github.sha }}
         # HEAD is GitHub's synthetic merge commit. Its first parent is the exact
         # base revision used for this run.
-        run: nu scripts/check-breaking-changes.nu ci "HEAD^1" semver-artifact
+        run: pixi run -e semver-check breaking-changes ci "HEAD^1" semver-artifact
 
       - name: Upload result artifact
         if: always()
