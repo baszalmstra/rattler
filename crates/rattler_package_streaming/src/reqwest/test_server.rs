@@ -35,6 +35,36 @@ pub async fn serve_file(file_path: impl AsRef<Path>) -> Url {
         .unwrap()
 }
 
+/// Spawn a local file server that does NOT support range requests: incoming
+/// `Range` headers are stripped, so every response is a full `200 OK`.
+pub async fn serve_file_no_ranges(file_path: impl AsRef<Path>) -> Url {
+    let file_path = file_path.as_ref();
+    let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
+    let dir = file_path.parent().unwrap();
+
+    let app = axum::Router::new()
+        .fallback_service(ServeDir::new(dir))
+        .layer(middleware::from_fn(strip_range));
+
+    let addr = SocketAddr::new([127, 0, 0, 1].into(), 0);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    format!("http://{}:{}/{file_name}", addr.ip(), addr.port())
+        .parse()
+        .unwrap()
+}
+
+async fn strip_range(mut req: Request, next: Next) -> Response {
+    req.headers_mut().remove(http::header::RANGE);
+    let mut response = next.run(req).await;
+    response.headers_mut().remove(http::header::ACCEPT_RANGES);
+    response
+}
+
 /// Clamp suffix ranges (`bytes=-N`) that exceed the file size so `ServeDir`
 /// doesn't return 416. Per RFC 9110 §14.1.2, a suffix range exceeding the
 /// representation length should select the entire representation.

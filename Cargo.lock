@@ -5322,6 +5322,7 @@ dependencies = [
  "astral_async_zip",
  "async-compression",
  "async-spooled-tempfile",
+ "async-trait",
  "axum",
  "bzip2",
  "filetime",

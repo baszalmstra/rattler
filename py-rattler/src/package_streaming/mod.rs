@@ -1,3 +1,5 @@
+pub mod archive;
+
 use futures::StreamExt;
 use pyo3::{prelude::*, types::PyBytes};
 use pyo3_async_runtimes::tokio::future_into_py;
