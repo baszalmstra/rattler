@@ -25,7 +25,7 @@ fn io_error<E: std::fmt::Display>(error: E) -> PyErr {
 fn parse_section(section: &str) -> PyResult<Section> {
     match section {
         "info" => Ok(Section::Info),
-        "pkg" | "content" => Ok(Section::Content),
+        "pkg" => Ok(Section::Content),
         _ => Err(PyValueError::new_err(format!(
             "invalid section {section:?}: expected 'info' or 'pkg'"
         ))),
@@ -34,7 +34,7 @@ fn parse_section(section: &str) -> PyResult<Section> {
 
 /// A conda package archive (local or remote) that is opened once and can then
 /// be read many times.
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPackageArchive {
     inner: PackageArchive,
@@ -149,6 +149,19 @@ impl PyPackageArchive {
         })
     }
 
+    /// Lists the paths of all files in one section ("info" or "pkg").
+    pub fn list_files<'a>(&self, py: Python<'a>, section: String) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        let section = parse_section(&section)?;
+        future_into_py(py, async move {
+            let paths = inner.list_files(section).await.map_err(io_error)?;
+            Ok(paths
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<String>>())
+        })
+    }
+
     /// Opens a stream over the tar entries of one section ("info" or "pkg").
     pub fn stream<'a>(&self, py: Python<'a>, section: String) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -252,8 +265,9 @@ impl PyArchiveEntry {
                 .current
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("entry has already been read"))?;
+            // The header size is untrusted; cap the upfront allocation.
             let size = entry.header().size().map_err(io_error)?;
-            let mut buf = Vec::with_capacity(size as usize);
+            let mut buf = Vec::with_capacity(size.min(4 * 1024 * 1024) as usize);
             entry.read_to_end(&mut buf).await.map_err(io_error)?;
             guard.current = None;
             Python::attach(|py| Ok(PyBytes::new(py, &buf).unbind()))

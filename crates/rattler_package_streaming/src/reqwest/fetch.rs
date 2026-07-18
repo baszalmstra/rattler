@@ -1,19 +1,20 @@
 //! High-level helpers to fetch single files from remote conda packages.
 //!
-//! Thin wrappers around [`crate::archive::PackageArchive`]: sparse range
-//! requests where supported, transparent fallback to a one-time spooled
-//! download otherwise. To read multiple files from one package, open a
-//! [`crate::archive::PackageArchive`] once instead.
+//! Sparse range requests where supported (via
+//! [`crate::archive::PackageArchive`]), with a streaming full-download
+//! fallback that aborts once the target file has been read. To read multiple
+//! files from one package, open a [`crate::archive::PackageArchive`] instead.
 
-use rattler_conda_types::package::PackageFile;
+use rattler_conda_types::package::{CondaArchiveType, PackageFile};
 use reqwest_middleware::ClientWithMiddleware;
+use tracing::debug;
 use url::Url;
 
 pub use super::full_download::{
     fetch_file_from_remote_full_download, fetch_package_file_full_download,
 };
 use crate::ExtractError;
-use crate::archive::PackageArchive;
+use crate::archive::{PackageArchive, sparse_unsupported};
 
 /// Fetch and parse a typed [`PackageFile`] from a remote package.
 ///
@@ -40,10 +41,11 @@ pub async fn fetch_package_file_from_remote_url<P: PackageFile>(
     client: ClientWithMiddleware,
     url: Url,
 ) -> Result<P, ExtractError> {
-    PackageArchive::from_url(client, url)
+    let bytes = fetch_file_from_remote_url(client, url, P::package_path())
         .await?
-        .read_package_file()
-        .await
+        .ok_or(ExtractError::MissingComponent)?;
+    P::from_slice(&bytes)
+        .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
 }
 
 /// Fetch the raw bytes for a file path inside a remote package.
@@ -53,10 +55,22 @@ pub async fn fetch_file_from_remote_url(
     url: Url,
     target_path: &std::path::Path,
 ) -> Result<Option<Vec<u8>>, ExtractError> {
-    PackageArchive::from_url(client, url)
-        .await?
-        .read_file(target_path)
-        .await
+    let archive_type = CondaArchiveType::try_from(std::path::Path::new(url.path()))
+        .ok_or(ExtractError::UnsupportedArchiveType)?;
+
+    if archive_type == CondaArchiveType::Conda {
+        match PackageArchive::open_sparse(client.clone(), url.clone()).await {
+            Ok(archive) => return archive.read_file(target_path).await,
+            Err(err) if sparse_unsupported(&err) => {
+                debug!("sparse access unavailable ({err}), falling back to full download");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    // One-shot read: stream the body and abort once the file is found,
+    // rather than spooling the whole archive like `PackageArchive` does.
+    fetch_file_from_remote_full_download(&client, &url, target_path).await
 }
 
 #[cfg(test)]
@@ -97,7 +111,7 @@ mod tests {
         insta::assert_yaml_snapshot!(about_json);
     }
 
-    /// tar.bz2 is unsupported by the sparse path, so the archive is spooled.
+    /// tar.bz2 is unsupported by the sparse path and falls back to streaming.
     #[tokio::test]
     async fn test_fetch_full_download_tar_bz2() {
         use rattler_conda_types::package::IndexJson;

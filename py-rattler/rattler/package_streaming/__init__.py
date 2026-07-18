@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from os import PathLike
-from typing import AsyncIterator, Awaitable, Dict, Iterable, Literal, Optional, Tuple
+from typing import AsyncIterator, Callable, Coroutine, Dict, Iterable, List, Literal, Optional, Tuple
 
 from rattler.networking.client import Client
 from rattler.package.about_json import AboutJson
@@ -114,10 +114,14 @@ class ArchiveEntry:
 
 
 class _SectionStream:
-    """Async iterator over the entries of one package section."""
+    """Async iterator over the entries of one package section.
 
-    def __init__(self, stream_future: Awaitable[PySectionStream]) -> None:
-        self._stream_future = stream_future
+    The underlying stream is opened lazily on the first `__anext__` so that
+    an iterator that is never consumed does not leave an unawaited coroutine.
+    """
+
+    def __init__(self, open_stream: Callable[[], Coroutine[None, None, PySectionStream]]) -> None:
+        self._open_stream: Optional[Callable[[], Coroutine[None, None, PySectionStream]]] = open_stream
         self._stream: Optional[PySectionStream] = None
 
     def __aiter__(self) -> AsyncIterator[ArchiveEntry]:
@@ -125,7 +129,12 @@ class _SectionStream:
 
     async def __anext__(self) -> ArchiveEntry:
         if self._stream is None:
-            self._stream = await self._stream_future
+            if self._open_stream is None:
+                raise StopAsyncIteration
+            # Consume the opener first so a failed open exhausts the iterator
+            # instead of retrying a spent coroutine.
+            open_stream, self._open_stream = self._open_stream, None
+            self._stream = await open_stream()
         return ArchiveEntry(await self._stream.__anext__())
 
 
@@ -207,6 +216,16 @@ class PackageArchive:
         """Reads and parses `info/run_exports.json`."""
         return RunExportsJson._from_py_run_exports_json(await self._inner.run_exports_json())
 
+    async def list_files(self, section: Literal["info", "pkg"] = "pkg") -> List[str]:
+        """
+        Lists the paths of all files in one section.
+
+        For `"info"` this is usually served from the cached archive tail. For
+        `"pkg"` it streams the entire section; prefer `paths_json()` when only
+        paths are needed.
+        """
+        return await self._inner.list_files(section)
+
     def stream(self, section: Literal["info", "pkg"] = "pkg") -> AsyncIterator[ArchiveEntry]:
         """
         Streams the tar entries of one section of the package.
@@ -220,7 +239,7 @@ class PackageArchive:
                 data = await entry.read()
         ```
         """
-        return _SectionStream(self._inner.stream(section))
+        return _SectionStream(lambda: self._inner.stream(section))
 
     def __repr__(self) -> str:
         return f"PackageArchive(access={self.access!r})"

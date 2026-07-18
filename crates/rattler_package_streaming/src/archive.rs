@@ -70,6 +70,12 @@ const TAIL_SIZE: u64 = 64 * 1024;
 /// Buffer size used for the decompression pipelines.
 const STREAM_BUF_SIZE: usize = 128 * 1024;
 
+/// Signature of a ZIP local file header (`PK\x03\x04`).
+const LOCAL_HEADER_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+
+/// Cap for upfront buffer allocations based on (untrusted) tar header sizes.
+const MAX_PREALLOC: u64 = 4 * 1024 * 1024;
+
 /// The two sections of a conda package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
@@ -84,10 +90,9 @@ pub enum Section {
 impl Section {
     /// Returns the section a path inside the package belongs to.
     pub fn containing(path: &Path) -> Section {
-        if path.starts_with("info") {
-            Section::Info
-        } else {
-            Section::Content
+        match normalize(path).components().next() {
+            Some(std::path::Component::Normal(first)) if first == "info" => Section::Info,
+            _ => Section::Content,
         }
     }
 
@@ -132,10 +137,10 @@ enum Backend {
     Sparse {
         client: ClientWithMiddleware,
         url: Url,
-        size: u64,
-        /// `ETag` (or `Last-Modified`) of the archive captured when it was
-        /// opened; sent as `If-Range` on section requests so a concurrently
-        /// republished archive is detected instead of yielding garbage.
+        /// Strong `ETag` (or `Last-Modified`) captured at open time; sent as
+        /// `If-Range` on section requests so servers that honor it reject
+        /// reads from a concurrently republished archive. Best-effort:
+        /// servers may ignore `If-Range`.
         validator: Option<http::HeaderValue>,
         tail_offset: u64,
         tail: Vec<u8>,
@@ -144,13 +149,13 @@ enum Backend {
     LocalConda {
         path: PathBuf,
         members: Vec<MemberSpan>,
-        _temp: Option<tempfile::TempPath>,
-        access: ArchiveAccess,
+        /// Present when the archive was spooled from a remote; keeps the
+        /// temporary file alive and distinguishes `Spooled` from `Local`.
+        temp: Option<tempfile::TempPath>,
     },
     LocalTarBz2 {
         path: PathBuf,
-        _temp: Option<tempfile::TempPath>,
-        access: ArchiveAccess,
+        temp: Option<tempfile::TempPath>,
     },
 }
 
@@ -198,38 +203,44 @@ impl PackageArchive {
         let path = path.as_ref();
         let archive_type =
             CondaArchiveType::try_from(path).ok_or(ExtractError::UnsupportedArchiveType)?;
-        Self::open_local(path.to_owned(), archive_type, None, ArchiveAccess::Local).await
+        Self::open_local(path.to_owned(), archive_type, None).await
     }
 
     /// Returns how this handle accesses the archive.
     pub fn access(&self) -> ArchiveAccess {
         match &*self.backend {
             Backend::Sparse { .. } => ArchiveAccess::Sparse,
-            Backend::LocalConda { access, .. } | Backend::LocalTarBz2 { access, .. } => *access,
+            Backend::LocalConda { temp: None, .. } | Backend::LocalTarBz2 { temp: None, .. } => {
+                ArchiveAccess::Local
+            }
+            Backend::LocalConda { .. } | Backend::LocalTarBz2 { .. } => ArchiveAccess::Spooled,
         }
     }
 
     /// Reads a single file from the package, or `None` if the path does not
     /// exist. Prefer [`PackageArchive::read_files`] for multiple files.
     pub async fn read_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>, ExtractError> {
-        let path = path.as_ref().to_path_buf();
+        let path = normalize(path.as_ref());
         let mut result = self.read_files([path.clone()]).await?;
         Ok(result.remove(&path).flatten())
     }
 
-    /// Reads multiple files in one pass per touched section (sections in
-    /// parallel), aborting each stream after its last requested file. Maps
-    /// every requested path to its contents, or `None` when absent.
+    /// Reads multiple files in one pass per touched section (sections are
+    /// fetched concurrently), aborting each stream after its last requested
+    /// file. Maps every requested path to its contents, or `None` when
+    /// absent.
     pub async fn read_files(
         &self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, ExtractError> {
-        let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
+        let paths: Vec<PathBuf> = paths.into_iter().map(|p| normalize(&p.into())).collect();
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
 
-        // A .tar.bz2 archive has no sections: serve everything in one pass.
+        // A .tar.bz2 archive is one flat tar: serve everything in a single
+        // unfiltered pass. Grouping per section here would decompress the
+        // whole bz2 stream once per section.
         if matches!(&*self.backend, Backend::LocalTarBz2 { .. }) {
             let mut stream = self.tar_bz2_stream(None).await?;
             return scan_stream(&mut stream, paths).await;
@@ -263,6 +274,23 @@ impl PackageArchive {
             .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
     }
 
+    /// Lists the paths of all files in one section.
+    ///
+    /// For [`Section::Info`] this is usually served from the cached archive
+    /// tail without extra requests. For [`Section::Content`] it streams the
+    /// entire section; prefer reading `info/paths.json` when only paths are
+    /// needed.
+    pub async fn list_files(&self, section: Section) -> Result<Vec<PathBuf>, ExtractError> {
+        let mut stream = self.stream(section).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = stream.next_entry().await? {
+            if entry.header().entry_type().is_file() {
+                paths.push(entry.path().map_err(ExtractError::IoError)?.into_owned());
+            }
+        }
+        Ok(paths)
+    }
+
     /// Streams the tar entries of one section. Unread entries are skipped
     /// cheaply; dropping the stream aborts any underlying HTTP transfer.
     pub async fn stream(&self, section: Section) -> Result<SectionStream, ExtractError> {
@@ -273,6 +301,8 @@ impl PackageArchive {
                     ZstdDecoder::new(tokio::io::BufReader::with_capacity(STREAM_BUF_SIZE, raw));
                 Ok(SectionStream::new(Box::new(decoder), None))
             }
+            // `read_files` bypasses the filter with `tar_bz2_stream(None)`
+            // to serve both sections from a single pass.
             Backend::LocalTarBz2 { .. } => self.tar_bz2_stream(Some(section)).await,
         }
     }
@@ -295,11 +325,15 @@ impl PackageArchive {
             HeaderMap::default(),
         )
         .await?;
+        // A weak ETag must not be sent in `If-Range` (RFC 9110 §13.1.5);
+        // fall back to `Last-Modified` in that case.
         let validator = headers
             .get(ETAG)
+            .filter(|v| !v.as_bytes().starts_with(b"W/"))
             .or_else(|| headers.get(LAST_MODIFIED))
             .cloned();
         let size = reader.len();
+        debug!("opened remote archive ({size} bytes) with a {TAIL_SIZE} byte tail request");
 
         // Parse the central directory. The needed bytes are already cached
         // from the tail request; if the central directory is unusually large
@@ -327,7 +361,6 @@ impl PackageArchive {
             backend: Arc::new(Backend::Sparse {
                 client,
                 url,
-                size,
                 validator,
                 tail_offset,
                 tail,
@@ -349,6 +382,8 @@ impl PackageArchive {
             .error_for_status()
             .map_err(|e| ExtractError::ReqwestError(e.into()))?;
 
+        // Spool to disk rather than memory: packages can be arbitrarily
+        // large (multi-GB), so an in-memory copy is not an option.
         let temp = tempfile::NamedTempFile::new().map_err(ExtractError::IoError)?;
         let (file, temp_path) = temp.into_parts();
         let mut file = tokio::fs::File::from_std(file);
@@ -358,20 +393,13 @@ impl PackageArchive {
             .map_err(ExtractError::IoError)?;
         file.flush().await.map_err(ExtractError::IoError)?;
 
-        Self::open_local(
-            temp_path.to_path_buf(),
-            archive_type,
-            Some(temp_path),
-            ArchiveAccess::Spooled,
-        )
-        .await
+        Self::open_local(temp_path.to_path_buf(), archive_type, Some(temp_path)).await
     }
 
     async fn open_local(
         path: PathBuf,
         archive_type: CondaArchiveType,
         temp: Option<tempfile::TempPath>,
-        access: ArchiveAccess,
     ) -> Result<Self, ExtractError> {
         let backend = match archive_type {
             CondaArchiveType::Conda => {
@@ -386,15 +414,10 @@ impl PackageArchive {
                 Backend::LocalConda {
                     path,
                     members,
-                    _temp: temp,
-                    access,
+                    temp,
                 }
             }
-            CondaArchiveType::TarBz2 => Backend::LocalTarBz2 {
-                path,
-                _temp: temp,
-                access,
-            },
+            CondaArchiveType::TarBz2 => Backend::LocalTarBz2 { path, temp },
         };
         Ok(Self {
             backend: Arc::new(backend),
@@ -412,24 +435,31 @@ impl PackageArchive {
             Backend::Sparse {
                 client,
                 url,
-                size,
                 validator,
                 tail_offset,
                 tail,
                 members,
+                ..
             } => {
                 let span = find_section_member(members, section)?;
 
                 // Serve from the cached tail when the whole member is inside it.
-                if span.header_offset >= *tail_offset && span.end <= *size {
+                if span.header_offset >= *tail_offset {
                     let rel = (span.header_offset - tail_offset) as usize;
                     if let Some(data) = member_data_from_buffer(&tail[rel..], span.size) {
+                        debug!("serving member {} from the cached tail", span.name);
                         return Ok(Box::new(std::io::Cursor::new(data.to_vec())));
                     }
                 }
 
                 // One bounded streaming ranged GET for the member. Dropping
                 // the returned reader aborts the transfer.
+                debug!(
+                    "requesting range {}-{} for member {}",
+                    span.header_offset,
+                    span.end - 1,
+                    span.name
+                );
                 let mut request = client.get(url.clone()).header(
                     RANGE,
                     format!("bytes={}-{}", span.header_offset, span.end - 1),
@@ -444,8 +474,8 @@ impl PackageArchive {
                     .error_for_status()
                     .map_err(|e| ExtractError::ReqwestError(e.into()))?;
                 if response.status() != ::reqwest::StatusCode::PARTIAL_CONTENT {
-                    // An `If-Range` mismatch (the archive changed since it was
-                    // opened) or a server that stopped honoring ranges.
+                    // An honored `If-Range` mismatch (the archive changed since
+                    // it was opened) or a server that stopped honoring ranges.
                     return Err(ExtractError::IoError(std::io::Error::other(
                         "remote archive changed while reading it (range request returned a full response)",
                     )));
@@ -536,8 +566,9 @@ async fn scan_stream(
         };
         let path: PathBuf = entry.path().map_err(ExtractError::IoError)?.into_owned();
         if remaining.remove(&path) {
+            // The header size is untrusted; cap the upfront allocation.
             let size = entry.header().size().map_err(ExtractError::IoError)?;
-            let mut buf = Vec::with_capacity(size as usize);
+            let mut buf = Vec::with_capacity(size.min(MAX_PREALLOC) as usize);
             entry
                 .read_to_end(&mut buf)
                 .await
@@ -601,10 +632,17 @@ fn find_section_member(
         .ok_or(ExtractError::MissingComponent)
 }
 
+/// Strips `.` components so `./info/index.json` matches `info/index.json`.
+fn normalize(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
 /// Parses a ZIP local file header at the start of `buf` and returns the
 /// member data if `buf` contains all of it.
 fn member_data_from_buffer(buf: &[u8], size: u64) -> Option<&[u8]> {
-    if buf.len() < 30 || buf[0..4] != [0x50, 0x4b, 0x03, 0x04] {
+    if buf.len() < 30 || buf[0..4] != LOCAL_HEADER_MAGIC {
         return None;
     }
     let name_len = u16::from_le_bytes([buf[26], buf[27]]) as usize;
@@ -622,7 +660,7 @@ async fn skip_local_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), E
         .read_exact(&mut header)
         .await
         .map_err(ExtractError::IoError)?;
-    if header[0..4] != [0x50, 0x4b, 0x03, 0x04] {
+    if header[0..4] != LOCAL_HEADER_MAGIC {
         return Err(ExtractError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "expected a ZIP local file header",
@@ -638,8 +676,8 @@ async fn skip_local_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), E
 }
 
 /// Returns true for errors that mean "sparse access is unavailable" and the
-/// caller should fall back to a spooled full download.
-fn sparse_unsupported(err: &ExtractError) -> bool {
+/// caller should fall back to a full download.
+pub(crate) fn sparse_unsupported(err: &ExtractError) -> bool {
     match err {
         // Servers that ignore the `Range` header answer with a plain `200 OK`
         // that carries no `Content-Range` header.
@@ -807,6 +845,64 @@ mod tests {
             2,
             "all reads served from the spool file"
         );
+    }
+
+    /// A package larger than the 64 KiB tail: payload reads must go through
+    /// the ranged member-GET path (local header skip, `If-Range`, end bound).
+    #[tokio::test]
+    async fn test_sparse_large_package() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/sparse-test-1.0.0-0.conda");
+        let url = test_server::serve_file(fixture).await;
+        let (client, requests) = counting_client();
+
+        let archive = PackageArchive::from_url(client, url).await.unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 1, "open = 1 request");
+
+        // The info member sits inside the tail: no extra request. Leading
+        // `./` components are normalized away.
+        let index = archive
+            .read_file("./info/index.json")
+            .await
+            .unwrap()
+            .expect("index.json should exist");
+        assert!(!index.is_empty());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        // The payload member lies outside the tail: exactly one ranged GET,
+        // shared by both files.
+        let files = archive
+            .read_files(["bin/first-file.txt", "share/last-file.txt"])
+            .await
+            .unwrap();
+        assert_eq!(
+            files[Path::new("bin/first-file.txt")].as_deref(),
+            Some(b"first payload file\n".as_slice())
+        );
+        assert_eq!(
+            files[Path::new("share/last-file.txt")].as_deref(),
+            Some(b"last payload file\n".as_slice())
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "payload batch = 1 ranged request"
+        );
+
+        let names = archive.list_files(Section::Content).await.unwrap();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn test_list_files() {
+        let archive = PackageArchive::from_path(conda_test_file()).await.unwrap();
+        let info = archive.list_files(Section::Info).await.unwrap();
+        assert!(
+            info.iter().any(|p| p == Path::new("info/index.json")),
+            "{info:?}"
+        );
+        let content = archive.list_files(Section::Content).await.unwrap();
+        assert_eq!(content, vec![PathBuf::from("clobber")]);
     }
 
     #[tokio::test]

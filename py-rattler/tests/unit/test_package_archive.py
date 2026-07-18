@@ -62,3 +62,12 @@ async def test_tar_bz2(tar_bz2_package: str) -> None:
     names = [entry.name async for entry in archive.stream("pkg")]
     assert "clobber.txt" in names
     assert not any(name.startswith("info/") for name in names)
+
+
+@pytest.mark.asyncio
+async def test_list_files(conda_package: str) -> None:
+    archive = await PackageArchive.from_path(conda_package)
+    info = await archive.list_files("info")
+    assert "info/index.json" in info
+    content = await archive.list_files("pkg")
+    assert content == ["clobber"]
