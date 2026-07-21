@@ -59,7 +59,7 @@ pub async fn serve_file_no_ranges(file_path: impl AsRef<Path>) -> Url {
 }
 
 /// Spawn a local file server that answers any suffix range (`bytes=-N`) with
-/// `416 Range Not Satisfiable`, mimicking JFrog Artifactory when the range
+/// `416 Range Not Satisfiable`, mimicking `JFrog` Artifactory when the range
 /// exceeds the object length.
 pub async fn serve_file_416_suffix(file_path: impl AsRef<Path>) -> Url {
     let file_path = file_path.as_ref();

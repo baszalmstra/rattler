@@ -1132,7 +1132,7 @@ mod tests {
         assert!(run_exports.is_none());
     }
 
-    /// JFrog Artifactory answers suffix ranges beyond the object length with
+    /// `JFrog` Artifactory answers suffix ranges beyond the object length with
     /// 416; the handle must fall back to spooling.
     #[tokio::test]
     async fn test_conda_416_suffix_fallback() {
