@@ -140,12 +140,13 @@ impl PyPackageArchive {
         })
     }
 
-    /// Reads and parses `info/run_exports.json`.
+    /// Reads and parses `info/run_exports.json`; `None` when absent.
     pub fn run_exports_json<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            let value: RunExportsJson = inner.read_package_file().await.map_err(io_error)?;
-            Ok(PyRunExportsJson::from(value))
+            let value: Option<RunExportsJson> =
+                inner.try_read_package_file().await.map_err(io_error)?;
+            Ok(value.map(PyRunExportsJson::from))
         })
     }
 
@@ -215,8 +216,16 @@ impl PySectionStream {
                         .map_err(io_error)?
                         .to_string_lossy()
                         .into_owned();
-                    let size = entry.header().size().map_err(io_error)?;
-                    let is_file = entry.header().entry_type().is_file();
+                    let header = entry.header();
+                    let size = header.size().map_err(io_error)?;
+                    let kind = header.entry_type();
+                    let is_file = kind.is_file();
+                    let is_symlink = kind.is_symlink() || kind.is_hard_link();
+                    let link_target = entry
+                        .link_name()
+                        .ok()
+                        .flatten()
+                        .map(|t| t.to_string_lossy().into_owned());
                     guard.generation += 1;
                     let generation = guard.generation;
                     guard.current = Some(entry);
@@ -225,6 +234,8 @@ impl PySectionStream {
                         name,
                         size,
                         is_file,
+                        is_symlink,
+                        link_target,
                         generation,
                         state: state.clone(),
                     })
@@ -244,14 +255,26 @@ pub struct PyArchiveEntry {
     size: u64,
     #[pyo3(get)]
     is_file: bool,
+    #[pyo3(get)]
+    is_symlink: bool,
+    #[pyo3(get)]
+    link_target: Option<String>,
     generation: u64,
     state: Arc<tokio::sync::Mutex<StreamState>>,
 }
 
 #[pymethods]
 impl PyArchiveEntry {
-    /// Reads the contents of this entry.
+    /// Reads the contents of this entry. Reading a link is an error; links
+    /// are not followed.
     pub fn read<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        if self.is_symlink {
+            return Err(PyIOError::new_err(format!(
+                "cannot read '{}': it is a link to '{}' and links are not followed",
+                self.name,
+                self.link_target.as_deref().unwrap_or_default()
+            )));
+        }
         let state = self.state.clone();
         let generation = self.generation;
         future_into_py(py, async move {

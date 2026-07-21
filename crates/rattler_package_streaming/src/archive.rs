@@ -9,6 +9,11 @@
 //! `.tar.bz2` archives and servers without range support transparently fall
 //! back to downloading the archive once into a temporary spool file.
 //!
+//! Reads are not retried internally: a network error mid-read surfaces as an
+//! [`ExtractError`] (check [`ExtractError::should_retry`]) and the call can
+//! simply be repeated. Symbolic links inside the archive are surfaced but
+//! never followed; reading one is an error.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -234,7 +239,8 @@ impl PackageArchive {
     ///
     /// Contents are not cached: every call streams the containing section
     /// again up to the requested file. Prefer [`PackageArchive::read_files`]
-    /// with one batch over repeated calls.
+    /// with one batch over repeated calls. Requesting a path that is a
+    /// symbolic or hard link is an error; links are not followed.
     ///
     /// ```rust,no_run
     /// # #[tokio::main]
@@ -259,7 +265,8 @@ impl PackageArchive {
     ///
     /// Calls are independent and may run concurrently, but contents are not
     /// cached: a repeated call streams its sections again, so batch all
-    /// needed paths into a single call where possible.
+    /// needed paths into a single call where possible. Requesting a path
+    /// that is a symbolic or hard link is an error; links are not followed.
     ///
     /// ```rust,no_run
     /// # #[tokio::main]
@@ -304,12 +311,30 @@ impl PackageArchive {
         }
 
         let passes = groups.into_iter().map(|(section, group)| async move {
-            let mut stream = self.stream(section).await?;
-            scan_stream(&mut stream, group).await
+            match self.stream(section).await {
+                Ok(mut stream) => scan_stream(&mut stream, group).await,
+                // A section that is absent from the archive simply does not
+                // contain any of the requested paths.
+                Err(ExtractError::MissingComponent) => {
+                    Ok(group.into_iter().map(|path| (path, None)).collect())
+                }
+                Err(err) => Err(err),
+            }
         });
         let results = futures::future::try_join_all(passes).await?;
 
         Ok(results.into_iter().flatten().collect())
+    }
+
+    /// Reads and parses a typed [`PackageFile`], or `None` when the file is
+    /// not present in the package (common for `run_exports.json`).
+    pub async fn try_read_package_file<P: PackageFile>(&self) -> Result<Option<P>, ExtractError> {
+        match self.read_file(P::package_path()).await? {
+            None => Ok(None),
+            Some(bytes) => P::from_slice(&bytes).map(Some).map_err(|e| {
+                ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e)
+            }),
+        }
     }
 
     /// Reads and parses a typed [`PackageFile`] (e.g. `IndexJson`,
@@ -326,15 +351,13 @@ impl PackageArchive {
     /// # }
     /// ```
     pub async fn read_package_file<P: PackageFile>(&self) -> Result<P, ExtractError> {
-        let bytes = self
-            .read_file(P::package_path())
+        self.try_read_package_file()
             .await?
-            .ok_or(ExtractError::MissingComponent)?;
-        P::from_slice(&bytes)
-            .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
+            .ok_or(ExtractError::MissingComponent)
     }
 
-    /// Lists the paths of all files in one section.
+    /// Lists the paths of all files (including symbolic links) in one
+    /// section.
     ///
     /// For [`Section::Info`] this is usually served from the cached archive
     /// tail without extra requests. For [`Section::Content`] it streams the
@@ -357,7 +380,8 @@ impl PackageArchive {
         let mut stream = self.stream(section).await?;
         let mut paths = Vec::new();
         while let Some(entry) = stream.next_entry().await? {
-            if entry.header().entry_type().is_file() {
+            let kind = entry.header().entry_type();
+            if kind.is_file() || kind.is_symlink() || kind.is_hard_link() {
                 paths.push(entry.path().map_err(ExtractError::IoError)?.into_owned());
             }
         }
@@ -555,10 +579,15 @@ impl PackageArchive {
                     span.end - 1,
                     span.name
                 );
-                let mut request = client.get(url.clone()).header(
-                    RANGE,
-                    format!("bytes={}-{}", span.header_offset, span.end - 1),
-                );
+                let mut request = client
+                    .get(url.clone())
+                    .header(
+                        RANGE,
+                        format!("bytes={}-{}", span.header_offset, span.end - 1),
+                    )
+                    // Forbid content-coding: byte math relies on the exact
+                    // stored representation.
+                    .header(http::header::ACCEPT_ENCODING, "identity");
                 if let Some(validator) = validator {
                     request = request.header(IF_RANGE, validator);
                 }
@@ -661,6 +690,22 @@ async fn scan_stream(
         };
         let path: PathBuf = entry.path().map_err(ExtractError::IoError)?.into_owned();
         if remaining.remove(&path) {
+            let kind = entry.header().entry_type();
+            if kind.is_symlink() || kind.is_hard_link() {
+                let target = entry
+                    .link_name()
+                    .ok()
+                    .flatten()
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_default();
+                return Err(ExtractError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "cannot read '{}': it is a link to '{target}' and links are not followed",
+                        path.display()
+                    ),
+                )));
+            }
             // The header size is untrusted; cap the upfront allocation.
             let size = entry.header().size().map_err(ExtractError::IoError)?;
             let mut buf = Vec::with_capacity(size.min(MAX_PREALLOC) as usize);
@@ -998,6 +1043,93 @@ mod tests {
         );
         let content = archive.list_files(Section::Content).await.unwrap();
         assert_eq!(content, vec![PathBuf::from("clobber")]);
+    }
+
+    #[tokio::test]
+    async fn test_symlinks_surfaced_not_followed() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/symlink-test-1.0.0-0.conda");
+        let archive = PackageArchive::from_path(&fixture).await.unwrap();
+
+        // Symbolic links show up in listings...
+        let files = archive.list_files(Section::Content).await.unwrap();
+        assert!(
+            files.contains(&PathBuf::from("lib/liblink.so")),
+            "{files:?}"
+        );
+        assert!(
+            files.contains(&PathBuf::from("lib/libreal.so.1")),
+            "{files:?}"
+        );
+
+        // ...their targets read fine...
+        let real = archive.read_file("lib/libreal.so.1").await.unwrap();
+        assert_eq!(real.as_deref(), Some(b"real library bytes".as_slice()));
+
+        // ...but reading a link itself is an error.
+        let err = archive.read_file("lib/liblink.so").await.unwrap_err();
+        assert!(err.to_string().contains("links are not followed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_missing_section_reads_as_none() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/info-only-1.0.0-0.conda");
+        let archive = PackageArchive::from_path(&fixture).await.unwrap();
+
+        // A path in an absent section is simply not in the archive.
+        let files = archive
+            .read_files(["bin/missing", "info/index.json"])
+            .await
+            .unwrap();
+        assert!(files[Path::new("bin/missing")].is_none());
+        assert!(files[Path::new("info/index.json")].is_some());
+
+        // Asking for the section itself is still an error.
+        assert!(matches!(
+            archive.stream(Section::Content).await,
+            Err(ExtractError::MissingComponent)
+        ));
+    }
+
+    /// The fixture uses zip64 local headers (0xFFFFFFFF sizes resolved from
+    /// the zip64 extra field).
+    #[tokio::test]
+    async fn test_zip64_local_headers() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/zip64-test-1.0.0-0.conda");
+        let url = test_server::serve_file(fixture).await;
+        let (client, _) = counting_client();
+
+        let archive = PackageArchive::from_url(client, url).await.unwrap();
+        let content = archive.read_file("bin/hello.txt").await.unwrap();
+        assert_eq!(content.as_deref(), Some(b"zip64 payload\n".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn test_tar_bz2_list_files() {
+        let archive = PackageArchive::from_path(tar_bz2_test_file())
+            .await
+            .unwrap();
+        let info = archive.list_files(Section::Info).await.unwrap();
+        assert!(info.contains(&PathBuf::from("info/index.json")), "{info:?}");
+        let content = archive.list_files(Section::Content).await.unwrap();
+        assert!(
+            content.contains(&PathBuf::from("clobber.txt")),
+            "{content:?}"
+        );
+        assert!(
+            content.iter().all(|p| !p.starts_with("info")),
+            "{content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_read_package_file_absent() {
+        use rattler_conda_types::package::RunExportsJson;
+        let archive = PackageArchive::from_path(conda_test_file()).await.unwrap();
+        let run_exports: Option<RunExportsJson> = archive.try_read_package_file().await.unwrap();
+        assert!(run_exports.is_none());
     }
 
     #[tokio::test]

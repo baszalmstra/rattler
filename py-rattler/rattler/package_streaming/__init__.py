@@ -84,7 +84,8 @@ class ArchiveEntry:
     One tar entry yielded while streaming a section of a package archive.
 
     Call `read()` to get the entry contents *before* advancing the stream;
-    not calling it skips the entry cheaply.
+    not calling it skips the entry cheaply. Reading a link entry raises an
+    `OSError`; links are surfaced but never followed.
     """
 
     def __init__(self, inner: PyArchiveEntry) -> None:
@@ -105,8 +106,18 @@ class ArchiveEntry:
         """True if the entry is a regular file (not a directory or link)."""
         return self._inner.is_file
 
+    @property
+    def is_symlink(self) -> bool:
+        """True if the entry is a symbolic or hard link."""
+        return self._inner.is_symlink
+
+    @property
+    def link_target(self) -> Optional[str]:
+        """The target of a link entry, or `None` for other entries."""
+        return self._inner.link_target
+
     async def read(self) -> bytes:
-        """Reads the contents of this entry."""
+        """Reads the contents of this entry. Raises `OSError` for links."""
         return await self._inner.read()
 
     def __repr__(self) -> str:
@@ -148,6 +159,11 @@ class PackageArchive:
     they need. `.tar.bz2` archives and servers without range support
     transparently fall back to downloading the archive once into a temporary
     file.
+
+    Reads are not retried internally: a network error mid-read raises and the
+    call can simply be repeated. Symbolic links inside the archive are
+    surfaced but never followed; reading one raises an `OSError`. Paths are
+    exchanged as UTF-8 strings.
 
     Examples
     --------
@@ -198,7 +214,8 @@ class PackageArchive:
 
         Contents are not cached: every call streams the containing section
         again up to the requested file. When reading more than one file,
-        prefer a single `read_files` call.
+        prefer a single `read_files` call. Requesting a path that is a link
+        raises an `OSError`; links are not followed.
 
         Examples
         --------
@@ -220,7 +237,8 @@ class PackageArchive:
 
         Calls are independent and may run concurrently, but contents are not
         cached: a repeated call streams its sections again, so batch all
-        needed paths into a single call where possible.
+        needed paths into a single call where possible. Requesting a path
+        that is a link raises an `OSError`; links are not followed.
 
         Examples
         --------
@@ -246,13 +264,20 @@ class PackageArchive:
         """Reads and parses `info/paths.json`."""
         return PathsJson._from_py_paths_json(await self._inner.paths_json())
 
-    async def run_exports_json(self) -> RunExportsJson:
-        """Reads and parses `info/run_exports.json`."""
-        return RunExportsJson._from_py_run_exports_json(await self._inner.run_exports_json())
+    async def run_exports_json(self) -> Optional[RunExportsJson]:
+        """
+        Reads and parses `info/run_exports.json`, or returns `None` when the
+        package has none.
+        """
+        value = await self._inner.run_exports_json()
+        if value is None:
+            return None
+        return RunExportsJson._from_py_run_exports_json(value)
 
     async def list_files(self, section: Literal["info", "pkg"] = "pkg") -> List[str]:
         """
-        Lists the paths of all files in one section.
+        Lists the paths of all files (including symbolic links) in one
+        section.
 
         For `"info"` this is usually served from the cached archive tail. For
         `"pkg"` it streams the entire section; prefer `paths_json()` when only
@@ -275,6 +300,8 @@ class PackageArchive:
         Every call opens a new independent forward-only iterator (for remote
         archives: a new request). Entries that are not `read()` are skipped
         cheaply, and abandoning the iterator aborts any underlying transfer.
+        If an iteration step is cancelled (e.g. by a timeout), discard the
+        iterator: the underlying stream position is no longer well-defined.
 
         Examples
         --------
