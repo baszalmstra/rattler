@@ -174,7 +174,16 @@ class PackageArchive:
 
     @staticmethod
     async def from_path(path: PathLike[str] | str) -> PackageArchive:
-        """Opens a package archive from a local file."""
+        """
+        Opens a package archive from a local file.
+
+        Examples
+        --------
+        ```python
+        pkg = await PackageArchive.from_path("numpy-2.1.3-py312h58c1407_0.conda")
+        index = await pkg.index_json()
+        ```
+        """
         return PackageArchive(await PyPackageArchive.from_path(path))
 
     @property
@@ -190,6 +199,14 @@ class PackageArchive:
         Contents are not cached: every call streams the containing section
         again up to the requested file. When reading more than one file,
         prefer a single `read_files` call.
+
+        Examples
+        --------
+        ```python
+        recipe = await pkg.read_file("info/recipe/meta.yaml")
+        if recipe is None:
+            print("package has no recipe")
+        ```
         """
         return await self._inner.read_file(path)
 
@@ -204,6 +221,16 @@ class PackageArchive:
         Calls are independent and may run concurrently, but contents are not
         cached: a repeated call streams its sections again, so batch all
         needed paths into a single call where possible.
+
+        Examples
+        --------
+        ```python
+        # One pass over the payload, one over info, fetched concurrently.
+        files = await pkg.read_files(["info/index.json", "lib/libfoo.so", "bin/foo"])
+        for path, contents in files.items():
+            if contents is None:
+                print(f"{path}: not in archive")
+        ```
         """
         return await self._inner.read_files(list(paths))
 
@@ -230,6 +257,14 @@ class PackageArchive:
         For `"info"` this is usually served from the cached archive tail. For
         `"pkg"` it streams the entire section; prefer `paths_json()` when only
         paths are needed.
+
+        Examples
+        --------
+        ```python
+        # Usually free: the info section tends to sit in the cached tail.
+        for path in await pkg.list_files("info"):
+            print(path)
+        ```
         """
         return await self._inner.list_files(section)
 
@@ -239,12 +274,15 @@ class PackageArchive:
 
         Every call opens a new independent forward-only iterator (for remote
         archives: a new request). Entries that are not `read()` are skipped
-        cheaply, and abandoning the iterator aborts any underlying transfer:
+        cheaply, and abandoning the iterator aborts any underlying transfer.
 
+        Examples
+        --------
         ```python
         async for entry in pkg.stream("pkg"):
             if entry.name.endswith(".so"):
-                data = await entry.read()
+                data = await entry.read()  # read before advancing
+            # entries that are not read are skipped cheaply
         ```
         """
         return _SectionStream(lambda: self._inner.stream(section))

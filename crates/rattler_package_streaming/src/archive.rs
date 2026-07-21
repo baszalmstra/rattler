@@ -199,6 +199,18 @@ impl PackageArchive {
     }
 
     /// Opens a package archive from a local file.
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// use rattler_package_streaming::archive::PackageArchive;
+    ///
+    /// let archive = PackageArchive::from_path("numpy-2.1.3-py312h58c1407_0.conda")
+    ///     .await
+    ///     .unwrap();
+    /// # drop(archive);
+    /// # }
+    /// ```
     pub async fn from_path(path: impl AsRef<Path>) -> Result<Self, ExtractError> {
         let path = path.as_ref();
         let archive_type =
@@ -223,6 +235,17 @@ impl PackageArchive {
     /// Contents are not cached: every call streams the containing section
     /// again up to the requested file. Prefer [`PackageArchive::read_files`]
     /// with one batch over repeated calls.
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let archive = rattler_package_streaming::archive::PackageArchive::from_path("pkg.conda").await.unwrap();
+    /// match archive.read_file("info/recipe/meta.yaml").await.unwrap() {
+    ///     Some(bytes) => println!("recipe: {}", String::from_utf8_lossy(&bytes)),
+    ///     None => println!("package has no recipe"),
+    /// }
+    /// # }
+    /// ```
     pub async fn read_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>, ExtractError> {
         let path = normalize(path.as_ref());
         let mut result = self.read_files([path.clone()]).await?;
@@ -237,6 +260,24 @@ impl PackageArchive {
     /// Calls are independent and may run concurrently, but contents are not
     /// cached: a repeated call streams its sections again, so batch all
     /// needed paths into a single call where possible.
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let archive = rattler_package_streaming::archive::PackageArchive::from_path("pkg.conda").await.unwrap();
+    /// // One pass over the payload, one over info, fetched concurrently.
+    /// let files = archive
+    ///     .read_files(["info/index.json", "lib/libfoo.so", "bin/foo"])
+    ///     .await
+    ///     .unwrap();
+    /// for (path, contents) in &files {
+    ///     match contents {
+    ///         Some(bytes) => println!("{}: {} bytes", path.display(), bytes.len()),
+    ///         None => println!("{}: not in archive", path.display()),
+    ///     }
+    /// }
+    /// # }
+    /// ```
     pub async fn read_files(
         &self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
@@ -273,6 +314,17 @@ impl PackageArchive {
 
     /// Reads and parses a typed [`PackageFile`] (e.g. `IndexJson`,
     /// `PathsJson`) from the package.
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let archive = rattler_package_streaming::archive::PackageArchive::from_path("pkg.conda").await.unwrap();
+    /// use rattler_conda_types::package::IndexJson;
+    ///
+    /// let index: IndexJson = archive.read_package_file().await.unwrap();
+    /// println!("{} {}", index.name.as_normalized(), index.version);
+    /// # }
+    /// ```
     pub async fn read_package_file<P: PackageFile>(&self) -> Result<P, ExtractError> {
         let bytes = self
             .read_file(P::package_path())
@@ -288,6 +340,19 @@ impl PackageArchive {
     /// tail without extra requests. For [`Section::Content`] it streams the
     /// entire section; prefer reading `info/paths.json` when only paths are
     /// needed.
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let archive = rattler_package_streaming::archive::PackageArchive::from_path("pkg.conda").await.unwrap();
+    /// use rattler_package_streaming::archive::Section;
+    ///
+    /// // Usually free: the info section tends to sit in the cached tail.
+    /// for path in archive.list_files(Section::Info).await.unwrap() {
+    ///     println!("{}", path.display());
+    /// }
+    /// # }
+    /// ```
     pub async fn list_files(&self, section: Section) -> Result<Vec<PathBuf>, ExtractError> {
         let mut stream = self.stream(section).await?;
         let mut paths = Vec::new();
@@ -304,6 +369,25 @@ impl PackageArchive {
     ///
     /// Every call opens a new independent forward-only stream (for remote
     /// archives: a new request).
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let archive = rattler_package_streaming::archive::PackageArchive::from_path("pkg.conda").await.unwrap();
+    /// use rattler_package_streaming::archive::Section;
+    /// use tokio::io::AsyncReadExt;
+    ///
+    /// let mut stream = archive.stream(Section::Content).await.unwrap();
+    /// while let Some(mut entry) = stream.next_entry().await.unwrap() {
+    ///     let path = entry.path().unwrap().into_owned();
+    ///     if path.extension().is_some_and(|ext| ext == "so") {
+    ///         let mut bytes = Vec::new();
+    ///         entry.read_to_end(&mut bytes).await.unwrap();
+    ///         println!("{}: {} bytes", path.display(), bytes.len());
+    ///     } // entries that are not read are skipped cheaply
+    /// }
+    /// # }
+    /// ```
     pub async fn stream(&self, section: Section) -> Result<SectionStream, ExtractError> {
         match &*self.backend {
             Backend::Sparse { .. } | Backend::LocalConda { .. } => {
