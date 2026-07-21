@@ -11,6 +11,8 @@ use rattler_digest::{Md5Hash, Sha256Hash};
 #[cfg(feature = "reqwest")]
 use rattler_redaction::Redact;
 
+#[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+pub mod archive;
 pub mod read;
 pub mod seek;
 
@@ -51,6 +53,9 @@ pub enum ExtractError {
 
     #[error("a component is missing from the Conda archive")]
     MissingComponent,
+
+    #[error("cannot read {}: links are not followed", .0.join(", "))]
+    LinksNotFollowed(Vec<String>),
 
     #[error("unsupported compression method")]
     UnsupportedCompressionMethod,
