@@ -119,3 +119,4 @@ async def test_from_url_spooled_fallback(conda_package: str) -> None:
         assert await archive.read_file("clobber") == b"clobber-fd-1\n"
     finally:
         server.shutdown()
+        server.server_close()

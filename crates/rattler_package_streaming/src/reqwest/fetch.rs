@@ -156,6 +156,28 @@ mod tests {
         assert!(!raw.is_empty());
     }
 
+    /// Both the sparse path and the streaming fallback must reject links
+    /// with the same contract.
+    #[tokio::test]
+    async fn test_link_rejected_on_both_paths() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/symlink-test-1.0.0-0.conda");
+        let link = std::path::Path::new("lib/liblink.so");
+        let client = reqwest_middleware::ClientWithMiddleware::from(reqwest::Client::new());
+
+        let sparse_url = test_server::serve_file(&fixture).await;
+        let err = fetch_file_from_remote_url(client.clone(), sparse_url, link)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("links are not followed"), "{err}");
+
+        let no_range_url = test_server::serve_file_no_ranges(&fixture).await;
+        let err = fetch_file_from_remote_url(client, no_range_url, link)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("links are not followed"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_fetch_file_from_remote_tar_bz2_fallback() {
         let tar_bz2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

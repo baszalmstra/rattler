@@ -256,6 +256,17 @@ pub(crate) async fn get_file_from_tar_archive<R: tokio::io::AsyncRead + Unpin>(
         let mut entry = entry.map_err(ExtractError::IoError)?;
         let path = entry.path().map_err(ExtractError::IoError)?;
         if path.as_ref() == file_name {
+            let kind = entry.header().entry_type();
+            if kind.is_symlink() || kind.is_hard_link() {
+                // Same contract as the sparse path in `crate::archive`.
+                return Err(ExtractError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "cannot read '{}': links are not followed",
+                        file_name.display()
+                    ),
+                )));
+            }
             let size = entry.header().size().map_err(ExtractError::IoError)?;
             let mut buf = Vec::with_capacity(size as usize);
             entry

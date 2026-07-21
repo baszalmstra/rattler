@@ -382,7 +382,7 @@ impl PackageArchive {
         while let Some(entry) = stream.next_entry().await? {
             let kind = entry.header().entry_type();
             if kind.is_file() || kind.is_symlink() || kind.is_hard_link() {
-                paths.push(entry.path().map_err(ExtractError::IoError)?.into_owned());
+                paths.push(normalize(&entry.path().map_err(ExtractError::IoError)?));
             }
         }
         Ok(paths)
@@ -684,11 +684,12 @@ async fn scan_stream(
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, ExtractError> {
     let mut remaining: HashSet<PathBuf> = paths.into_iter().collect();
     let mut out = HashMap::with_capacity(remaining.len());
+    let mut links: Vec<String> = Vec::new();
     while !remaining.is_empty() {
         let Some(mut entry) = stream.next_entry().await? else {
             break;
         };
-        let path: PathBuf = entry.path().map_err(ExtractError::IoError)?.into_owned();
+        let path = normalize(&entry.path().map_err(ExtractError::IoError)?);
         if remaining.remove(&path) {
             let kind = entry.header().entry_type();
             if kind.is_symlink() || kind.is_hard_link() {
@@ -698,13 +699,10 @@ async fn scan_stream(
                     .flatten()
                     .map(|t| t.display().to_string())
                     .unwrap_or_default();
-                return Err(ExtractError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    format!(
-                        "cannot read '{}': it is a link to '{target}' and links are not followed",
-                        path.display()
-                    ),
-                )));
+                // Finish the scan so the error names every offending path
+                // instead of discarding the whole batch on the first one.
+                links.push(format!("'{}' (links to '{target}')", path.display()));
+                continue;
             }
             // The header size is untrusted; cap the upfront allocation.
             let size = entry.header().size().map_err(ExtractError::IoError)?;
@@ -715,6 +713,12 @@ async fn scan_stream(
                 .map_err(ExtractError::IoError)?;
             out.insert(path, Some(buf));
         }
+    }
+    if !links.is_empty() {
+        return Err(ExtractError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("cannot read {}: links are not followed", links.join(", ")),
+        )));
     }
     for path in remaining {
         out.insert(path, None);
@@ -1092,8 +1096,9 @@ mod tests {
         ));
     }
 
-    /// The fixture uses zip64 local headers (0xFFFFFFFF sizes resolved from
-    /// the zip64 extra field).
+    /// The fixture uses zip64 local headers; the reader must skip their
+    /// zip64 extra fields correctly (sizes themselves come from the central
+    /// directory).
     #[tokio::test]
     async fn test_zip64_local_headers() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1173,6 +1178,54 @@ mod tests {
         // The payload member no longer matches the parsed index; the read
         // must error rather than return bytes from the wrong archive.
         assert!(archive.read_file("bin/first-file.txt").await.is_err());
+    }
+
+    /// Entries stored with a leading `./` (as `tar -C dir -c .` produces)
+    /// must round-trip between `list_files` and `read_file`.
+    #[tokio::test]
+    async fn test_dot_slash_entries_round_trip() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/dotslash-test-1.0.0-0.conda");
+        let archive = PackageArchive::from_path(&fixture).await.unwrap();
+
+        let files = archive.list_files(Section::Content).await.unwrap();
+        assert_eq!(files, vec![PathBuf::from("lib/data.txt")]);
+
+        for spelling in ["lib/data.txt", "./lib/data.txt"] {
+            let content = archive.read_file(spelling).await.unwrap();
+            assert_eq!(
+                content.as_deref(),
+                Some(b"dot slash payload\n".as_slice()),
+                "{spelling}"
+            );
+        }
+        assert!(
+            archive
+                .read_file("info/index.json")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A link in a batch fails the read, but only after the scan completes,
+    /// with an error naming the offending path.
+    #[tokio::test]
+    async fn test_link_error_names_offending_path() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/symlink-test-1.0.0-0.conda");
+        let archive = PackageArchive::from_path(&fixture).await.unwrap();
+
+        let err = archive
+            .read_files(["lib/libreal.so.1", "lib/liblink.so"])
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("'lib/liblink.so'"), "{message}");
+        assert!(
+            !message.contains("'lib/libreal.so.1'"),
+            "the regular file must not be reported as offending: {message}"
+        );
     }
 
     #[tokio::test]
