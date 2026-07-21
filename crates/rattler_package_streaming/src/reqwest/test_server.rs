@@ -58,6 +58,45 @@ pub async fn serve_file_no_ranges(file_path: impl AsRef<Path>) -> Url {
         .unwrap()
 }
 
+/// Spawn a local file server that answers any suffix range (`bytes=-N`) with
+/// `416 Range Not Satisfiable`, mimicking JFrog Artifactory when the range
+/// exceeds the object length.
+pub async fn serve_file_416_suffix(file_path: impl AsRef<Path>) -> Url {
+    let file_path = file_path.as_ref();
+    let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
+    let dir = file_path.parent().unwrap();
+
+    let app = axum::Router::new()
+        .fallback_service(ServeDir::new(dir))
+        .layer(middleware::from_fn(reject_suffix_range));
+
+    let addr = SocketAddr::new([127, 0, 0, 1].into(), 0);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    format!("http://{}:{}/{file_name}", addr.ip(), addr.port())
+        .parse()
+        .unwrap()
+}
+
+async fn reject_suffix_range(req: Request, next: Next) -> Response {
+    let is_suffix = req
+        .headers()
+        .get(http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|range| range.starts_with("bytes=-"));
+    if is_suffix {
+        return Response::builder()
+            .status(http::StatusCode::RANGE_NOT_SATISFIABLE)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+    next.run(req).await
+}
+
 async fn strip_range(mut req: Request, next: Next) -> Response {
     req.headers_mut().remove(http::header::RANGE);
     let mut response = next.run(req).await;

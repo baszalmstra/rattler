@@ -1132,6 +1132,49 @@ mod tests {
         assert!(run_exports.is_none());
     }
 
+    /// JFrog Artifactory answers suffix ranges beyond the object length with
+    /// 416; the handle must fall back to spooling.
+    #[tokio::test]
+    async fn test_conda_416_suffix_fallback() {
+        let url = test_server::serve_file_416_suffix(conda_test_file()).await;
+        let (client, requests) = counting_client();
+
+        let archive = PackageArchive::from_url(client, url).await.unwrap();
+        assert_eq!(archive.access(), ArchiveAccess::Spooled);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "rejected range probe + one full download"
+        );
+        let content = archive.read_file("clobber").await.unwrap().unwrap();
+        assert_eq!(String::from_utf8(content).unwrap(), "clobber-fd-1\n");
+    }
+
+    /// A republished archive must fail loudly, not yield garbage — even on
+    /// servers (like this test server) that ignore `If-Range`.
+    #[tokio::test]
+    async fn test_archive_replaced_mid_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("replaced-test-1.0.0-0.conda");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test-data/sparse/sparse-test-1.0.0-0.conda"),
+            &served,
+        )
+        .unwrap();
+        let url = test_server::serve_file(&served).await;
+        let (client, _) = counting_client();
+
+        let archive = PackageArchive::from_url(client, url).await.unwrap();
+
+        // Replace the archive on the server with a different package.
+        std::fs::copy(conda_test_file(), &served).unwrap();
+
+        // The payload member no longer matches the parsed index; the read
+        // must error rather than return bytes from the wrong archive.
+        assert!(archive.read_file("bin/first-file.txt").await.is_err());
+    }
+
     #[tokio::test]
     async fn test_local_conda() {
         let archive = PackageArchive::from_path(conda_test_file()).await.unwrap();
