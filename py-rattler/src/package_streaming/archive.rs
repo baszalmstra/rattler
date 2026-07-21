@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyIOError, PyRuntimeError, PyStopAsyncIteration, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -12,15 +12,12 @@ use rattler_package_streaming::archive::{
 use tokio::io::AsyncReadExt;
 use url::Url;
 
+use super::io_error;
 use crate::about_json::PyAboutJson;
 use crate::index_json::PyIndexJson;
 use crate::networking::client::PyClientWithMiddleware;
 use crate::paths_json::PyPathsJson;
 use crate::run_exports_json::PyRunExportsJson;
-
-fn io_error<E: std::fmt::Display>(error: E) -> PyErr {
-    PyIOError::new_err(error.to_string())
-}
 
 fn parse_section(section: &str) -> PyResult<Section> {
     match section {
@@ -268,13 +265,6 @@ impl PyArchiveEntry {
     /// Reads the contents of this entry. Reading a link is an error; links
     /// are not followed.
     pub fn read<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        if self.is_symlink {
-            return Err(PyIOError::new_err(format!(
-                "cannot read '{}': it is a link to '{}' and links are not followed",
-                self.name,
-                self.link_target.as_deref().unwrap_or_default()
-            )));
-        }
         let state = self.state.clone();
         let generation = self.generation;
         future_into_py(py, async move {
@@ -288,10 +278,9 @@ impl PyArchiveEntry {
                 .current
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("entry has already been read"))?;
-            // The header size is untrusted; cap the upfront allocation.
-            let size = entry.header().size().map_err(io_error)?;
-            let mut buf = Vec::with_capacity(size.min(4 * 1024 * 1024) as usize);
-            entry.read_to_end(&mut buf).await.map_err(io_error)?;
+            let buf = rattler_package_streaming::archive::read_entry_contents(entry)
+                .await
+                .map_err(io_error)?;
             guard.current = None;
             Python::attach(|py| Ok(PyBytes::new(py, &buf).unbind()))
         })

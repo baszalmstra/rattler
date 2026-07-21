@@ -59,11 +59,11 @@ pub async fn fetch_package_file_sparse<P: PackageFile>(
     client: ClientWithMiddleware,
     url: Url,
 ) -> Result<P, ExtractError> {
-    let bytes = fetch_file_from_remote_sparse(client, url, P::package_path())
-        .await?
-        .ok_or(ExtractError::MissingComponent)?;
-    P::from_slice(&bytes)
-        .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
+    if CondaArchiveType::try_from(Path::new(url.path())) != Some(CondaArchiveType::Conda) {
+        return Err(ExtractError::UnsupportedArchiveType);
+    }
+    let archive = PackageArchive::open_sparse(client, url).await?;
+    archive.read_package_file().await
 }
 
 #[cfg(test)]

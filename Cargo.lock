@@ -5324,6 +5324,7 @@ dependencies = [
  "async-spooled-tempfile",
  "async-trait",
  "axum",
+ "bytes",
  "bzip2",
  "filetime",
  "fs-err",

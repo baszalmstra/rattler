@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from os import PathLike
-from typing import AsyncIterator, Callable, Coroutine, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import AsyncIterator, Dict, Iterable, List, Literal, Optional, Tuple
 
 from rattler.networking.client import Client
 from rattler.package.about_json import AboutJson
 from rattler.package.index_json import IndexJson
 from rattler.package.paths_json import PathsJson
 from rattler.package.run_exports_json import RunExportsJson
-from rattler.rattler import PyArchiveEntry, PyPackageArchive, PySectionStream
+from rattler.rattler import PyArchiveEntry, PyPackageArchive
 from rattler.rattler import download_bytes as py_download_bytes
 from rattler.rattler import download_to_path as py_download_to_path
 from rattler.rattler import download_to_writer as py_download_to_writer
@@ -122,31 +122,6 @@ class ArchiveEntry:
 
     def __repr__(self) -> str:
         return f"ArchiveEntry(name={self.name!r}, size={self.size})"
-
-
-class _SectionStream:
-    """Async iterator over the entries of one package section.
-
-    The underlying stream is opened lazily on the first `__anext__` so that
-    an iterator that is never consumed does not leave an unawaited coroutine.
-    """
-
-    def __init__(self, open_stream: Callable[[], Coroutine[None, None, PySectionStream]]) -> None:
-        self._open_stream: Optional[Callable[[], Coroutine[None, None, PySectionStream]]] = open_stream
-        self._stream: Optional[PySectionStream] = None
-
-    def __aiter__(self) -> AsyncIterator[ArchiveEntry]:
-        return self
-
-    async def __anext__(self) -> ArchiveEntry:
-        if self._stream is None:
-            if self._open_stream is None:
-                raise StopAsyncIteration
-            # Consume the opener first so a failed open exhausts the iterator
-            # instead of retrying a spent coroutine.
-            open_stream, self._open_stream = self._open_stream, None
-            self._stream = await open_stream()
-        return ArchiveEntry(await self._stream.__anext__())
 
 
 class PackageArchive:
@@ -293,7 +268,7 @@ class PackageArchive:
         """
         return await self._inner.list_files(section)
 
-    def stream(self, section: Literal["info", "pkg"] = "pkg") -> AsyncIterator[ArchiveEntry]:
+    async def stream(self, section: Literal["info", "pkg"] = "pkg") -> AsyncIterator[ArchiveEntry]:
         """
         Streams the tar entries of one section of the package.
 
@@ -312,7 +287,9 @@ class PackageArchive:
             # entries that are not read are skipped cheaply
         ```
         """
-        return _SectionStream(lambda: self._inner.stream(section))
+        inner = await self._inner.stream(section)
+        async for entry in inner:
+            yield ArchiveEntry(entry)
 
     def __repr__(self) -> str:
         return f"PackageArchive(access={self.access!r})"

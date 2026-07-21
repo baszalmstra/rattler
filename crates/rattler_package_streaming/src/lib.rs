@@ -54,6 +54,9 @@ pub enum ExtractError {
     #[error("a component is missing from the Conda archive")]
     MissingComponent,
 
+    #[error("cannot read {}: links are not followed", .0.join(", "))]
+    LinksNotFollowed(Vec<String>),
+
     #[error("unsupported compression method")]
     UnsupportedCompressionMethod,
 

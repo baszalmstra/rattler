@@ -12,63 +12,41 @@ use url::Url;
 /// Returns the URL to the file (e.g. `http://127.0.0.1:12345/file.conda`).
 pub async fn serve_file(file_path: impl AsRef<Path>) -> Url {
     let file_path = file_path.as_ref();
-    let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
-    let dir = file_path.parent().unwrap();
     let file_size = std::fs::metadata(file_path).unwrap().len();
-
-    let app = axum::Router::new()
-        .fallback_service(ServeDir::new(dir))
-        .layer(middleware::from_fn_with_state(
+    serve(file_path, |router| {
+        router.layer(middleware::from_fn_with_state(
             file_size,
             clamp_suffix_range,
-        ));
-
-    let addr = SocketAddr::new([127, 0, 0, 1].into(), 0);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    format!("http://{}:{}/{file_name}", addr.ip(), addr.port())
-        .parse()
-        .unwrap()
+        ))
+    })
+    .await
 }
 
 /// Spawn a local file server that does NOT support range requests: incoming
 /// `Range` headers are stripped, so every response is a full `200 OK`.
 pub async fn serve_file_no_ranges(file_path: impl AsRef<Path>) -> Url {
-    let file_path = file_path.as_ref();
-    let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
-    let dir = file_path.parent().unwrap();
-
-    let app = axum::Router::new()
-        .fallback_service(ServeDir::new(dir))
-        .layer(middleware::from_fn(strip_range));
-
-    let addr = SocketAddr::new([127, 0, 0, 1].into(), 0);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    format!("http://{}:{}/{file_name}", addr.ip(), addr.port())
-        .parse()
-        .unwrap()
+    serve(file_path.as_ref(), |router| {
+        router.layer(middleware::from_fn(strip_range))
+    })
+    .await
 }
 
 /// Spawn a local file server that answers any suffix range (`bytes=-N`) with
 /// `416 Range Not Satisfiable`, mimicking `JFrog` Artifactory when the range
 /// exceeds the object length.
 pub async fn serve_file_416_suffix(file_path: impl AsRef<Path>) -> Url {
-    let file_path = file_path.as_ref();
+    serve(file_path.as_ref(), |router| {
+        router.layer(middleware::from_fn(reject_suffix_range))
+    })
+    .await
+}
+
+/// Serves the directory containing `file_path` with the given middleware
+/// applied, returning the URL of the file.
+async fn serve(file_path: &Path, layer: impl FnOnce(axum::Router) -> axum::Router) -> Url {
     let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
     let dir = file_path.parent().unwrap();
-
-    let app = axum::Router::new()
-        .fallback_service(ServeDir::new(dir))
-        .layer(middleware::from_fn(reject_suffix_range));
+    let app = layer(axum::Router::new().fallback_service(ServeDir::new(dir)));
 
     let addr = SocketAddr::new([127, 0, 0, 1].into(), 0);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

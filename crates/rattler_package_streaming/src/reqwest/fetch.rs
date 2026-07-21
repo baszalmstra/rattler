@@ -7,14 +7,13 @@
 
 use rattler_conda_types::package::{CondaArchiveType, PackageFile};
 use reqwest_middleware::ClientWithMiddleware;
-use tracing::debug;
 use url::Url;
 
 pub use super::full_download::{
     fetch_file_from_remote_full_download, fetch_package_file_full_download,
 };
 use crate::ExtractError;
-use crate::archive::{PackageArchive, sparse_unsupported};
+use crate::archive::{PackageArchive, parse_package_file};
 
 /// Fetch and parse a typed [`PackageFile`] from a remote package.
 ///
@@ -44,8 +43,7 @@ pub async fn fetch_package_file_from_remote_url<P: PackageFile>(
     let bytes = fetch_file_from_remote_url(client, url, P::package_path())
         .await?
         .ok_or(ExtractError::MissingComponent)?;
-    P::from_slice(&bytes)
-        .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
+    parse_package_file(&bytes)
 }
 
 /// Fetch the raw bytes for a file path inside a remote package.
@@ -58,14 +56,10 @@ pub async fn fetch_file_from_remote_url(
     let archive_type = CondaArchiveType::try_from(std::path::Path::new(url.path()))
         .ok_or(ExtractError::UnsupportedArchiveType)?;
 
-    if archive_type == CondaArchiveType::Conda {
-        match PackageArchive::open_sparse(client.clone(), url.clone()).await {
-            Ok(archive) => return archive.read_file(target_path).await,
-            Err(err) if sparse_unsupported(&err) => {
-                debug!("sparse access unavailable ({err}), falling back to full download");
-            }
-            Err(err) => return Err(err),
-        }
+    if archive_type == CondaArchiveType::Conda
+        && let Some(archive) = PackageArchive::try_open_sparse(client.clone(), url.clone()).await?
+    {
+        return archive.read_file(target_path).await;
     }
 
     // One-shot read: stream the body and abort once the file is found,

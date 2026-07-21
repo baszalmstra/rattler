@@ -95,14 +95,17 @@ pub enum Section {
 impl Section {
     /// Returns the section a path inside the package belongs to.
     pub fn containing(path: &Path) -> Section {
-        match normalize(path).components().next() {
+        let first = path
+            .components()
+            .find(|c| !matches!(c, std::path::Component::CurDir));
+        match first {
             Some(std::path::Component::Normal(first)) if first == "info" => Section::Info,
             _ => Section::Content,
         }
     }
 
     /// The file name prefix of the ZIP member holding this section.
-    fn zip_prefix(self) -> &'static str {
+    pub(crate) fn zip_prefix(self) -> &'static str {
         match self {
             Section::Info => "info-",
             Section::Content => "pkg-",
@@ -139,6 +142,18 @@ struct MemberSpan {
 }
 
 enum Backend {
+    Conda {
+        source: CondaSource,
+        members: Vec<MemberSpan>,
+    },
+    TarBz2 {
+        path: PathBuf,
+        temp: Option<tempfile::TempPath>,
+    },
+}
+
+/// Where the bytes of a `.conda` archive come from.
+enum CondaSource {
     Sparse {
         client: ClientWithMiddleware,
         url: Url,
@@ -148,18 +163,12 @@ enum Backend {
         /// servers may ignore `If-Range`.
         validator: Option<http::HeaderValue>,
         tail_offset: u64,
-        tail: Vec<u8>,
-        members: Vec<MemberSpan>,
+        tail: bytes::Bytes,
     },
-    LocalConda {
+    Local {
         path: PathBuf,
-        members: Vec<MemberSpan>,
         /// Present when the archive was spooled from a remote; keeps the
         /// temporary file alive and distinguishes `Spooled` from `Local`.
-        temp: Option<tempfile::TempPath>,
-    },
-    LocalTarBz2 {
-        path: PathBuf,
         temp: Option<tempfile::TempPath>,
     },
 }
@@ -188,16 +197,10 @@ impl PackageArchive {
         let archive_type = CondaArchiveType::try_from(Path::new(url.path()))
             .ok_or(ExtractError::UnsupportedArchiveType)?;
 
-        if archive_type == CondaArchiveType::Conda {
-            match Self::open_sparse(client.clone(), url.clone()).await {
-                Ok(archive) => return Ok(archive),
-                Err(err) if sparse_unsupported(&err) => {
-                    debug!(
-                        "sparse access unavailable ({err}), falling back to spooled full download"
-                    );
-                }
-                Err(err) => return Err(err),
-            }
+        if archive_type == CondaArchiveType::Conda
+            && let Some(archive) = Self::try_open_sparse(client.clone(), url.clone()).await?
+        {
+            return Ok(archive);
         }
 
         Self::open_spooled(client, url, archive_type).await
@@ -225,12 +228,21 @@ impl PackageArchive {
 
     /// Returns how this handle accesses the archive.
     pub fn access(&self) -> ArchiveAccess {
-        match &*self.backend {
-            Backend::Sparse { .. } => ArchiveAccess::Sparse,
-            Backend::LocalConda { temp: None, .. } | Backend::LocalTarBz2 { temp: None, .. } => {
-                ArchiveAccess::Local
+        let temp = match &*self.backend {
+            Backend::Conda {
+                source: CondaSource::Sparse { .. },
+                ..
+            } => return ArchiveAccess::Sparse,
+            Backend::Conda {
+                source: CondaSource::Local { temp, .. },
+                ..
             }
-            Backend::LocalConda { .. } | Backend::LocalTarBz2 { .. } => ArchiveAccess::Spooled,
+            | Backend::TarBz2 { temp, .. } => temp,
+        };
+        if temp.is_some() {
+            ArchiveAccess::Spooled
+        } else {
+            ArchiveAccess::Local
         }
     }
 
@@ -253,7 +265,7 @@ impl PackageArchive {
     /// # }
     /// ```
     pub async fn read_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>, ExtractError> {
-        let path = normalize(path.as_ref());
+        let path = normalize(path.as_ref()).into_owned();
         let mut result = self.read_files([path.clone()]).await?;
         Ok(result.remove(&path).flatten())
     }
@@ -289,7 +301,10 @@ impl PackageArchive {
         &self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, ExtractError> {
-        let paths: Vec<PathBuf> = paths.into_iter().map(|p| normalize(&p.into())).collect();
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|p| normalize(&p.into()).into_owned())
+            .collect();
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
@@ -297,8 +312,8 @@ impl PackageArchive {
         // A .tar.bz2 archive is one flat tar: serve everything in a single
         // unfiltered pass. Grouping per section here would decompress the
         // whole bz2 stream once per section.
-        if matches!(&*self.backend, Backend::LocalTarBz2 { .. }) {
-            let mut stream = self.tar_bz2_stream(None).await?;
+        if let Backend::TarBz2 { path, .. } = &*self.backend {
+            let mut stream = Self::tar_bz2_stream(path, None).await?;
             return scan_stream(&mut stream, paths).await;
         }
 
@@ -331,9 +346,7 @@ impl PackageArchive {
     pub async fn try_read_package_file<P: PackageFile>(&self) -> Result<Option<P>, ExtractError> {
         match self.read_file(P::package_path()).await? {
             None => Ok(None),
-            Some(bytes) => P::from_slice(&bytes).map(Some).map_err(|e| {
-                ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e)
-            }),
+            Some(bytes) => parse_package_file(&bytes).map(Some),
         }
     }
 
@@ -382,7 +395,7 @@ impl PackageArchive {
         while let Some(entry) = stream.next_entry().await? {
             let kind = entry.header().entry_type();
             if kind.is_file() || kind.is_symlink() || kind.is_hard_link() {
-                paths.push(normalize(&entry.path().map_err(ExtractError::IoError)?));
+                paths.push(entry_path(&entry)?);
             }
         }
         Ok(paths)
@@ -414,21 +427,39 @@ impl PackageArchive {
     /// ```
     pub async fn stream(&self, section: Section) -> Result<SectionStream, ExtractError> {
         match &*self.backend {
-            Backend::Sparse { .. } | Backend::LocalConda { .. } => {
-                let raw = self.conda_section_reader(section).await?;
+            Backend::Conda { source, members } => {
+                let span = find_section_member(members, section)?;
+                let raw = Self::conda_member_reader(source, span).await?;
                 let decoder =
                     ZstdDecoder::new(tokio::io::BufReader::with_capacity(STREAM_BUF_SIZE, raw));
                 Ok(SectionStream::new(Box::new(decoder), None))
             }
             // `read_files` bypasses the filter with `tar_bz2_stream(None)`
             // to serve both sections from a single pass.
-            Backend::LocalTarBz2 { .. } => self.tar_bz2_stream(Some(section)).await,
+            Backend::TarBz2 { path, .. } => Self::tar_bz2_stream(path, Some(section)).await,
         }
     }
 
     // ---------------------------------------------------------------------
     // opening
     // ---------------------------------------------------------------------
+
+    /// Opens a remote `.conda` archive sparsely, or `None` when the server
+    /// does not support the required range requests and the caller should
+    /// fall back to a full download.
+    pub(crate) async fn try_open_sparse(
+        client: ClientWithMiddleware,
+        url: Url,
+    ) -> Result<Option<Self>, ExtractError> {
+        match Self::open_sparse(client, url).await {
+            Ok(archive) => Ok(Some(archive)),
+            Err(err) if sparse_unsupported(&err) => {
+                debug!("sparse access unavailable ({err}), falling back to full download");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
 
     /// Opens a remote `.conda` archive sparsely, without full-download fallback.
     pub(crate) async fn open_sparse(
@@ -467,22 +498,18 @@ impl PackageArchive {
         let mut reader = zip.into_inner().into_inner().into_inner();
         let tail_offset = size.saturating_sub(TAIL_SIZE);
         let mut tail = vec![0u8; (size - tail_offset) as usize];
-        reader
-            .seek(SeekFrom::Start(tail_offset))
-            .await
-            .map_err(ExtractError::IoError)?;
-        reader
-            .read_exact(&mut tail)
-            .await
-            .map_err(ExtractError::IoError)?;
+        reader.seek(SeekFrom::Start(tail_offset)).await?;
+        reader.read_exact(&mut tail).await?;
 
         Ok(Self {
-            backend: Arc::new(Backend::Sparse {
-                client,
-                url,
-                validator,
-                tail_offset,
-                tail,
+            backend: Arc::new(Backend::Conda {
+                source: CondaSource::Sparse {
+                    client,
+                    url,
+                    validator,
+                    tail_offset,
+                    tail: tail.into(),
+                },
                 members,
             }),
         })
@@ -496,21 +523,18 @@ impl PackageArchive {
         let response = client
             .get(url.clone())
             .send()
-            .await
-            .map_err(ExtractError::from)?
+            .await?
             .error_for_status()
             .map_err(|e| ExtractError::ReqwestError(e.into()))?;
 
         // Spool to disk rather than memory: packages can be arbitrarily
         // large (multi-GB), so an in-memory copy is not an option.
-        let temp = tempfile::NamedTempFile::new().map_err(ExtractError::IoError)?;
+        let temp = tempfile::NamedTempFile::new()?;
         let (file, temp_path) = temp.into_parts();
         let mut file = tokio::fs::File::from_std(file);
         let mut body = StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
-        tokio::io::copy(&mut body, &mut file)
-            .await
-            .map_err(ExtractError::IoError)?;
-        file.flush().await.map_err(ExtractError::IoError)?;
+        tokio::io::copy(&mut body, &mut file).await?;
+        file.flush().await?;
 
         Self::open_local(temp_path.to_path_buf(), archive_type, Some(temp_path)).await
     }
@@ -522,21 +546,18 @@ impl PackageArchive {
     ) -> Result<Self, ExtractError> {
         let backend = match archive_type {
             CondaArchiveType::Conda => {
-                let file = tokio::fs::File::open(&path)
-                    .await
-                    .map_err(ExtractError::IoError)?;
-                let size = file.metadata().await.map_err(ExtractError::IoError)?.len();
+                let file = tokio::fs::File::open(&path).await?;
+                let size = file.metadata().await?.len();
                 let buf_reader =
                     futures::io::BufReader::new(tokio::io::BufReader::new(file).compat());
                 let zip = ZipFileReader::new(buf_reader).await?;
                 let members = collect_members(zip.file(), size)?;
-                Backend::LocalConda {
-                    path,
+                Backend::Conda {
+                    source: CondaSource::Local { path, temp },
                     members,
-                    temp,
                 }
             }
-            CondaArchiveType::TarBz2 => Backend::LocalTarBz2 { path, temp },
+            CondaArchiveType::TarBz2 => Backend::TarBz2 { path, temp },
         };
         Ok(Self {
             backend: Arc::new(backend),
@@ -547,27 +568,26 @@ impl PackageArchive {
     // section readers
     // ---------------------------------------------------------------------
 
-    /// Returns a reader over the stored bytes of the ZIP member holding
-    /// `section`.
-    async fn conda_section_reader(&self, section: Section) -> Result<DynReader, ExtractError> {
-        match &*self.backend {
-            Backend::Sparse {
+    /// Returns a reader over the stored bytes of a ZIP member.
+    async fn conda_member_reader(
+        source: &CondaSource,
+        span: &MemberSpan,
+    ) -> Result<DynReader, ExtractError> {
+        match source {
+            CondaSource::Sparse {
                 client,
                 url,
                 validator,
                 tail_offset,
                 tail,
-                members,
-                ..
             } => {
-                let span = find_section_member(members, section)?;
-
                 // Serve from the cached tail when the whole member is inside it.
                 if span.header_offset >= *tail_offset {
                     let rel = (span.header_offset - tail_offset) as usize;
-                    if let Some(data) = member_data_from_buffer(&tail[rel..], span.size) {
+                    if let Some(range) = member_data_range(&tail[rel..], span.size) {
                         debug!("serving member {} from the cached tail", span.name);
-                        return Ok(Box::new(std::io::Cursor::new(data.to_vec())));
+                        let data = tail.slice(rel + range.start..rel + range.end);
+                        return Ok(Box::new(std::io::Cursor::new(data)));
                     }
                 }
 
@@ -593,8 +613,7 @@ impl PackageArchive {
                 }
                 let response = request
                     .send()
-                    .await
-                    .map_err(ExtractError::from)?
+                    .await?
                     .error_for_status()
                     .map_err(|e| ExtractError::ReqwestError(e.into()))?;
                 if response.status() != ::reqwest::StatusCode::PARTIAL_CONTENT {
@@ -609,33 +628,22 @@ impl PackageArchive {
                 skip_local_header(&mut reader).await?;
                 Ok(Box::new(reader.take(span.size)))
             }
-            Backend::LocalConda { path, members, .. } => {
-                let span = find_section_member(members, section)?;
-                let mut file = tokio::fs::File::open(path)
-                    .await
-                    .map_err(ExtractError::IoError)?;
-                file.seek(SeekFrom::Start(span.header_offset))
-                    .await
-                    .map_err(ExtractError::IoError)?;
+            CondaSource::Local { path, .. } => {
+                let mut file = tokio::fs::File::open(path).await?;
+                file.seek(SeekFrom::Start(span.header_offset)).await?;
                 let mut reader = tokio::io::BufReader::new(file);
                 skip_local_header(&mut reader).await?;
                 Ok(Box::new(reader.take(span.size)))
             }
-            Backend::LocalTarBz2 { .. } => unreachable!("tar.bz2 has no conda sections"),
         }
     }
 
     /// Opens a (optionally section-filtered) stream over a `.tar.bz2` archive.
     async fn tar_bz2_stream(
-        &self,
+        path: &Path,
         section: Option<Section>,
     ) -> Result<SectionStream, ExtractError> {
-        let Backend::LocalTarBz2 { path, .. } = &*self.backend else {
-            unreachable!("tar_bz2_stream called on a .conda backend")
-        };
-        let file = tokio::fs::File::open(path)
-            .await
-            .map_err(ExtractError::IoError)?;
+        let file = tokio::fs::File::open(path).await?;
         let decoder = BzDecoder::new(tokio::io::BufReader::with_capacity(STREAM_BUF_SIZE, file));
         Ok(SectionStream::new(Box::new(decoder), section))
     }
@@ -663,9 +671,9 @@ impl SectionStream {
     pub async fn next_entry(&mut self) -> Result<Option<SectionEntry>, ExtractError> {
         use futures_util::StreamExt;
         while let Some(entry) = self.entries.next().await {
-            let entry = entry.map_err(ExtractError::IoError)?;
+            let entry = entry?;
             if let Some(section) = self.filter {
-                let path = entry.path().map_err(ExtractError::IoError)?;
+                let path = entry.path()?;
                 if Section::containing(&path) != section {
                     continue;
                 }
@@ -689,36 +697,23 @@ async fn scan_stream(
         let Some(mut entry) = stream.next_entry().await? else {
             break;
         };
-        let path = normalize(&entry.path().map_err(ExtractError::IoError)?);
+        let path = entry_path(&entry)?;
         if remaining.remove(&path) {
-            let kind = entry.header().entry_type();
-            if kind.is_symlink() || kind.is_hard_link() {
-                let target = entry
-                    .link_name()
-                    .ok()
-                    .flatten()
-                    .map(|t| t.display().to_string())
-                    .unwrap_or_default();
-                // Finish the scan so the error names every offending path
-                // instead of discarding the whole batch on the first one.
-                links.push(format!("'{}' (links to '{target}')", path.display()));
+            // Finish the scan so the error names every offending link
+            // instead of discarding the whole batch on the first one.
+            if let Some(link) = describe_link(&entry, &path) {
+                links.push(link);
                 continue;
             }
             // The header size is untrusted; cap the upfront allocation.
-            let size = entry.header().size().map_err(ExtractError::IoError)?;
+            let size = entry.header().size()?;
             let mut buf = Vec::with_capacity(size.min(MAX_PREALLOC) as usize);
-            entry
-                .read_to_end(&mut buf)
-                .await
-                .map_err(ExtractError::IoError)?;
+            entry.read_to_end(&mut buf).await?;
             out.insert(path, Some(buf));
         }
     }
     if !links.is_empty() {
-        return Err(ExtractError::IoError(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!("cannot read {}: links are not followed", links.join(", ")),
-        )));
+        return Err(ExtractError::LinksNotFollowed(links));
     }
     for path in remaining {
         out.insert(path, None);
@@ -755,12 +750,9 @@ fn collect_members(
         });
     }
     // Bound each member by the next member's local header offset.
-    let mut offsets: Vec<u64> = members.iter().map(|m| m.header_offset).collect();
-    offsets.sort_unstable();
-    for member in &mut members {
-        if let Some(next) = offsets.iter().find(|&&o| o > member.header_offset) {
-            member.end = *next;
-        }
+    members.sort_unstable_by_key(|m| m.header_offset);
+    for i in 1..members.len() {
+        members[i - 1].end = members[i].header_offset;
     }
     Ok(members)
 }
@@ -776,16 +768,71 @@ fn find_section_member(
         .ok_or(ExtractError::MissingComponent)
 }
 
+/// Describes a link entry for [`ExtractError::LinksNotFollowed`], or `None`
+/// for regular entries.
+pub(crate) fn describe_link<R: AsyncRead + Unpin>(
+    entry: &tokio_tar::Entry<R>,
+    path: &Path,
+) -> Option<String> {
+    let kind = entry.header().entry_type();
+    (kind.is_symlink() || kind.is_hard_link()).then(|| {
+        let target = entry
+            .link_name()
+            .ok()
+            .flatten()
+            .map(|t| t.display().to_string())
+            .unwrap_or_default();
+        format!("'{}' (links to '{target}')", path.display())
+    })
+}
+
+/// Reads the contents of a tar entry, rejecting link entries and capping the
+/// upfront allocation derived from the untrusted header size.
+pub async fn read_entry_contents<R: AsyncRead + Unpin>(
+    entry: &mut tokio_tar::Entry<R>,
+) -> Result<Vec<u8>, ExtractError> {
+    let path = normalize(&entry.path()?).into_owned();
+    if let Some(link) = describe_link(entry, &path) {
+        return Err(ExtractError::LinksNotFollowed(vec![link]));
+    }
+    let size = entry.header().size()?;
+    let mut buf = Vec::with_capacity(size.min(MAX_PREALLOC) as usize);
+    entry.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Parses the raw bytes of a typed [`PackageFile`].
+pub(crate) fn parse_package_file<P: PackageFile>(bytes: &[u8]) -> Result<P, ExtractError> {
+    P::from_slice(bytes)
+        .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
+}
+
 /// Strips `.` components so `./info/index.json` matches `info/index.json`.
-fn normalize(path: &Path) -> PathBuf {
-    path.components()
-        .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .collect()
+/// Borrows when the path is already normal (the common case).
+fn normalize(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::CurDir))
+    {
+        std::borrow::Cow::Owned(
+            path.components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
+/// The normalized path of a tar entry as it is exposed by this API
+/// (`list_files`, `read_files` keys, entry names).
+pub fn entry_path(entry: &SectionEntry) -> Result<PathBuf, ExtractError> {
+    Ok(normalize(&entry.path()?).into_owned())
 }
 
 /// Parses a ZIP local file header at the start of `buf` and returns the
-/// member data if `buf` contains all of it.
-fn member_data_from_buffer(buf: &[u8], size: u64) -> Option<&[u8]> {
+/// range of the member data if `buf` contains all of it.
+fn member_data_range(buf: &[u8], size: u64) -> Option<std::ops::Range<usize>> {
     if buf.len() < 30 || buf[0..4] != LOCAL_HEADER_MAGIC {
         return None;
     }
@@ -793,17 +840,14 @@ fn member_data_from_buffer(buf: &[u8], size: u64) -> Option<&[u8]> {
     let extra_len = u16::from_le_bytes([buf[28], buf[29]]) as usize;
     let data_start = 30 + name_len + extra_len;
     let data_end = data_start.checked_add(size as usize)?;
-    (data_end <= buf.len()).then(|| &buf[data_start..data_end])
+    (data_end <= buf.len()).then_some(data_start..data_end)
 }
 
 /// Reads and skips a ZIP local file header from a stream, leaving the reader
 /// positioned at the start of the member data.
 async fn skip_local_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), ExtractError> {
     let mut header = [0u8; 30];
-    reader
-        .read_exact(&mut header)
-        .await
-        .map_err(ExtractError::IoError)?;
+    reader.read_exact(&mut header).await?;
     if header[0..4] != LOCAL_HEADER_MAGIC {
         return Err(ExtractError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -813,15 +857,13 @@ async fn skip_local_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), E
     let name_len = u64::from(u16::from_le_bytes([header[26], header[27]]));
     let extra_len = u64::from(u16::from_le_bytes([header[28], header[29]]));
     let mut skip = reader.take(name_len + extra_len);
-    tokio::io::copy(&mut skip, &mut tokio::io::sink())
-        .await
-        .map_err(ExtractError::IoError)?;
+    tokio::io::copy(&mut skip, &mut tokio::io::sink()).await?;
     Ok(())
 }
 
 /// Returns true for errors that mean "sparse access is unavailable" and the
 /// caller should fall back to a full download.
-pub(crate) fn sparse_unsupported(err: &ExtractError) -> bool {
+fn sparse_unsupported(err: &ExtractError) -> bool {
     match err {
         // Servers that ignore the `Range` header answer with a plain `200 OK`
         // that carries no `Content-Range` header.
@@ -1225,6 +1267,31 @@ mod tests {
         assert!(
             !message.contains("'lib/libreal.so.1'"),
             "the regular file must not be reported as offending: {message}"
+        );
+    }
+
+    #[test]
+    fn test_section_containing() {
+        assert_eq!(
+            Section::containing(Path::new("info/index.json")),
+            Section::Info
+        );
+        assert_eq!(
+            Section::containing(Path::new("./info/index.json")),
+            Section::Info
+        );
+        assert_eq!(Section::containing(Path::new("info")), Section::Info);
+        assert_eq!(
+            Section::containing(Path::new("info-custom.txt")),
+            Section::Content
+        );
+        assert_eq!(
+            Section::containing(Path::new("information/file")),
+            Section::Content
+        );
+        assert_eq!(
+            Section::containing(Path::new("lib/libz.so")),
+            Section::Content
         );
     }
 
