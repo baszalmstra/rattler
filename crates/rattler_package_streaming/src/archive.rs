@@ -218,7 +218,11 @@ impl PackageArchive {
     }
 
     /// Reads a single file from the package, or `None` if the path does not
-    /// exist. Prefer [`PackageArchive::read_files`] for multiple files.
+    /// exist.
+    ///
+    /// Contents are not cached: every call streams the containing section
+    /// again up to the requested file. Prefer [`PackageArchive::read_files`]
+    /// with one batch over repeated calls.
     pub async fn read_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>, ExtractError> {
         let path = normalize(path.as_ref());
         let mut result = self.read_files([path.clone()]).await?;
@@ -229,6 +233,10 @@ impl PackageArchive {
     /// fetched concurrently), aborting each stream after its last requested
     /// file. Maps every requested path to its contents, or `None` when
     /// absent.
+    ///
+    /// Calls are independent and may run concurrently, but contents are not
+    /// cached: a repeated call streams its sections again, so batch all
+    /// needed paths into a single call where possible.
     pub async fn read_files(
         &self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
@@ -293,6 +301,9 @@ impl PackageArchive {
 
     /// Streams the tar entries of one section. Unread entries are skipped
     /// cheaply; dropping the stream aborts any underlying HTTP transfer.
+    ///
+    /// Every call opens a new independent forward-only stream (for remote
+    /// archives: a new request).
     pub async fn stream(&self, section: Section) -> Result<SectionStream, ExtractError> {
         match &*self.backend {
             Backend::Sparse { .. } | Backend::LocalConda { .. } => {

@@ -185,8 +185,11 @@ class PackageArchive:
     async def read_file(self, path: str) -> Optional[bytes]:
         """
         Reads a single file from the package. Returns `None` if the path does
-        not exist in the archive. When reading more than one file, prefer
-        `read_files`.
+        not exist in the archive.
+
+        Contents are not cached: every call streams the containing section
+        again up to the requested file. When reading more than one file,
+        prefer a single `read_files` call.
         """
         return await self._inner.read_file(path)
 
@@ -197,6 +200,10 @@ class PackageArchive:
         streamed at most once, aborting as soon as its last requested file
         has been read. The result maps every requested path to its contents,
         or `None` when the path does not exist.
+
+        Calls are independent and may run concurrently, but contents are not
+        cached: a repeated call streams its sections again, so batch all
+        needed paths into a single call where possible.
         """
         return await self._inner.read_files(list(paths))
 
@@ -230,8 +237,9 @@ class PackageArchive:
         """
         Streams the tar entries of one section of the package.
 
-        Entries that are not `read()` are skipped cheaply, and abandoning the
-        iterator aborts any underlying transfer:
+        Every call opens a new independent forward-only iterator (for remote
+        archives: a new request). Entries that are not `read()` are skipped
+        cheaply, and abandoning the iterator aborts any underlying transfer:
 
         ```python
         async for entry in pkg.stream("pkg"):
