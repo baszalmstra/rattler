@@ -24,8 +24,9 @@ def tar_zst(entries, level=3):
             info = tarfile.TarInfo(name)
             info.mtime = 0
             if link:
-                info.type = tarfile.SYMTYPE
-                info.linkname = link
+                kind, target = link
+                info.type = kind
+                info.linkname = target
             else:
                 info.size = len(data)
             tar.addfile(info, io.BytesIO(data) if not link else None)
@@ -83,12 +84,13 @@ write_conda(
     ],
 )
 
-# A payload containing a symbolic link.
+# A payload containing a symbolic and a hard link.
 write_conda(
     "symlink-test-1.0.0-0",
     [
         ("lib/libreal.so.1", b"real library bytes", None),
-        ("lib/liblink.so", b"", "libreal.so.1"),
+        ("lib/liblink.so", b"", (tarfile.SYMTYPE, "libreal.so.1")),
+        ("lib/libhard.so", b"", (tarfile.LNKTYPE, "lib/libreal.so.1")),
     ],
     [("info/index.json", index_json("symlink-test"), None)],
 )

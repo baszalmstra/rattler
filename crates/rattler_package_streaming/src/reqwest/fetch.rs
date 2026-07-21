@@ -150,6 +150,30 @@ mod tests {
         assert!(!raw.is_empty());
     }
 
+    /// `./`-prefixed entries resolve identically on the sparse path and the
+    /// streaming fallback.
+    #[tokio::test]
+    async fn test_dot_slash_on_both_paths() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/sparse/dotslash-test-1.0.0-0.conda");
+        let client = reqwest_middleware::ClientWithMiddleware::from(reqwest::Client::new());
+
+        for url in [
+            test_server::serve_file(&fixture).await,
+            test_server::serve_file_no_ranges(&fixture).await,
+        ] {
+            let raw = fetch_file_from_remote_url(
+                client.clone(),
+                url,
+                std::path::Path::new("lib/data.txt"),
+            )
+            .await
+            .unwrap()
+            .expect("entry stored as ./lib/data.txt must resolve");
+            assert_eq!(raw, b"dot slash payload\n");
+        }
+    }
+
     /// Both the sparse path and the streaming fallback must reject links
     /// with the same contract.
     #[tokio::test]

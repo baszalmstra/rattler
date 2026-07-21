@@ -809,7 +809,7 @@ pub(crate) fn parse_package_file<P: PackageFile>(bytes: &[u8]) -> Result<P, Extr
 
 /// Strips `.` components so `./info/index.json` matches `info/index.json`.
 /// Borrows when the path is already normal (the common case).
-fn normalize(path: &Path) -> std::borrow::Cow<'_, Path> {
+pub(crate) fn normalize(path: &Path) -> std::borrow::Cow<'_, Path> {
     if path
         .components()
         .any(|c| matches!(c, std::path::Component::CurDir))
@@ -1104,6 +1104,10 @@ mod tests {
             "{files:?}"
         );
         assert!(
+            files.contains(&PathBuf::from("lib/libhard.so")),
+            "{files:?}"
+        );
+        assert!(
             files.contains(&PathBuf::from("lib/libreal.so.1")),
             "{files:?}"
         );
@@ -1112,9 +1116,11 @@ mod tests {
         let real = archive.read_file("lib/libreal.so.1").await.unwrap();
         assert_eq!(real.as_deref(), Some(b"real library bytes".as_slice()));
 
-        // ...but reading a link itself is an error.
-        let err = archive.read_file("lib/liblink.so").await.unwrap_err();
-        assert!(err.to_string().contains("links are not followed"), "{err}");
+        // ...but reading a link itself is an error, for both link kinds.
+        for link in ["lib/liblink.so", "lib/libhard.so"] {
+            let err = archive.read_file(link).await.unwrap_err();
+            assert!(err.to_string().contains("links are not followed"), "{err}");
+        }
     }
 
     #[tokio::test]

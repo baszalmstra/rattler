@@ -89,6 +89,7 @@ async def test_symlinks_surfaced_not_followed(test_data_dir: str) -> None:
 
     files = await archive.list_files("pkg")
     assert "lib/liblink.so" in files and "lib/libreal.so.1" in files
+    assert "lib/libhard.so" in files
 
     assert await archive.read_file("lib/libreal.so.1") == b"real library bytes"
     with pytest.raises(OSError, match="links are not followed"):
