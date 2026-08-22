@@ -76,13 +76,77 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
         solvables: &mut [SolvableId],
         version_cache: &mut HashMap<VersionSetId, Option<(Version, bool)>>,
     ) {
+        use super::sort_stats as st;
+        st::add(&st::SORT_CALLS, 1);
+        st::add(&st::SORTED_SOLVABLES, solvables.len() as u64);
+        let t = std::time::Instant::now();
         self.sort_by_tracked_version_build(solvables);
+        st::add(&st::STAGE1_NANOS, t.elapsed().as_nanos() as u64);
+        let t = std::time::Instant::now();
         self.sort_by_highest_dependency_versions(solvables, version_cache);
+        st::add(&st::STAGE2_NANOS, t.elapsed().as_nanos() as u64);
     }
 
     /// This function can be used for the initial sorting of the candidates.
     fn sort_by_tracked_version_build(&self, solvables: &mut [SolvableId]) {
-        solvables.sort_by(|a, b| self.simple_compare(*a, *b));
+        // The pool and solver cache are not `Sync`, so a parallel sort cannot
+        // call `simple_compare` directly. Instead extract plain `Send + Sync`
+        // sort keys sequentially and sort those in parallel. Only do this for
+        // larger lists where the parallelism outweighs the extraction cost.
+        const PAR_SORT_THRESHOLD: usize = 500;
+        if solvables.len() < PAR_SORT_THRESHOLD {
+            solvables.sort_by(|a, b| self.simple_compare(*a, *b));
+            return;
+        }
+
+        struct SortKey<'r> {
+            id: SolvableId,
+            tracked: bool,
+            channel_rank: u32,
+            version: Option<&'r Version>,
+            build_number: u64,
+        }
+
+        let flexible = self.solver.provider().channel_priority == ChannelPriority::Flexible;
+        let strategy = self.strategy;
+        let mut keyed: Vec<SortKey<'_>> = solvables
+            .iter()
+            .map(|&id| {
+                let record = self.solvable_record(id);
+                SortKey {
+                    id,
+                    tracked: !record.track_features().is_empty(),
+                    channel_rank: if flexible { self.channel_rank(id) } else { 0 },
+                    version: record.version(),
+                    build_number: record.build_number(),
+                }
+            })
+            .collect();
+
+        use rayon::slice::ParallelSliceMut;
+        keyed.par_sort_by(|a, b| {
+            match (a.tracked, b.tracked) {
+                (true, false) => return Ordering::Greater,
+                (false, true) => return Ordering::Less,
+                _ => {}
+            }
+            match a.channel_rank.cmp(&b.channel_rank) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+            match (strategy, a.version.cmp(&b.version)) {
+                (CompareStrategy::Default, Ordering::Greater)
+                | (CompareStrategy::LowestVersion, Ordering::Less) => return Ordering::Less,
+                (CompareStrategy::Default, Ordering::Less)
+                | (CompareStrategy::LowestVersion, Ordering::Greater) => return Ordering::Greater,
+                (_, Ordering::Equal) => {}
+            }
+            b.build_number.cmp(&a.build_number)
+        });
+
+        for (slot, key) in solvables.iter_mut().zip(keyed) {
+            *slot = key.id;
+        }
     }
 
     /// Sort the candidates based on:
@@ -152,6 +216,12 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
             // Take the sub list of solvables
             let sub = &mut solvables[start..end];
             if sub.len() > 1 {
+                {
+                    use super::sort_stats as st;
+                    st::add(&st::TIEBREAK_RUNS, 1);
+                    st::add(&st::TIEBREAK_RUN_SOLVABLES, sub.len() as u64);
+                    st::max(&st::TIEBREAK_MAX_RUN, sub.len() as u64);
+                }
                 let cache_hit = {
                     let cache = self.solver.provider().dependency_tiebreak_cache.borrow();
                     if let Some(cached) = cache.entries.get(sub) {
@@ -209,6 +279,8 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
         solvables: &mut [SolvableId],
         version_cache: &mut HashMap<VersionSetId, Option<(Version, bool)>>,
     ) -> bool {
+        use super::sort_stats as st;
+        let t_gather = std::time::Instant::now();
         // Get the dependencies for each solvable
         let dependencies = solvables
             .iter()
@@ -334,6 +406,8 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
                 })
         };
 
+        st::add(&st::DEP_GATHER_NANOS, t_gather.elapsed().as_nanos() as u64);
+        let t_final = std::time::Instant::now();
         // Sort the solvables by comparing the highest version of the shared
         // dependencies in alphabetic order.
         solvables.sort_by(|a, b| {
@@ -375,6 +449,7 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
             let b_record = self.solvable_record(*b);
             b_record.timestamp().cmp(&a_record.timestamp())
         });
+        st::add(&st::FINAL_SORT_NANOS, t_final.elapsed().as_nanos() as u64);
 
         // Candidate matching reports cancellation as no matching version. Do not
         // retain the resulting partial/timestamp-biased ordering in that case.
@@ -419,9 +494,13 @@ pub(super) fn find_highest_version(
     solver: &SolverCache<CondaDependencyProvider<'_>>,
     highest_version_cache: &mut HashMap<VersionSetId, Option<(rattler_conda_types::Version, bool)>>,
 ) -> Option<(Version, bool)> {
+    use super::sort_stats as st;
+    st::add(&st::HIGHEST_VERSION_CALLS, 1);
     highest_version_cache
         .entry(match_spec_id)
         .or_insert_with(|| {
+            st::add(&st::HIGHEST_VERSION_MISSES, 1);
+            let t_miss = std::time::Instant::now();
             let candidates = solver
                 .get_or_cache_matching_candidates(match_spec_id)
                 .now_or_never()
@@ -461,6 +540,7 @@ pub(super) fn find_highest_version(
                 );
             }
 
+            st::add(&st::HIGHEST_VERSION_MISS_NANOS, t_miss.elapsed().as_nanos() as u64);
             highest_version
         })
         .clone()
