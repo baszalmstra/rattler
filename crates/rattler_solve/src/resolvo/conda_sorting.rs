@@ -333,6 +333,60 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
                 })
         };
 
+        // For small runs a pairwise lexicographic comparator has less
+        // overhead than the column-by-column sort below.
+        const SMALL_RUN_PAIRWISE_THRESHOLD: usize = 8;
+        if solvables.len() <= SMALL_RUN_PAIRWISE_THRESHOLD {
+            solvables.sort_by(|a, b| {
+                for &name in sorted_unique_names.iter() {
+                    let a_version = id_and_deps
+                        .get(&(*a, name))
+                        .and_then(&mut find_best_selectable_version);
+                    let b_version = id_and_deps
+                        .get(&(*b, name))
+                        .and_then(&mut find_best_selectable_version);
+
+                    // Deal with the case where resolving the version set doesn't actually select a
+                    // version
+                    let (a_version, b_version) = match (a_version, b_version) {
+                        // If we have a version for either solvable, but not the other, the one with
+                        // the version is better.
+                        (Some(_), None) => return Ordering::Less,
+                        (None, Some(_)) => return Ordering::Greater,
+
+                        // If for neither solvable the version set doesn't select a version for the
+                        // dependency we skip it.
+                        (None, None) => continue,
+
+                        (Some(a), Some(b)) => (a, b),
+                    };
+
+                    // Compare the versions
+                    match a_version.compare_with_strategy(&b_version, self.dependency_strategy) {
+                        Ordering::Equal => {
+                            // If this version is equal, we continue with the next
+                            // dependency
+                        }
+                        ordering => return ordering,
+                    }
+                }
+
+                // Otherwise sort by timestamp (in reverse, we want the highest timestamp first)
+                let a_record = self.solvable_record(*a);
+                let b_record = self.solvable_record(*b);
+                b_record.timestamp().cmp(&a_record.timestamp())
+            });
+
+            // Candidate matching reports cancellation as no matching version. Do not
+            // retain the resulting partial/timestamp-biased ordering in that case.
+            return !self
+                .solver
+                .provider()
+                .cancellation_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled);
+        }
+
         // Sort lexicographically by the shared dependencies: order everything
         // by the first dependency, then order the groups that are still tied
         // by the next dependency, and so on. This produces the same order as a
