@@ -30,8 +30,95 @@ fn main() {
     match args.next().as_deref() {
         Some("envs") => run_envs(args),
         Some("corpus") => run_corpus(args),
-        _ => panic!("usage: snapshot-replay envs|corpus ..."),
+        Some("corpus2") => run_corpus2(args),
+        _ => panic!("usage: snapshot-replay envs|corpus|corpus2 ..."),
     }
+}
+
+/// Corpus mode for snapshots produced by rattler's `create-resolvo-snapshot`
+/// tool: no sidecar, roots are sampled deterministically from the snapshot's
+/// own package list and requested through `add_package_requirement`.
+fn run_corpus2(mut args: impl Iterator<Item = String>) {
+    let snapshot_path = args.next().expect("missing snapshot path");
+    let sample_count: usize = args.next().expect("missing sample count").parse().unwrap();
+    let results_out = args.next().expect("missing results-out");
+    let timings_out = args.next().expect("missing timings-out");
+    let timeout_secs: u64 = args.next().map_or(30, |s| s.parse().unwrap());
+
+    eprintln!("loading snapshot...");
+    let load_start = Instant::now();
+    let snapshot: DependencySnapshot =
+        serde_json::from_reader(BufReader::new(File::open(&snapshot_path).unwrap())).unwrap();
+
+    // Sample base package names (skip `pkg[extra]` pseudo-packages),
+    // deterministically by sorted name.
+    let mut names: Vec<(&str, resolvo::NameId)> = snapshot
+        .packages
+        .iter()
+        .filter(|(_, package)| !package.name.contains('['))
+        .map(|(id, package)| (package.name.as_str(), id))
+        .collect();
+    names.sort_unstable_by_key(|(name, _)| *name);
+    let sample_count = sample_count.min(names.len());
+    let roots: Vec<(&str, resolvo::NameId)> = (0..sample_count)
+        .map(|i| names[i * names.len() / sample_count])
+        .collect();
+    eprintln!(
+        "loaded {} solvables, {} packages in {:.1}s; sampled {} roots",
+        snapshot.solvables.len(),
+        names.len(),
+        load_start.elapsed().as_secs_f64(),
+        roots.len()
+    );
+
+    let mut results = std::io::BufWriter::new(File::create(&results_out).unwrap());
+    let mut timings = std::io::BufWriter::new(File::create(&timings_out).unwrap());
+    writeln!(timings, "root\tstatus\tms").unwrap();
+
+    let mut times: Vec<f64> = Vec::new();
+    let total_start = Instant::now();
+    for (i, (name, name_id)) in roots.iter().enumerate() {
+        let mut provider = snapshot
+            .provider()
+            .with_timeout(SystemTime::now() + Duration::from_secs(timeout_secs));
+        let version_set = provider.add_package_requirement(*name_id, "*");
+        let requirement: ConditionalRequirement = version_set.into();
+
+        let problem = Problem::new().requirements(vec![requirement]);
+        let mut solver = Solver::new(provider);
+        let t = Instant::now();
+        let res = solver.solve(problem);
+        let elapsed = t.elapsed().as_secs_f64() * 1e3;
+
+        let repr = solution_repr(&res, &solver);
+        let status = match repr.first().map(String::as_str) {
+            Some("UNSOLVABLE") => "unsolvable",
+            Some("CANCELLED") => "cancelled",
+            _ => "ok",
+        };
+        times.push(elapsed);
+        writeln!(timings, "{name}\t{status}\t{elapsed:.3}").unwrap();
+        writeln!(results, "=== {name} ===\n{}", repr.join("\n")).unwrap();
+        if (i + 1) % 100 == 0 {
+            eprintln!(
+                "{}/{} solves done ({:.1}s elapsed)",
+                i + 1,
+                roots.len(),
+                total_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    times.sort_by(f64::total_cmp);
+    let total: f64 = times.iter().sum();
+    println!(
+        "corpus: {} solves | total {:.1} ms | median {:.3} ms | p95 {:.3} ms | max {:.1} ms",
+        times.len(),
+        total,
+        times[times.len() / 2],
+        times[times.len() * 95 / 100],
+        times[times.len() - 1],
+    );
 }
 
 fn run_envs(mut args: impl Iterator<Item = String>) {
@@ -156,7 +243,14 @@ fn solve_once(
     let res = solver.solve(problem);
     let elapsed = t.elapsed().as_secs_f64() * 1e3;
 
-    let repr = match &res {
+    (elapsed, solution_repr(&res, &solver))
+}
+
+fn solution_repr<D: resolvo::DependencyProvider<SolvableId = resolvo::SolvableId>>(
+    res: &Result<Vec<resolvo::SolvableId>, resolvo::UnsolvableOrCancelled>,
+    solver: &Solver<D>,
+) -> Vec<String> {
+    match res {
         Ok(ids) => {
             let mut v: Vec<String> = ids
                 .iter()
@@ -167,6 +261,5 @@ fn solve_once(
         }
         Err(resolvo::UnsolvableOrCancelled::Unsolvable(_)) => vec!["UNSOLVABLE".to_string()],
         Err(resolvo::UnsolvableOrCancelled::Cancelled(_)) => vec!["CANCELLED".to_string()],
-    };
-    (elapsed, repr)
+    }
 }
