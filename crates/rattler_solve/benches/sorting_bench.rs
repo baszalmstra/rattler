@@ -82,6 +82,12 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_sort(c, &sparse_repo_data, "pytorch");
     bench_sort(c, &sparse_repo_data, "python");
     bench_sort(c, &sparse_repo_data, "tensorflow");
+    bench_sort(c, &sparse_repo_data, "numpy");
+    bench_sort(c, &sparse_repo_data, "scipy");
+    bench_sort(c, &sparse_repo_data, "opencv");
+    bench_sort(c, &sparse_repo_data, "pandas");
+    bench_sort(c, &sparse_repo_data, "nodejs");
+    bench_sort(c, &sparse_repo_data, "libgcc-ng");
 }
 
 criterion_group!(benches, criterion_benchmark);
