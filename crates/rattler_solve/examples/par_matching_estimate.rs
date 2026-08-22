@@ -61,7 +61,7 @@ fn measure(sparse_repo_data: &SparseRepoData, root: &str) {
         .iter()
         .flatten()
         .filter_map(|spec| {
-            let name = spec.name.as_ref()?.as_exact()?.as_normalized().to_owned();
+            let name = spec.name.as_exact()?.as_normalized().to_owned();
             let (_, nameless) = spec.clone().into_nameless();
             by_name
                 .get_key_value(name.as_str())
