@@ -1321,10 +1321,10 @@ mod resolvo {
         │  └─ conflicting-extras[extra2]
         └─ conflicting-extras [extras=[extra1, extra2]] cannot be installed because there are no viable options:
            └─ conflicting-extras 1 would require
-              ├─ bar >=2, which can be installed with any of the following options:
-              │  └─ bar 2
-              └─ bar <2, which cannot be installed because there are no viable options:
-                 └─ bar 1, which conflicts with the versions reported above.
+              ├─ bar <2, which can be installed with any of the following options:
+              │  └─ bar 1
+              └─ bar >=2, which cannot be installed because there are no viable options:
+                 └─ bar 2, which conflicts with the versions reported above.
         "###);
     }
 
@@ -1344,12 +1344,12 @@ mod resolvo {
         Cannot solve the request because of: The following packages are incompatible
         ├─ conflicting-extras[extra1] can be installed with any of the following options:
         │  └─ conflicting-extras[extra1]
-        ├─ bar >=2 can be installed with any of the following options:
-        │  └─ bar 2
-        └─ conflicting-extras [extras=[extra1]] cannot be installed because there are no viable options:
-           └─ conflicting-extras 1 would require
-              └─ bar <2, which cannot be installed because there are no viable options:
-                 └─ bar 1, which conflicts with the versions reported above.
+        ├─ conflicting-extras [extras=[extra1]] can be installed with any of the following options:
+        │  └─ conflicting-extras 1 would require
+        │     └─ bar <2, which can be installed with any of the following options:
+        │        └─ bar 1
+        └─ bar >=2 cannot be installed because there are no viable options:
+           └─ bar 2, which conflicts with the versions reported above.
         "###);
     }
 
