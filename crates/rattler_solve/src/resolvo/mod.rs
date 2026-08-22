@@ -32,7 +32,6 @@ use crate::{
 };
 
 mod conda_sorting;
-pub mod sort_stats;
 
 type MatchSpecParseCache = HashMap<String, (Vec<VersionSetId>, Option<ConditionId>)>;
 

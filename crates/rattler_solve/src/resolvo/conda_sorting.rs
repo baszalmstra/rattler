@@ -76,77 +76,13 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
         solvables: &mut [SolvableId],
         version_cache: &mut HashMap<VersionSetId, Option<(Version, bool)>>,
     ) {
-        use super::sort_stats as st;
-        st::add(&st::SORT_CALLS, 1);
-        st::add(&st::SORTED_SOLVABLES, solvables.len() as u64);
-        let t = std::time::Instant::now();
         self.sort_by_tracked_version_build(solvables);
-        st::add(&st::STAGE1_NANOS, t.elapsed().as_nanos() as u64);
-        let t = std::time::Instant::now();
         self.sort_by_highest_dependency_versions(solvables, version_cache);
-        st::add(&st::STAGE2_NANOS, t.elapsed().as_nanos() as u64);
     }
 
     /// This function can be used for the initial sorting of the candidates.
     fn sort_by_tracked_version_build(&self, solvables: &mut [SolvableId]) {
-        // The pool and solver cache are not `Sync`, so a parallel sort cannot
-        // call `simple_compare` directly. Instead extract plain `Send + Sync`
-        // sort keys sequentially and sort those in parallel. Only do this for
-        // larger lists where the parallelism outweighs the extraction cost.
-        const PAR_SORT_THRESHOLD: usize = 500;
-        if solvables.len() < PAR_SORT_THRESHOLD {
-            solvables.sort_by(|a, b| self.simple_compare(*a, *b));
-            return;
-        }
-
-        struct SortKey<'r> {
-            id: SolvableId,
-            tracked: bool,
-            channel_rank: u32,
-            version: Option<&'r Version>,
-            build_number: u64,
-        }
-
-        let flexible = self.solver.provider().channel_priority == ChannelPriority::Flexible;
-        let strategy = self.strategy;
-        let mut keyed: Vec<SortKey<'_>> = solvables
-            .iter()
-            .map(|&id| {
-                let record = self.solvable_record(id);
-                SortKey {
-                    id,
-                    tracked: !record.track_features().is_empty(),
-                    channel_rank: if flexible { self.channel_rank(id) } else { 0 },
-                    version: record.version(),
-                    build_number: record.build_number(),
-                }
-            })
-            .collect();
-
-        use rayon::slice::ParallelSliceMut;
-        keyed.par_sort_by(|a, b| {
-            match (a.tracked, b.tracked) {
-                (true, false) => return Ordering::Greater,
-                (false, true) => return Ordering::Less,
-                _ => {}
-            }
-            match a.channel_rank.cmp(&b.channel_rank) {
-                Ordering::Equal => {}
-                ordering => return ordering,
-            }
-            match (strategy, a.version.cmp(&b.version)) {
-                (CompareStrategy::Default, Ordering::Greater)
-                | (CompareStrategy::LowestVersion, Ordering::Less) => return Ordering::Less,
-                (CompareStrategy::Default, Ordering::Less)
-                | (CompareStrategy::LowestVersion, Ordering::Greater) => return Ordering::Greater,
-                (_, Ordering::Equal) => {}
-            }
-            b.build_number.cmp(&a.build_number)
-        });
-
-        for (slot, key) in solvables.iter_mut().zip(keyed) {
-            *slot = key.id;
-        }
+        solvables.sort_by(|a, b| self.simple_compare(*a, *b));
     }
 
     /// Sort the candidates based on:
@@ -216,12 +152,6 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
             // Take the sub list of solvables
             let sub = &mut solvables[start..end];
             if sub.len() > 1 {
-                {
-                    use super::sort_stats as st;
-                    st::add(&st::TIEBREAK_RUNS, 1);
-                    st::add(&st::TIEBREAK_RUN_SOLVABLES, sub.len() as u64);
-                    st::max(&st::TIEBREAK_MAX_RUN, sub.len() as u64);
-                }
                 let cache_hit = {
                     let cache = self.solver.provider().dependency_tiebreak_cache.borrow();
                     if let Some(cached) = cache.entries.get(sub) {
@@ -270,17 +200,14 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
     /// 3. Get the known dependencies for each solvable, filter out the unknown
     ///    dependencies
     /// 4. Retain the dependencies that are shared by all the solvables
-    /// 6. Calculate a total score by counting the position of the solvable in
-    ///    the list with sorted dependencies
-    /// 7. Sort by the score per solvable and use timestamp of the record as a
-    ///    tie breaker
+    /// 5. Sort the solvables lexicographically by the highest selectable
+    ///    versions of the shared dependencies, and use the timestamp of the
+    ///    record as a tie breaker
     fn sort_subset_by_highest_dependency_versions(
         &self,
         solvables: &mut [SolvableId],
         version_cache: &mut HashMap<VersionSetId, Option<(Version, bool)>>,
     ) -> bool {
-        use super::sort_stats as st;
-        let t_gather = std::time::Instant::now();
         // Get the dependencies for each solvable
         let dependencies = solvables
             .iter()
@@ -406,50 +333,85 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
                 })
         };
 
-        st::add(&st::DEP_GATHER_NANOS, t_gather.elapsed().as_nanos() as u64);
-        let t_final = std::time::Instant::now();
-        // Sort the solvables by comparing the highest version of the shared
-        // dependencies in alphabetic order.
-        solvables.sort_by(|a, b| {
-            for &name in sorted_unique_names.iter() {
-                let a_version = id_and_deps
-                    .get(&(*a, name))
-                    .and_then(&mut find_best_selectable_version);
-                let b_version = id_and_deps
-                    .get(&(*b, name))
-                    .and_then(&mut find_best_selectable_version);
-
-                // Deal with the case where resolving the version set doesn't actually select a
-                // version
-                let (a_version, b_version) = match (a_version, b_version) {
-                    // If we have a version for either solvable, but not the other, the one with the
-                    // version is better.
-                    (Some(_), None) => return Ordering::Less,
-                    (None, Some(_)) => return Ordering::Greater,
-
-                    // If for neither solvable the version set doesn't select a version for the
-                    // dependency we skip it.
-                    (None, None) => continue,
-
-                    (Some(a), Some(b)) => (a, b),
-                };
-
-                // Compare the versions
-                match a_version.compare_with_strategy(&b_version, self.dependency_strategy) {
-                    Ordering::Equal => {
-                        // If this version is equal, we continue with the next
-                        // dependency
-                    }
-                    ordering => return ordering,
+        // Sort lexicographically by the shared dependencies: order everything
+        // by the first dependency, then order the groups that are still tied
+        // by the next dependency, and so on. This produces the same order as a
+        // pairwise lexicographic comparator, but evaluates the best selectable
+        // version of a dependency exactly once per solvable instead of on
+        // every comparison, and only for the dependencies that are actually
+        // needed to break ties.
+        let dependency_strategy = self.dependency_strategy;
+        let compare_keys =
+            |a: &Option<TrackedFeatureVersion>, b: &Option<TrackedFeatureVersion>| -> Ordering {
+                match (a, b) {
+                    // If we have a version for either solvable, but not the other,
+                    // the one with the version is better.
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    // If for neither solvable the version set selects a version we
+                    // keep them tied.
+                    (None, None) => Ordering::Equal,
+                    (Some(a), Some(b)) => a.compare_with_strategy(b, dependency_strategy),
                 }
+            };
+
+        // `groups` holds the ranges of `solvables` that are still tied.
+        let mut groups: Vec<(usize, usize)> = vec![(0, solvables.len())];
+        let mut keyed: Vec<(Option<TrackedFeatureVersion>, SolvableId)> = Vec::new();
+        for name in &sorted_unique_names {
+            if groups.is_empty() {
+                break;
             }
 
-            // Otherwise sort by timestamp (in reverse, we want the highest timestamp first)
-            let a_record = self.solvable_record(*a);
-            let b_record = self.solvable_record(*b);
-            b_record.timestamp().cmp(&a_record.timestamp())
-        });
-        st::add(&st::FINAL_SORT_NANOS, t_final.elapsed().as_nanos() as u64);
+            let mut next_groups = Vec::new();
+            for (group_start, group_end) in groups {
+                // Look up the best selectable version of this dependency for
+                // every member of the group.
+                keyed.clear();
+                keyed.extend(solvables[group_start..group_end].iter().map(|&id| {
+                    (
+                        id_and_deps
+                            .get(&(id, *name))
+                            .and_then(&mut find_best_selectable_version),
+                        id,
+                    )
+                }));
+
+                // Stable sort keeps tied solvables in their current order,
+                // matching the behavior of a single stable sort with a
+                // lexicographic comparator.
+                keyed.sort_by(|(a, _), (b, _)| compare_keys(a, b));
+
+                // Write the new order back and split off the ranges that are
+                // still tied.
+                let mut tie_start = 0;
+                for i in 0..keyed.len() {
+                    solvables[group_start + i] = keyed[i].1;
+                    if i + 1 == keyed.len()
+                        || compare_keys(&keyed[i].0, &keyed[i + 1].0) != Ordering::Equal
+                    {
+                        if i > tie_start {
+                            next_groups.push((group_start + tie_start, group_start + i + 1));
+                        }
+                        tie_start = i + 1;
+                    }
+                }
+            }
+            groups = next_groups;
+        }
+
+        // Break the remaining ties by timestamp (in reverse, we want the
+        // highest timestamp first).
+        for (group_start, group_end) in groups {
+            let mut keyed: Vec<_> = solvables[group_start..group_end]
+                .iter()
+                .map(|&id| (self.solvable_record(id).timestamp(), id))
+                .collect();
+            keyed.sort_by(|(a, _), (b, _)| b.cmp(a));
+            for (i, (_, id)) in keyed.into_iter().enumerate() {
+                solvables[group_start + i] = id;
+            }
+        }
 
         // Candidate matching reports cancellation as no matching version. Do not
         // retain the resulting partial/timestamp-biased ordering in that case.
@@ -494,13 +456,9 @@ pub(super) fn find_highest_version(
     solver: &SolverCache<CondaDependencyProvider<'_>>,
     highest_version_cache: &mut HashMap<VersionSetId, Option<(rattler_conda_types::Version, bool)>>,
 ) -> Option<(Version, bool)> {
-    use super::sort_stats as st;
-    st::add(&st::HIGHEST_VERSION_CALLS, 1);
     highest_version_cache
         .entry(match_spec_id)
         .or_insert_with(|| {
-            st::add(&st::HIGHEST_VERSION_MISSES, 1);
-            let t_miss = std::time::Instant::now();
             let candidates = solver
                 .get_or_cache_matching_candidates(match_spec_id)
                 .now_or_never()
@@ -540,7 +498,6 @@ pub(super) fn find_highest_version(
                 );
             }
 
-            st::add(&st::HIGHEST_VERSION_MISS_NANOS, t_miss.elapsed().as_nanos() as u64);
             highest_version
         })
         .clone()
