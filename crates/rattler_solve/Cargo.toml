@@ -30,6 +30,9 @@ url = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 rayon = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { version = "0.14", features = ["flamegraph"] }
 insta = { workspace = true, features = ["yaml"] }
 jiff = { workspace = true }
 once_cell = { workspace = true }
