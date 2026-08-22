@@ -5566,6 +5566,7 @@ dependencies = [
  "rattler_digest",
  "rattler_libsolv_c",
  "rattler_repodata_gateway",
+ "rayon",
  "resolvo",
  "rstest",
  "serde",
