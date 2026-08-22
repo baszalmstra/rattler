@@ -241,7 +241,7 @@ fn main() {
         let cases: Vec<Case> = parsed
             .iter()
             .filter_map(|(spec, nameless)| {
-                let name = spec.name.as_ref()?.as_exact()?.as_normalized();
+                let name = spec.name.as_exact()?.as_normalized();
                 let (name_key, _) = by_name.get_key_value(name)?;
                 if nameless.build.is_some()
                     || nameless.build_number.is_some()
