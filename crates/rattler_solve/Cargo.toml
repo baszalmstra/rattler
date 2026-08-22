@@ -28,8 +28,10 @@ serde = { workspace = true, optional = true }
 url = { workspace = true }
 
 [dev-dependencies]
+bincode = "1"
 criterion = { workspace = true }
 rayon = { workspace = true }
+resolvo = { workspace = true, features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { version = "0.14", features = ["flamegraph"] }
