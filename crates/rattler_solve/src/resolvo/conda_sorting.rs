@@ -208,6 +208,10 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
         solvables: &mut [SolvableId],
         version_cache: &mut HashMap<VersionSetId, Option<(Version, bool)>>,
     ) -> bool {
+        // For small runs a pairwise lexicographic comparator has less
+        // overhead than the column-by-column sort.
+        const SMALL_RUN_PAIRWISE_THRESHOLD: usize = 8;
+
         // Get the dependencies for each solvable
         let dependencies = solvables
             .iter()
@@ -335,7 +339,6 @@ impl<'a, 'repo> SolvableSorter<'a, 'repo> {
 
         // For small runs a pairwise lexicographic comparator has less
         // overhead than the column-by-column sort below.
-        const SMALL_RUN_PAIRWISE_THRESHOLD: usize = 8;
         if solvables.len() <= SMALL_RUN_PAIRWISE_THRESHOLD {
             solvables.sort_by(|a, b| {
                 for &name in sorted_unique_names.iter() {
