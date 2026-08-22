@@ -33,54 +33,7 @@ use crate::{
 
 mod conda_sorting;
 
-#[derive(Default)]
-struct MatchSpecParseCache {
-    /// Maps a raw matchspec string to its interned version sets and condition.
-    interned: HashMap<String, (Vec<VersionSetId>, Option<ConditionId>)>,
-
-    /// Match specs parsed ahead of time at provider construction. Parsing is
-    /// pure, so it can use all cores there, while interning stays lazy.
-    preparsed: HashMap<String, MatchSpec>,
-}
-
-/// Parses the dependency strings of the loaded records ahead of time. Parsing
-/// is by far the most expensive part of [`parse_match_spec`] and, unlike
-/// interning, it is pure — so on native targets it is done in parallel.
-/// Interning still happens lazily for only the packages the solver visits.
-///
-/// Specs that fail to parse are simply not stored: [`parse_match_spec`] parses
-/// them again on demand and reports the error exactly as before.
-#[cfg(not(target_arch = "wasm32"))]
-fn preparse_match_specs(mut strings: Vec<&str>) -> HashMap<String, MatchSpec> {
-    use rayon::prelude::*;
-
-    // Below this size the fixed cost of fanning out to the thread pool
-    // exceeds the parsing work itself.
-    const MIN_SPECS_TO_PREPARSE: usize = 128;
-
-    strings.sort_unstable();
-    strings.dedup();
-    if strings.len() < MIN_SPECS_TO_PREPARSE {
-        return HashMap::new();
-    }
-
-    strings
-        .into_par_iter()
-        .filter_map(|spec_str| {
-            MatchSpec::from_str(
-                spec_str,
-                ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
-            )
-            .ok()
-            .map(|spec| (spec_str.to_owned(), spec))
-        })
-        .collect()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn preparse_match_specs(_strings: Vec<&str>) -> HashMap<String, MatchSpec> {
-    HashMap::new()
-}
+type MatchSpecParseCache = HashMap<String, (Vec<VersionSetId>, Option<ConditionId>)>;
 
 fn exclude_newer_reason(
     config: &ExcludeNewer,
@@ -464,10 +417,6 @@ impl<'a> CondaDependencyProvider<'a> {
             .filter(|spec| spec.channel.is_some())
             .collect::<Vec<_>>();
 
-        // Collects the dependency strings of all interned records so they can
-        // be parsed ahead of time, in parallel, once all records are known.
-        let mut dependency_strings: Vec<&'a str> = Vec::new();
-
         // Hashmap that maps the package name to the channel it was first found in.
         // Only maintained (and consulted) for [`ChannelPriority::Strict`].
         let mut package_name_found_in_channel = HashMap::<&str, &Option<String>>::new();
@@ -559,16 +508,6 @@ impl<'a> CondaDependencyProvider<'a> {
                     pool.intern_package_name(NameType::from(&record.package_record.name));
                 let solvable_id =
                     pool.intern_solvable(package_name, SolverPackageRecord::Record(record));
-
-                dependency_strings.extend(
-                    record
-                        .package_record
-                        .depends
-                        .iter()
-                        .chain(record.package_record.constrains.iter())
-                        .chain(record.package_record.extra_depends.values().flatten())
-                        .map(String::as_str),
-                );
 
                 // Update records with all entries in a single mutable borrow
                 let candidates = records.entry(package_name).or_default();
@@ -745,10 +684,7 @@ impl<'a> CondaDependencyProvider<'a> {
             records,
             dependency_tiebreak_cache: RefCell::default(),
             matchspec_to_highest_version: RefCell::default(),
-            parse_match_spec_cache: RefCell::new(MatchSpecParseCache {
-                interned: HashMap::new(),
-                preparsed: preparse_match_specs(dependency_strings),
-            }),
+            parse_match_spec_cache: RefCell::default(),
             stop_time,
             cancellation_token,
             strategy,
@@ -1296,19 +1232,16 @@ fn parse_match_spec(
     spec_str: &str,
     parse_match_spec_cache: &mut MatchSpecParseCache,
 ) -> Result<(Vec<VersionSetId>, Option<ConditionId>), ParseMatchSpecError> {
-    if let Some(cached) = parse_match_spec_cache.interned.get(spec_str) {
+    if let Some(cached) = parse_match_spec_cache.get(spec_str) {
         return Ok(cached.clone());
     }
 
     // Parse the match spec and extract the name of the package it depends on.
     // Enable conditionals parsing to support dependencies with conditions like `numpy[when="python >=3.9"]`
-    let match_spec = match parse_match_spec_cache.preparsed.get(spec_str) {
-        Some(match_spec) => match_spec.clone(),
-        None => MatchSpec::from_str(
-            spec_str,
-            ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
-        )?,
-    };
+    let match_spec = MatchSpec::from_str(
+        spec_str,
+        ParseMatchSpecOptions::lenient().with_repodata_revision(RepodataRevision::V3),
+    )?;
     let condition_id = if let Some(condition) = match_spec.condition.as_ref() {
         let condition_id = parse_condition(condition, pool, parse_match_spec_cache);
         Some(condition_id)
@@ -1320,7 +1253,7 @@ fn parse_match_spec(
     let version_set_ids = version_sets_for_match_spec(pool, match_spec);
 
     // Store in the match spec cache
-    parse_match_spec_cache.interned.insert(
+    parse_match_spec_cache.insert(
         spec_str.to_string(),
         (version_set_ids.clone(), condition_id),
     );
