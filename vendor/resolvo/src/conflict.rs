@@ -246,19 +246,36 @@ impl Conflict {
                         .expect("only solvables can be excluded");
                     let node1_id = Self::add_node(&mut graph, &mut nodes, solvable1);
 
-                    let VariableOrigin::ForbidMultiple(name) =
-                        state.variable_map.origin(instance2_id.variable())
-                    else {
-                        unreachable!("expected only forbid variables")
-                    };
-
-                    let previous_node = last_node_by_name.insert(name, node1_id);
-                    if let Some(previous_node) = previous_node {
-                        graph.add_edge(
-                            previous_node,
-                            node1_id,
-                            ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                        );
+                    match state.variable_map.origin(instance2_id.variable()) {
+                        VariableOrigin::ForbidMultiple(name) => {
+                            // Bitwise-encoded shape: the second literal is a
+                            // helper variable, so successive clauses of the
+                            // same name are chained.
+                            let previous_node = last_node_by_name.insert(name, node1_id);
+                            if let Some(previous_node) = previous_node {
+                                graph.add_edge(
+                                    previous_node,
+                                    node1_id,
+                                    ConflictEdge::Conflict(
+                                        ConflictCause::ForbidMultipleInstances,
+                                    ),
+                                );
+                            }
+                        }
+                        _ => {
+                            // Native at-most-one shape: the second literal is
+                            // the conflicting same-name candidate itself.
+                            let solvable2 = instance2_id
+                                .variable()
+                                .as_solvable_or_root(&state.variable_map)
+                                .expect("only solvables can be excluded");
+                            let node2_id = Self::add_node(&mut graph, &mut nodes, solvable2);
+                            graph.add_edge(
+                                node1_id,
+                                node2_id,
+                                ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                            );
+                        }
                     }
                 }
                 &Clause::Constrains(package_id, dep_id, version_set_id) => {
