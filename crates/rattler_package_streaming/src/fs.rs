@@ -1,6 +1,6 @@
 //! Functions to extracting or stream a Conda package from a file on disk.
 
-use crate::{ExtractError, ExtractResult, seek::read_package_file};
+use crate::{ExtractError, ExtractOptions, ExtractResult, seek::read_package_file};
 use rattler_conda_types::{
     ConvertSubdirError, PackageRecord, RepoDataRecord,
     package::{ArchiveIdentifier, CondaArchiveType, DistArchiveIdentifier, IndexJson},
@@ -20,8 +20,18 @@ use std::path::Path;
 ///     .unwrap();
 /// ```
 pub fn extract_tar_bz2(archive: &Path, destination: &Path) -> Result<ExtractResult, ExtractError> {
+    extract_tar_bz2_with_options(archive, destination, &ExtractOptions::default())
+}
+
+/// Extracts the contents a `.tar.bz2` package archive at the specified path
+/// to a directory, with the given options.
+pub fn extract_tar_bz2_with_options(
+    archive: &Path,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     let file = File::open(archive)?;
-    crate::read::extract_tar_bz2(file, destination)
+    crate::read::extract_tar_bz2_with_options(file, destination, options)
 }
 
 /// Extracts the contents a `.conda` package archive at the specified path to a directory.
@@ -35,8 +45,18 @@ pub fn extract_tar_bz2(archive: &Path, destination: &Path) -> Result<ExtractResu
 ///     .unwrap();
 /// ```
 pub fn extract_conda(archive: &Path, destination: &Path) -> Result<ExtractResult, ExtractError> {
+    extract_conda_with_options(archive, destination, &ExtractOptions::default())
+}
+
+/// Extracts the contents a `.conda` package archive at the specified path to
+/// a directory, with the given options.
+pub fn extract_conda_with_options(
+    archive: &Path,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     let file = File::open(archive)?;
-    crate::read::extract_conda_via_streaming(file, destination)
+    crate::read::extract_conda_via_streaming_with_options(file, destination, options)
 }
 
 /// Extracts the contents a package archive at the specified path to a directory. The type of
@@ -51,9 +71,20 @@ pub fn extract_conda(archive: &Path, destination: &Path) -> Result<ExtractResult
 ///     .unwrap();
 /// ```
 pub fn extract(archive: &Path, destination: &Path) -> Result<ExtractResult, ExtractError> {
+    extract_with_options(archive, destination, &ExtractOptions::default())
+}
+
+/// Extracts the contents a package archive at the specified path to a
+/// directory, with the given options. The type of package is determined based
+/// on the file extension of the archive path.
+pub fn extract_with_options(
+    archive: &Path,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     match CondaArchiveType::try_from(archive).ok_or(ExtractError::UnsupportedArchiveType)? {
-        CondaArchiveType::TarBz2 => extract_tar_bz2(archive, destination),
-        CondaArchiveType::Conda => extract_conda(archive, destination),
+        CondaArchiveType::TarBz2 => extract_tar_bz2_with_options(archive, destination, options),
+        CondaArchiveType::Conda => extract_conda_with_options(archive, destination, options),
     }
 }
 

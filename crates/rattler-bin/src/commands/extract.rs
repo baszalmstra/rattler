@@ -6,7 +6,7 @@ use std::{
 use futures_util::{StreamExt, stream};
 use miette::{Context, IntoDiagnostic};
 use rattler_conda_types::package::{CondaArchiveIdentifier, CondaArchiveType};
-use rattler_package_streaming::ExtractResult;
+use rattler_package_streaming::{ExtractOptions, ExtractResult};
 use reqwest_middleware::ClientWithMiddleware;
 use url::Url;
 
@@ -31,6 +31,11 @@ pub struct Opt {
     /// Number of packages to extract concurrently.
     #[clap(long, default_value_t = 1)]
     concurrency: usize,
+
+    /// Share extracted files through a content-addressed store at this
+    /// directory. Must be on the same filesystem as the destination.
+    #[clap(long)]
+    file_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -85,16 +90,18 @@ async fn extract_one(
     destination: PathBuf,
     mode: Mode,
     client: &ClientWithMiddleware,
+    options: &ExtractOptions,
 ) -> miette::Result<(Source, PathBuf, ExtractResult, Duration)> {
     let start = Instant::now();
     let result = match (&source, mode) {
         (Source::Url(url), _) => {
-            rattler_package_streaming::reqwest::tokio::extract(
+            rattler_package_streaming::reqwest::tokio::extract_with_options(
                 client.clone(),
                 url.clone(),
                 &destination,
                 None,
                 None,
+                options,
             )
             .await
         }
@@ -108,10 +115,12 @@ async fn extract_one(
                     Err(err) => Err(rattler_package_streaming::ExtractError::IoError(err)),
                     Ok(file) => match archive_type {
                         CondaArchiveType::TarBz2 => {
-                            async_read::extract_tar_bz2(file, &destination).await
+                            async_read::extract_tar_bz2_with_options(file, &destination, options)
+                                .await
                         }
                         CondaArchiveType::Conda => {
-                            async_read::extract_conda(file, &destination).await
+                            async_read::extract_conda_with_options(file, &destination, options)
+                                .await
                         }
                     },
                 },
@@ -120,8 +129,9 @@ async fn extract_one(
         (Source::Path(path), Mode::Sync) => {
             let path = path.clone();
             let destination = destination.clone();
+            let options = options.clone();
             tokio::task::spawn_blocking(move || {
-                rattler_package_streaming::fs::extract(&path, &destination)
+                rattler_package_streaming::fs::extract_with_options(&path, &destination, &options)
             })
             .await
             .into_diagnostic()?
@@ -154,8 +164,11 @@ pub async fn extract(opt: Opt, offline: bool) -> miette::Result<()> {
     let mode = opt.mode;
     let total = jobs.len();
     let client = super::client::create_client_with_middleware(offline)?;
+    let options = ExtractOptions {
+        file_store: opt.file_store,
+    };
     let mut results = stream::iter(jobs)
-        .map(|(source, destination)| extract_one(source, destination, mode, &client))
+        .map(|(source, destination)| extract_one(source, destination, mode, &client, &options))
         .buffer_unordered(concurrency);
 
     // Report each package as it finishes; a failure does not hide the others.
@@ -175,6 +188,12 @@ pub async fn extract(opt: Opt, offline: bool) -> miette::Result<()> {
                 println!("  SHA256: {}", hex::encode(result.sha256));
                 println!("  MD5: {}", hex::encode(result.md5));
                 println!("  Size: {} bytes", result.total_size);
+                if let Some(stats) = result.file_store {
+                    println!(
+                        "  Store: {} files, {} added, {} reused ({} bytes), {} private",
+                        stats.files, stats.added, stats.reused, stats.bytes_reused, stats.unshared
+                    );
+                }
             }
             Err(err) => {
                 eprintln!("{} {err:?}", console::style("✗").red());

@@ -1,8 +1,9 @@
 //! Functions that enable extracting or streaming a Conda package for objects that implement the
 //! [`std::io::Read`] trait.
 
-use super::{ExtractError, ExtractResult};
-use std::io::{Seek, SeekFrom, copy};
+use super::{ExtractError, ExtractOptions, ExtractResult};
+use crate::file_store::{ExtractedFile, FileStore, FileStoreStats, KnownShards, SMALL_FILE_LIMIT};
+use std::io::{Seek, SeekFrom, Write, copy};
 use std::mem::ManuallyDrop;
 use std::{
     collections::HashSet,
@@ -36,8 +37,17 @@ pub fn extract_tar_bz2(
     reader: impl Read,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
+    extract_tar_bz2_with_options(reader, destination, &ExtractOptions::default())
+}
+
+/// Extracts the contents a `.tar.bz2` package archive with the given options.
+pub fn extract_tar_bz2_with_options(
+    reader: impl Read,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     process_with_hashing(reader, |reader| {
-        extract_tar_bz2_without_hashing(reader, destination)
+        extract_tar_bz2_without_hashing(reader, destination, options)
     })
 }
 
@@ -45,13 +55,16 @@ pub fn extract_tar_bz2(
 pub(crate) fn extract_tar_bz2_without_hashing(
     mut reader: impl Read,
     destination: &Path,
-) -> Result<(), ExtractError> {
+    options: &ExtractOptions,
+) -> Result<Option<FileStoreStats>, ExtractError> {
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
+    let store = options.file_store.as_deref().map(FileStore::new);
     let mut archive = stream_tar_bz2(&mut reader);
-    unpack_tar_archive_sync(&mut archive, destination)?;
+    let mut files = Vec::new();
+    unpack_tar_archive_sync(&mut archive, destination, store.as_ref(), &mut files)?;
     drain_decoder(archive.into_inner())?;
     copy(&mut reader, &mut std::io::sink())?;
-    Ok(())
+    Ok(store.as_ref().map(|store| store.publish(&files)))
 }
 
 /// Reads a decompressor to its end after the tar reader stopped at the
@@ -67,8 +80,17 @@ pub fn extract_conda_via_streaming(
     reader: impl Read,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
+    extract_conda_via_streaming_with_options(reader, destination, &ExtractOptions::default())
+}
+
+/// Extracts the contents of a `.conda` package archive with the given options.
+pub fn extract_conda_via_streaming_with_options(
+    reader: impl Read,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     process_with_hashing(reader, |reader| {
-        extract_conda_via_streaming_without_hashing(reader, destination)
+        extract_conda_via_streaming_without_hashing(reader, destination, options)
     })
 }
 
@@ -76,13 +98,16 @@ pub fn extract_conda_via_streaming(
 pub(crate) fn extract_conda_via_streaming_without_hashing(
     mut reader: impl Read,
     destination: &Path,
-) -> Result<(), ExtractError> {
+    options: &ExtractOptions,
+) -> Result<Option<FileStoreStats>, ExtractError> {
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
+    let store = options.file_store.as_deref().map(FileStore::new);
+    let mut files = Vec::new();
     while let Some(file) = read_zipfile_from_stream(&mut reader)? {
-        extract_zipfile(file, destination)?;
+        extract_zipfile(file, destination, store.as_ref(), &mut files)?;
     }
     copy(&mut reader, &mut std::io::sink())?;
-    Ok(())
+    Ok(store.as_ref().map(|store| store.publish(&files)))
 }
 
 /// Extracts the contents of a .conda package archive by fully reading the stream and then decompressing
@@ -90,8 +115,18 @@ pub fn extract_conda_via_buffering(
     reader: impl Read,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
+    extract_conda_via_buffering_with_options(reader, destination, &ExtractOptions::default())
+}
+
+/// Extracts the contents of a .conda package archive by fully reading the
+/// stream and then decompressing, with the given options.
+pub fn extract_conda_via_buffering_with_options(
+    reader: impl Read,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     process_with_hashing(reader, |reader| {
-        extract_conda_via_buffering_without_hashing(reader, destination)
+        extract_conda_via_buffering_without_hashing(reader, destination, options)
     })
 }
 
@@ -99,12 +134,14 @@ pub fn extract_conda_via_buffering(
 pub(crate) fn extract_conda_via_buffering_without_hashing(
     mut reader: impl Read,
     destination: &Path,
-) -> Result<(), ExtractError> {
+    options: &ExtractOptions,
+) -> Result<Option<FileStoreStats>, ExtractError> {
     // delete destination first, as this method is usually used as a fallback from a failed streaming decompression
     if destination.exists() {
         std::fs::remove_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
     }
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
+    let store = options.file_store.as_deref().map(FileStore::new);
 
     // Create a SpooledTempFile with a 5MB limit
     let mut temp_file = SpooledTempFile::new(5 * 1024 * 1024);
@@ -112,16 +149,19 @@ pub(crate) fn extract_conda_via_buffering_without_hashing(
     temp_file.seek(SeekFrom::Start(0))?;
     let mut archive = ZipArchive::new(temp_file)?;
 
+    let mut files = Vec::new();
     for index in 0..archive.len() {
         let file = archive.by_index(index)?;
-        extract_zipfile(file, destination)?;
+        extract_zipfile(file, destination, store.as_ref(), &mut files)?;
     }
-    Ok(())
+    Ok(store.as_ref().map(|store| store.publish(&files)))
 }
 
 fn extract_zipfile<R: std::io::Read>(
     zip_file: ZipFile<'_, R>,
     destination: &Path,
+    store: Option<&FileStore>,
+    files: &mut Vec<ExtractedFile>,
 ) -> Result<(), ExtractError> {
     // If an error occurs while we are reading the contents of the zip we don't want to
     // seek to the end of the file. Using [`ManuallyDrop`] we prevent `drop` to be called on
@@ -135,7 +175,7 @@ fn extract_zipfile<R: std::io::Read>(
         .is_some_and(|file_name| file_name.ends_with(".tar.zst"))
     {
         let mut archive = stream_tar_zst(&mut *file)?;
-        unpack_tar_archive_sync(&mut archive, destination)?;
+        unpack_tar_archive_sync(&mut archive, destination, store, files)?;
         drain_decoder(archive.into_inner())?;
     } else {
         // Manually read to the end of the stream if that didn't happen.
@@ -161,6 +201,8 @@ fn extract_zipfile<R: std::io::Read>(
 fn unpack_tar_archive_sync<R: Read>(
     archive: &mut tar::Archive<R>,
     destination: &Path,
+    store: Option<&FileStore>,
+    files: &mut Vec<ExtractedFile>,
 ) -> Result<(), ExtractError> {
     archive.set_preserve_mtime(false);
 
@@ -168,6 +210,10 @@ fn unpack_tar_archive_sync<R: Read>(
     // verbatim form that `std::fs::canonicalize` returns.
     let destination = dunce::canonicalize(destination).map_err(ExtractError::IoError)?;
     let mut validated_parents: HashSet<PathBuf> = HashSet::new();
+    // Holds one small file at a time while its store object is looked up.
+    let mut small_file = Vec::new();
+    let known_shards = store.map(FileStore::known_shards).unwrap_or_default();
+    let min_shared_size = crate::file_store::min_shared_file_size();
 
     for entry in archive.entries().map_err(ExtractError::IoError)? {
         let mut entry = entry.map_err(ExtractError::IoError)?;
@@ -208,8 +254,30 @@ fn unpack_tar_archive_sync<R: Read>(
         }
 
         if is_regular_file {
-            unpack_file(&mut entry, &file_dst, mtime)
-                .map_err(|err| unpack_error(&entry_path, err))?;
+            // Package metadata under `info/` is rewritten in place by some
+            // tools, so it is never shared between packages.
+            let shareable = entry.size() >= min_shared_size
+                && file_dst
+                    .strip_prefix(&destination)
+                    .is_ok_and(|relative| !relative.starts_with("info"));
+            match store.filter(|_| shareable) {
+                Some(store) => {
+                    let file = unpack_shared_file(
+                        store,
+                        &known_shards,
+                        &mut entry,
+                        &file_dst,
+                        mtime,
+                        &mut small_file,
+                    )
+                    .map_err(|err| unpack_error(&entry_path, err))?;
+                    files.push(file);
+                }
+                None => {
+                    unpack_file(&mut entry, &file_dst, mtime)
+                        .map_err(|err| unpack_error(&entry_path, err))?;
+                }
+            }
         } else {
             if entry_type.is_hard_link() {
                 unpack_hard_link(&destination, &entry, &file_dst)
@@ -238,13 +306,125 @@ const UNPACK_WRITE_BUFFER_SIZE: usize = 128 * 1024;
 /// Writes a regular file entry to `file_dst`.
 ///
 /// [`tar::Entry::unpack`] copies with 8 KiB writes; buffering up to the file
-/// size cuts the number of write calls, which dominates on Windows. The mtime
-/// is set through the open handle, saving a reopen per file.
+/// size cuts the number of write calls, which dominates on Windows.
 fn unpack_file<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     file_dst: &Path,
     mtime: u64,
 ) -> std::io::Result<()> {
+    let mode = entry.header().mode().ok();
+    let capacity = write_buffer_capacity(entry.size());
+    write_file(file_dst, mode, mtime, capacity, |writer| {
+        copy(entry, writer)
+    })?;
+    Ok(())
+}
+
+/// Writes a regular file entry that may be shared through the store.
+///
+/// Small files are hashed in memory first and linked from an existing object
+/// when there is one, so on a warm store they cost a single link call. Larger
+/// files are hashed while they are written and shared afterwards by
+/// [`FileStore::publish`].
+fn unpack_shared_file<R: Read>(
+    store: &FileStore,
+    shards: &KnownShards,
+    entry: &mut tar::Entry<'_, R>,
+    file_dst: &Path,
+    mtime: u64,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<ExtractedFile> {
+    let mode = entry.header().mode().ok();
+    let executable = mode.is_some_and(|mode| mode & 0o111 != 0);
+    let size = entry.size();
+
+    if size <= SMALL_FILE_LIMIT {
+        buffer.clear();
+        entry.read_to_end(buffer)?;
+        let digest = blake3::hash(buffer);
+        match store.link_existing(shards, &digest, executable, file_dst) {
+            Ok(true) => {
+                return Ok(ExtractedFile::new(
+                    file_dst.to_path_buf(),
+                    digest,
+                    executable,
+                    buffer.len() as u64,
+                    true,
+                ));
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::debug!(
+                    "could not link {} from the store: {err}",
+                    file_dst.display()
+                );
+            }
+        }
+        let written = write_file(file_dst, mode, mtime, buffer.len(), |writer| {
+            writer.write_all(buffer)?;
+            Ok(buffer.len() as u64)
+        })?;
+        return Ok(ExtractedFile::new(
+            file_dst.to_path_buf(),
+            digest,
+            executable,
+            written,
+            false,
+        ));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    let capacity = write_buffer_capacity(size);
+    let written = write_file(file_dst, mode, mtime, capacity, |writer| {
+        let mut reader = HashingRead {
+            inner: entry,
+            hasher: &mut hasher,
+        };
+        copy(&mut reader, writer)
+    })?;
+    Ok(ExtractedFile::new(
+        file_dst.to_path_buf(),
+        hasher.finalize(),
+        executable,
+        written,
+        false,
+    ))
+}
+
+/// Feeds everything read through it to a BLAKE3 hasher.
+struct HashingRead<'a, R> {
+    inner: &'a mut R,
+    hasher: &'a mut blake3::Hasher,
+}
+
+impl<R: Read> Read for HashingRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
+    }
+}
+
+/// A write buffer sized to the file, capped so large files stream.
+fn write_buffer_capacity(size: u64) -> usize {
+    usize::try_from(size)
+        .unwrap_or(UNPACK_WRITE_BUFFER_SIZE)
+        .min(UNPACK_WRITE_BUFFER_SIZE)
+}
+
+/// Creates `file_dst`, lets `write` fill it through a buffer of `capacity`
+/// bytes, then applies the mode and mtime through the open handle, saving a
+/// reopen per file. Returns the number of bytes `write` reported.
+fn write_file<W>(
+    file_dst: &Path,
+    mode: Option<u32>,
+    mtime: u64,
+    capacity: usize,
+    write: W,
+) -> std::io::Result<u64>
+where
+    W: FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<u64>,
+{
     fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
         std::fs::OpenOptions::new()
             .write(true)
@@ -263,11 +443,8 @@ fn unpack_file<R: Read>(
         Err(err) => return Err(err),
     };
 
-    let capacity = usize::try_from(entry.size())
-        .unwrap_or(UNPACK_WRITE_BUFFER_SIZE)
-        .min(UNPACK_WRITE_BUFFER_SIZE);
     let mut writer = std::io::BufWriter::with_capacity(capacity, file);
-    copy(entry, &mut writer)?;
+    let written = write(&mut writer)?;
     let file = writer
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)?;
@@ -275,10 +452,12 @@ fn unpack_file<R: Read>(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(mode) = entry.header().mode() {
+        if let Some(mode) = mode {
             file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
         }
     }
+    #[cfg(not(unix))]
+    let _ = mode;
 
     let clamped = std::cmp::max(mtime, SAFE_MTIME_FLOOR);
     let file_time = filetime::FileTime::from_unix_time(clamped as i64, 0);
@@ -292,7 +471,7 @@ fn unpack_file<R: Read>(
         );
     }
 
-    Ok(())
+    Ok(written)
 }
 
 /// Creates `dir` and any missing ancestors, after checking that the deepest
@@ -474,7 +653,7 @@ where
                 rattler_digest::Md5,
             >,
         >,
-    ) -> Result<(), E>,
+    ) -> Result<Option<FileStoreStats>, E>,
 {
     // Wrap the reading in additional readers that will compute the hashes of the file while its
     // being read, and count the total size.
@@ -485,7 +664,7 @@ where
 
     // Every extractor reads its input to the end, so the hashes cover the
     // whole stream once it returns.
-    processor(&mut size_reader)?;
+    let file_store = processor(&mut size_reader)?;
 
     // Get the size and hashes
     let (_, total_size) = size_reader.finalize();
@@ -506,5 +685,6 @@ where
         sha256,
         md5,
         total_size,
+        file_store,
     })
 }

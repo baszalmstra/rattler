@@ -28,7 +28,7 @@ use rattler_networking::{
     LazyClient,
     retry_policies::{DoNotRetryPolicy, RetryDecision, RetryPolicy},
 };
-use rattler_package_streaming::{DownloadReporter, ExtractError};
+use rattler_package_streaming::{DownloadReporter, ExtractError, ExtractOptions};
 use rattler_redaction::Redact;
 pub use reporter::CacheReporter;
 use simple_spawn_blocking::Cancelled;
@@ -52,6 +52,7 @@ mod reporter;
 pub struct PackageCache {
     inner: Arc<PackageCacheInner>,
     cache_origin: bool,
+    file_store: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -470,6 +471,25 @@ impl PackageCache {
         }
     }
 
+    /// Shares the files of extracted packages through a content-addressed
+    /// store rooted at `path`, so packages that ship identical files occupy
+    /// the disk once. The store must be on the same filesystem as the cache
+    /// layer that is written to; otherwise packages keep private copies. See
+    /// [`rattler_package_streaming::file_store`].
+    pub fn with_file_store(self, path: impl Into<PathBuf>) -> Self {
+        Self {
+            file_store: Some(path.into()),
+            ..self
+        }
+    }
+
+    /// The options every package in this cache is extracted with.
+    fn extract_options(&self) -> ExtractOptions {
+        ExtractOptions {
+            file_store: self.file_store.clone(),
+        }
+    }
+
     /// Prepends a configured layer to this cache.
     ///
     /// Existing layers, filters, cached-origin behavior, and in-memory entry
@@ -557,6 +577,7 @@ impl PackageCache {
                 layers: layers.into_iter().collect(),
             }),
             cache_origin,
+            file_store: None,
         }
     }
 
@@ -771,14 +792,20 @@ impl PackageCache {
             cache_key = cache_key.with_path(path);
         }
 
+        let options = self.extract_options();
         self.get_or_fetch(
             cache_key,
             move |destination| {
                 let path_buf = path_buf.clone();
+                let options = options.clone();
                 async move {
-                    rattler_package_streaming::tokio::fs::extract(&path_buf, &destination)
-                        .await
-                        .map(|_| ())
+                    rattler_package_streaming::tokio::fs::extract_with_options(
+                        &path_buf,
+                        &destination,
+                        &options,
+                    )
+                    .await
+                    .map(|_| ())
                 }
             },
             reporter,
@@ -822,6 +849,7 @@ impl PackageCache {
         let sha256 = cache_key.sha256();
         let md5 = cache_key.md5();
         let download_reporter = reporter.clone();
+        let options = self.extract_options();
         // Get or fetch the package, using the specified fetch function
         self.get_or_fetch(cache_key, move |destination| {
             let url = url.clone();
@@ -829,6 +857,7 @@ impl PackageCache {
             let retry_policy = retry_policy.clone();
             let download_reporter = download_reporter.clone();
             let concurrent_requests_semaphore = concurrent_requests_semaphore.clone();
+            let options = options.clone();
             async move {
                 // Acquire a permit to limit the number of concurrent download
                 // and extraction operations. The permit is held until the
@@ -849,7 +878,7 @@ impl PackageCache {
                     current_try += 1;
                     tracing::debug!("downloading {} to {}", &url, destination.display());
                     // Extract the package
-                    let result = rattler_package_streaming::reqwest::tokio::extract(
+                    let result = rattler_package_streaming::reqwest::tokio::extract_with_options(
                         client.client().clone(),
                         url.clone(),
                         &destination,
@@ -858,6 +887,7 @@ impl PackageCache {
                             reporter,
                             index: Mutex::new(None),
                         }) as Arc::<dyn DownloadReporter>),
+                        &options,
                     )
                         .await;
 
@@ -1034,7 +1064,7 @@ where
 #[cfg(windows)]
 fn is_transient_rename_error(err: &std::io::Error) -> bool {
     // 5 = ERROR_ACCESS_DENIED, 32 = ERROR_SHARING_VIOLATION.
-    matches!(err.raw_os_error(), Some(5) | Some(32))
+    matches!(err.raw_os_error(), Some(5 | 32))
 }
 
 /// Shared logic for validating a package.

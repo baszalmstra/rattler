@@ -20,7 +20,7 @@ use futures_util::future::{self, Either};
 use rattler_digest::{Md5, Sha256, digest::Digest};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{ExtractError, ExtractResult};
+use crate::{ExtractError, ExtractOptions, ExtractResult, FileStoreStats};
 
 use super::shared::DEFAULT_BUF_SIZE;
 
@@ -37,9 +37,22 @@ pub async fn extract_tar_bz2(
     reader: impl AsyncRead + Unpin,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
-    extract_blocking(reader, destination, |reader, destination| {
-        crate::read::extract_tar_bz2_without_hashing(reader, destination)
-    })
+    extract_tar_bz2_with_options(reader, destination, &ExtractOptions::default()).await
+}
+
+/// Extracts the contents of a `.tar.bz2` package archive with the given
+/// options.
+pub async fn extract_tar_bz2_with_options(
+    reader: impl AsyncRead + Unpin,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
+    extract_blocking(
+        reader,
+        destination,
+        options,
+        crate::read::extract_tar_bz2_without_hashing,
+    )
     .await
 }
 
@@ -49,9 +62,22 @@ pub async fn extract_conda(
     reader: impl AsyncRead + Unpin,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
-    extract_blocking(reader, destination, |reader, destination| {
-        crate::read::extract_conda_via_streaming_without_hashing(reader, destination)
-    })
+    extract_conda_with_options(reader, destination, &ExtractOptions::default()).await
+}
+
+/// Extracts the contents of a `.conda` package archive with the given
+/// options, decompressing the stream as it arrives.
+pub async fn extract_conda_with_options(
+    reader: impl AsyncRead + Unpin,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
+    extract_blocking(
+        reader,
+        destination,
+        options,
+        crate::read::extract_conda_via_streaming_without_hashing,
+    )
     .await
 }
 
@@ -62,9 +88,22 @@ pub async fn extract_conda_via_buffering(
     reader: impl AsyncRead + Unpin,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
-    extract_blocking(reader, destination, |reader, destination| {
-        crate::read::extract_conda_via_buffering_without_hashing(reader, destination)
-    })
+    extract_conda_via_buffering_with_options(reader, destination, &ExtractOptions::default()).await
+}
+
+/// Extracts the contents of a `.conda` package archive by fully reading the
+/// stream before decompressing, with the given options.
+pub async fn extract_conda_via_buffering_with_options(
+    reader: impl AsyncRead + Unpin,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
+    extract_blocking(
+        reader,
+        destination,
+        options,
+        crate::read::extract_conda_via_buffering_without_hashing,
+    )
     .await
 }
 
@@ -118,6 +157,14 @@ async fn read_exact_or_eof<R: AsyncRead + Unpin>(
     Ok(filled)
 }
 
+/// A blocking extractor that reads an archive from a reader into a directory
+/// and reports what the file store did, if one was configured.
+type Extractor = fn(
+    Box<dyn Read + Send>,
+    &Path,
+    &ExtractOptions,
+) -> Result<Option<FileStoreStats>, ExtractError>;
+
 /// Sets the cancellation flag when dropped, so a worker whose future went
 /// away stops at its next read.
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -129,8 +176,8 @@ impl Drop for CancelOnDrop {
 }
 
 fn flatten_worker_result(
-    joined: Result<Result<(), ExtractError>, tokio::task::JoinError>,
-) -> Result<(), ExtractError> {
+    joined: Result<Result<Option<FileStoreStats>, ExtractError>, tokio::task::JoinError>,
+) -> Result<Option<FileStoreStats>, ExtractError> {
     match joined {
         Ok(result) => result,
         Err(err) => {
@@ -157,7 +204,8 @@ fn flatten_worker_result(
 async fn extract_blocking<R: AsyncRead + Unpin>(
     reader: R,
     destination: &Path,
-    extract: fn(Box<dyn Read + Send>, &Path) -> Result<(), ExtractError>,
+    options: &ExtractOptions,
+    extract: Extractor,
 ) -> Result<ExtractResult, ExtractError> {
     let (sender, receiver) = tokio::sync::mpsc::channel(CHUNKS_IN_FLIGHT);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -169,7 +217,9 @@ async fn extract_blocking<R: AsyncRead + Unpin>(
         cancelled,
     };
     let destination = destination.to_path_buf();
-    let mut worker = tokio::task::spawn_blocking(move || extract(Box::new(chunks), &destination));
+    let options = options.clone();
+    let mut worker =
+        tokio::task::spawn_blocking(move || extract(Box::new(chunks), &destination, &options));
 
     let pump = async move {
         let mut reader = reader;
@@ -202,6 +252,7 @@ async fn extract_blocking<R: AsyncRead + Unpin>(
             sha256: sha256.finalize(),
             md5: md5.finalize(),
             total_size,
+            file_store: None,
         })
     };
 
@@ -210,8 +261,8 @@ async fn extract_blocking<R: AsyncRead + Unpin>(
     // early.
     let pump = std::pin::pin!(pump);
     match future::select(pump, &mut worker).await {
-        Either::Left((Ok(result), worker)) => {
-            flatten_worker_result(worker.await)?;
+        Either::Left((Ok(mut result), worker)) => {
+            result.file_store = flatten_worker_result(worker.await)?;
             Ok(result)
         }
         Either::Left((Err(err), worker)) => {
@@ -222,8 +273,10 @@ async fn extract_blocking<R: AsyncRead + Unpin>(
             Err(ExtractError::IoError(err))
         }
         Either::Right((joined, pump)) => {
-            flatten_worker_result(joined)?;
-            pump.await.map_err(ExtractError::IoError)
+            let file_store = flatten_worker_result(joined)?;
+            let mut result = pump.await.map_err(ExtractError::IoError)?;
+            result.file_store = file_store;
+            Ok(result)
         }
     }
 }

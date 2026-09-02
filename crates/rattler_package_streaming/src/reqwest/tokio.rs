@@ -14,7 +14,7 @@ use tracing;
 use url::Url;
 use zip::result::ZipError;
 
-use crate::{DownloadReporter, ExtractError, ExtractResult};
+use crate::{DownloadReporter, ExtractError, ExtractOptions, ExtractResult};
 
 /// zip files may use data descriptors to signal that the decompressor needs to
 /// seek ahead in the buffer to find the compressed data length.
@@ -115,9 +115,32 @@ pub async fn extract_tar_bz2(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
+    extract_tar_bz2_with_options(
+        client,
+        url,
+        destination,
+        expected_sha256,
+        reporter,
+        &ExtractOptions::default(),
+    )
+    .await
+}
+
+/// Extracts the contents a `.tar.bz2` package archive from the specified
+/// remote location, with the given options.
+pub async fn extract_tar_bz2_with_options(
+    client: reqwest_middleware::ClientWithMiddleware,
+    url: Url,
+    destination: &Path,
+    expected_sha256: Option<Sha256Hash>,
+    reporter: Option<Arc<dyn DownloadReporter>>,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
     // The `response` is used to stream in the package data
-    let result = crate::tokio::async_read::extract_tar_bz2(reader, destination).await?;
+    let result =
+        crate::tokio::async_read::extract_tar_bz2_with_options(reader, destination, options)
+            .await?;
     if let Some(reporter) = &reporter {
         reporter.on_download_complete();
     }
@@ -152,6 +175,27 @@ pub async fn extract_conda(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
+    extract_conda_with_options(
+        client,
+        url,
+        destination,
+        expected_sha256,
+        reporter,
+        &ExtractOptions::default(),
+    )
+    .await
+}
+
+/// Extracts the contents a `.conda` package archive from the specified remote
+/// location, with the given options.
+pub async fn extract_conda_with_options(
+    client: reqwest_middleware::ClientWithMiddleware,
+    url: Url,
+    destination: &Path,
+    expected_sha256: Option<Sha256Hash>,
+    reporter: Option<Arc<dyn DownloadReporter>>,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     // The `response` is used to stream in the package data
     let reader = get_reader(
         url.clone(),
@@ -160,7 +204,7 @@ pub async fn extract_conda(
         reporter.clone(),
     )
     .await?;
-    match crate::tokio::async_read::extract_conda(reader, destination).await {
+    match crate::tokio::async_read::extract_conda_with_options(reader, destination, options).await {
         Ok(result) => {
             if let Some(reporter) = &reporter {
                 reporter.on_download_complete();
@@ -181,8 +225,12 @@ pub async fn extract_conda(
             let new_reader =
                 get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
 
-            match crate::tokio::async_read::extract_conda_via_buffering(new_reader, destination)
-                .await
+            match crate::tokio::async_read::extract_conda_via_buffering_with_options(
+                new_reader,
+                destination,
+                options,
+            )
+            .await
             {
                 Ok(result) => {
                     if let Some(reporter) = &reporter {
@@ -225,14 +273,45 @@ pub async fn extract(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
+    extract_with_options(
+        client,
+        url,
+        destination,
+        expected_sha256,
+        reporter,
+        &ExtractOptions::default(),
+    )
+    .await
+}
+
+/// Extracts the contents a package archive from the specified remote
+/// location, with the given options. The type of package is determined based
+/// on the path of the url.
+pub async fn extract_with_options(
+    client: reqwest_middleware::ClientWithMiddleware,
+    url: Url,
+    destination: &Path,
+    expected_sha256: Option<Sha256Hash>,
+    reporter: Option<Arc<dyn DownloadReporter>>,
+    options: &ExtractOptions,
+) -> Result<ExtractResult, ExtractError> {
     match CondaArchiveType::try_from(Path::new(url.path()))
         .ok_or(ExtractError::UnsupportedArchiveType)?
     {
         CondaArchiveType::TarBz2 => {
-            extract_tar_bz2(client, url, destination, expected_sha256, reporter).await
+            extract_tar_bz2_with_options(
+                client,
+                url,
+                destination,
+                expected_sha256,
+                reporter,
+                options,
+            )
+            .await
         }
         CondaArchiveType::Conda => {
-            extract_conda(client, url, destination, expected_sha256, reporter).await
+            extract_conda_with_options(client, url, destination, expected_sha256, reporter, options)
+                .await
         }
     }
 }

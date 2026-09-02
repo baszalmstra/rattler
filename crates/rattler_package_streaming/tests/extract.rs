@@ -17,7 +17,10 @@ use rattler_conda_types::package::IndexJson;
 use rattler_digest::{Md5, Sha256};
 use rattler_package_streaming::{
     ExtractError, ExtractResult,
-    read::{extract_conda_via_buffering, extract_conda_via_streaming, extract_tar_bz2},
+    read::{
+        extract_conda_via_buffering, extract_conda_via_streaming,
+        extract_conda_via_streaming_with_options, extract_tar_bz2,
+    },
 };
 use rstest::rstest;
 use rstest_reuse::{self, apply, template};
@@ -1339,6 +1342,255 @@ impl<R: Read> Read for FlakyReader<R> {
         self.total_read += bytes_read;
         Ok(bytes_read)
     }
+}
+
+/// Two packages sharing bytes: one small file and one above the in-memory
+/// limit are identical, one file is unique to the second package.
+fn store_test_packages() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let big = noise(3 * CHUNK_SIZE, 7);
+    let pkg_a = RawTar::default()
+        .file("lib/shared.txt", b"same bytes in both")
+        .file("lib/big.bin", &big)
+        .finish();
+    let pkg_b = RawTar::default()
+        .file("lib/renamed.txt", b"same bytes in both")
+        .file("lib/big.bin", &big)
+        .file("lib/only_b.txt", b"unique")
+        .finish();
+    (build_conda("a", &pkg_a), build_conda("b", &pkg_b), big)
+}
+
+fn store_options(root: &Path) -> rattler_package_streaming::ExtractOptions {
+    rattler_package_streaming::ExtractOptions {
+        file_store: Some(root.to_path_buf()),
+    }
+}
+
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::metadata(a).unwrap();
+        let b = std::fs::metadata(b).unwrap();
+        a.ino() == b.ino() && a.dev() == b.dev()
+    }
+    #[cfg(windows)]
+    {
+        fn identity(path: &Path) -> (u32, u32, u32) {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let file = File::open(path).unwrap();
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle is open for the duration of the call and
+            // `info` is a valid, writable structure of the expected type.
+            let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+            assert_ne!(
+                ok,
+                0,
+                "GetFileInformationByHandle failed for {}",
+                path.display()
+            );
+            (
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )
+        }
+        identity(a) == identity(b)
+    }
+}
+
+#[test]
+fn file_store_shares_identical_files_between_packages() {
+    let (conda_a, conda_b, _) = store_test_packages();
+    let root = fresh_dir("store_shared");
+    let store = root.join("store");
+    let options = store_options(&store);
+
+    let dest_a = root.join("a");
+    let stats_a =
+        extract_conda_via_streaming_with_options(Cursor::new(&conda_a), &dest_a, &options)
+            .unwrap()
+            .file_store
+            .unwrap();
+    assert_eq!(
+        (
+            stats_a.files,
+            stats_a.added,
+            stats_a.reused,
+            stats_a.unshared
+        ),
+        (2, 2, 0, 0)
+    );
+
+    let dest_b = root.join("b");
+    let stats_b =
+        extract_conda_via_streaming_with_options(Cursor::new(&conda_b), &dest_b, &options)
+            .unwrap()
+            .file_store
+            .unwrap();
+    assert_eq!(
+        (
+            stats_b.files,
+            stats_b.added,
+            stats_b.reused,
+            stats_b.unshared
+        ),
+        (3, 1, 2, 0)
+    );
+    assert_eq!(stats_b.bytes_reused, 18 + 3 * CHUNK_SIZE as u64);
+
+    // Both packages read the same bytes and share one inode per file.
+    assert!(is_same_file(
+        &dest_a.join("lib/shared.txt"),
+        &dest_b.join("lib/renamed.txt")
+    ));
+    assert!(is_same_file(
+        &dest_a.join("lib/big.bin"),
+        &dest_b.join("lib/big.bin")
+    ));
+    assert_eq!(
+        std::fs::read(dest_b.join("lib/only_b.txt")).unwrap(),
+        b"unique"
+    );
+
+    // The tree is the same as an extraction without a store.
+    let plain = root.join("plain");
+    extract_conda_via_streaming(Cursor::new(&conda_b), &plain).unwrap();
+    assert_eq!(snapshot(&plain), snapshot(&dest_b));
+
+    // Package metadata stays private: no object exists for it.
+    let index = std::fs::read(dest_a.join("info/index.json")).unwrap();
+    let object = rattler_package_streaming::file_store::FileStore::new(&store)
+        .object_path(&blake3::hash(&index), false);
+    assert!(!object.exists(), "info/ file was published to the store");
+}
+
+#[test]
+fn file_store_reuses_everything_on_a_second_extraction() {
+    let (conda_a, _, _) = store_test_packages();
+    let root = fresh_dir("store_warm");
+    let options = store_options(&root.join("store"));
+
+    extract_conda_via_streaming_with_options(Cursor::new(&conda_a), &root.join("first"), &options)
+        .unwrap();
+    let stats = extract_conda_via_streaming_with_options(
+        Cursor::new(&conda_a),
+        &root.join("second"),
+        &options,
+    )
+    .unwrap()
+    .file_store
+    .unwrap();
+    assert_eq!(
+        (stats.files, stats.added, stats.reused, stats.unshared),
+        (2, 0, 2, 0)
+    );
+    assert_eq!(
+        snapshot(&root.join("first")),
+        snapshot(&root.join("second"))
+    );
+}
+
+#[tokio::test]
+async fn file_store_async_path_matches_sync_path() {
+    let (conda_a, conda_b, _) = store_test_packages();
+    let root = fresh_dir("store_async");
+    let options = store_options(&root.join("store"));
+
+    extract_conda_via_streaming_with_options(Cursor::new(&conda_a), &root.join("a"), &options)
+        .unwrap();
+    let stats = rattler_package_streaming::tokio::async_read::extract_conda_with_options(
+        conda_b.as_slice(),
+        &root.join("b"),
+        &options,
+    )
+    .await
+    .unwrap()
+    .file_store
+    .unwrap();
+    assert_eq!(
+        (stats.files, stats.added, stats.reused, stats.unshared),
+        (3, 1, 2, 0)
+    );
+}
+
+#[test]
+fn unwritable_file_store_keeps_private_copies() {
+    let (conda_a, _, _) = store_test_packages();
+    let root = fresh_dir("store_unwritable");
+    std::fs::create_dir_all(&root).unwrap();
+    // A file where the store directory should be.
+    let store = root.join("store");
+    std::fs::write(&store, b"not a directory").unwrap();
+
+    let dest = root.join("a");
+    let result = extract_conda_via_streaming_with_options(
+        Cursor::new(&conda_a),
+        &dest,
+        &store_options(&store),
+    )
+    .unwrap();
+    let stats = result.file_store.unwrap();
+    assert_eq!(
+        (stats.files, stats.added, stats.reused, stats.unshared),
+        (2, 0, 0, 2)
+    );
+    let plain = root.join("plain");
+    extract_conda_via_streaming(Cursor::new(&conda_a), &plain).unwrap();
+    assert_eq!(snapshot(&plain), snapshot(&dest));
+}
+
+#[cfg(unix)]
+#[test]
+fn file_store_keeps_executable_and_plain_files_apart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let contents = b"#!/bin/sh\necho same\n";
+    let mut tar = RawTar::default();
+    tar.push(
+        raw_header(tar::EntryType::Regular, 0o755, RAW_MTIME),
+        "bin/tool",
+        None,
+        contents.len() as u64,
+        contents,
+    );
+    tar.file("share/tool.txt", contents);
+    let conda = build_conda("modes", &tar.finish());
+
+    let root = fresh_dir("store_modes");
+    let dest = root.join("pkg");
+    let stats = extract_conda_via_streaming_with_options(
+        Cursor::new(&conda),
+        &dest,
+        &store_options(&root.join("store")),
+    )
+    .unwrap()
+    .file_store
+    .unwrap();
+    assert_eq!((stats.files, stats.added, stats.reused), (2, 2, 0));
+    assert!(!is_same_file(
+        &dest.join("bin/tool"),
+        &dest.join("share/tool.txt")
+    ));
+    assert_eq!(
+        std::fs::metadata(dest.join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(dest.join("share/tool.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
 }
 
 /// Bytes per chunk the async path hands to the extraction worker.

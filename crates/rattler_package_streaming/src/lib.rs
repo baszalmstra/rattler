@@ -19,9 +19,22 @@ pub mod seek;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
 
+pub mod file_store;
 pub mod fs;
 pub mod tokio;
 pub mod write;
+
+pub use file_store::FileStoreStats;
+
+/// Options that change how a package is extracted.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractOptions {
+    /// Root directory of a content-addressed store that deduplicates the
+    /// extracted files across packages. See [`file_store`]. The store must be
+    /// on the same filesystem as the destination for files to be shared;
+    /// otherwise the package keeps private copies.
+    pub file_store: Option<PathBuf>,
+}
 
 /// An error that can occur when extracting a package archive.
 #[derive(thiserror::Error, Debug)]
@@ -155,6 +168,10 @@ pub struct ExtractResult {
 
     /// The total size of the extracted archive in bytes.
     pub total_size: u64,
+
+    /// What sharing the extracted files through a file store did, when one
+    /// was configured.
+    pub file_store: Option<FileStoreStats>,
 }
 
 /// A trait that can be implemented to report download progress.
