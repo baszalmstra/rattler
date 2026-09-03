@@ -1362,7 +1362,7 @@ fn store_test_packages() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 
 fn store_options(root: &Path) -> rattler_package_streaming::ExtractOptions {
     rattler_package_streaming::ExtractOptions {
-        file_store: Some(root.to_path_buf()),
+        file_store: Some(rattler_package_streaming::FileStore::new(root)),
     }
 }
 
@@ -1463,8 +1463,10 @@ fn file_store_shares_identical_files_between_packages() {
 
     // Package metadata stays private: no object exists for it.
     let index = std::fs::read(dest_a.join("info/index.json")).unwrap();
-    let object = rattler_package_streaming::file_store::FileStore::new(&store)
-        .object_path(&blake3::hash(&index), false);
+    let object = rattler_package_streaming::file_store::FileStore::new(&store).object_path(
+        &rattler_digest::compute_bytes_digest::<Sha256>(&index),
+        false,
+    );
     assert!(!object.exists(), "info/ file was published to the store");
 }
 
@@ -1591,6 +1593,98 @@ fn file_store_keeps_executable_and_plain_files_apart() {
             & 0o777,
         0o644
     );
+}
+
+/// Files above the in-memory limit are linked from the store through the
+/// SHA-256 that `info/paths.json` records for them, and the archive entry is
+/// checked against that hash instead of being written.
+#[test]
+fn file_store_links_large_files_through_paths_json() {
+    let big = noise(3 * CHUNK_SIZE, 11);
+    let other = noise(3 * CHUNK_SIZE, 13);
+    let pkg = |data: &[u8]| RawTar::default().file("lib/big.bin", data).finish();
+    let paths_json = |sha256: &str, size: usize| {
+        format!(
+            r#"{{"paths":[{{"_path":"lib/big.bin","path_type":"hardlink","sha256":"{sha256}","size_in_bytes":{size}}}],"paths_version":1}}"#
+        )
+    };
+    let big_sha = sha256_hex(&big);
+    let other_sha = sha256_hex(&other);
+
+    let root = fresh_dir("store_hints");
+    let options = store_options(&root.join("store"));
+
+    // Seed the store with both contents.
+    for (name, data) in [("big", &big), ("other", &other)] {
+        extract_conda_via_streaming_with_options(
+            Cursor::new(build_conda(name, &pkg(data))),
+            &root.join(name),
+            &options,
+        )
+        .unwrap();
+    }
+
+    // A correct hint reuses the object.
+    let hinted = build_conda_with_info(
+        "hinted",
+        &[(
+            "info/paths.json",
+            paths_json(&big_sha, big.len()).as_bytes(),
+        )],
+        &pkg(&big),
+    );
+    let dest = root.join("hinted");
+    let stats = extract_conda_via_streaming_with_options(Cursor::new(&hinted), &dest, &options)
+        .unwrap()
+        .file_store
+        .unwrap();
+    assert_eq!(
+        (stats.files, stats.added, stats.reused, stats.bytes_reused),
+        (1, 0, 1, big.len() as u64)
+    );
+    assert!(is_same_file(
+        &dest.join("lib/big.bin"),
+        &root.join("big/lib/big.bin")
+    ));
+
+    // A hint whose object exists but does not match the entry is caught
+    // while the entry is read, so the package is rejected rather than
+    // linked to the wrong contents.
+    let lying = build_conda_with_info(
+        "lying",
+        &[(
+            "info/paths.json",
+            paths_json(&other_sha, big.len()).as_bytes(),
+        )],
+        &pkg(&big),
+    );
+    let dest = root.join("lying");
+    let err =
+        extract_conda_via_streaming_with_options(Cursor::new(&lying), &dest, &options).unwrap_err();
+    assert_matches::assert_matches!(
+        &err,
+        ExtractError::IoError(err) if err.kind() == std::io::ErrorKind::InvalidData,
+        "{err}"
+    );
+    assert!(!dest.join("lib/big.bin").exists());
+
+    // A hint whose size disagrees with the entry is ignored; the file is
+    // written and shared afterwards like any other.
+    let wrong_size = build_conda_with_info(
+        "wrong_size",
+        &[(
+            "info/paths.json",
+            paths_json(&other_sha, big.len() + 1).as_bytes(),
+        )],
+        &pkg(&big),
+    );
+    let dest = root.join("wrong_size");
+    let stats = extract_conda_via_streaming_with_options(Cursor::new(&wrong_size), &dest, &options)
+        .unwrap()
+        .file_store
+        .unwrap();
+    assert_eq!((stats.added, stats.reused), (0, 1));
+    assert_eq!(std::fs::read(dest.join("lib/big.bin")).unwrap(), big);
 }
 
 /// Bytes per chunk the async path hands to the extraction worker.
@@ -1796,15 +1890,22 @@ impl RawTar {
 
 /// Builds a minimal `.conda` archive around the given package tar.
 fn build_conda(name: &str, pkg_tar: &[u8]) -> Vec<u8> {
+    build_conda_with_info(name, &[], pkg_tar)
+}
+
+/// Builds a `.conda` archive whose `info-*.tar.zst` holds `index.json` plus
+/// `info_files`, around the given package tar.
+fn build_conda_with_info(name: &str, info_files: &[(&str, &[u8])], pkg_tar: &[u8]) -> Vec<u8> {
     let index = format!(
         r#"{{"name":"{name}","version":"1.0","build":"0","build_number":0,"subdir":"noarch","depends":[]}}"#
     );
     let mut info = tar::Builder::new(Vec::new());
-    let mut header = raw_header(tar::EntryType::Regular, 0o644, RAW_MTIME);
-    header.set_size(index.len() as u64);
-    header.set_cksum();
-    info.append_data(&mut header, "info/index.json", index.as_bytes())
-        .unwrap();
+    for (path, data) in std::iter::once(&("info/index.json", index.as_bytes())).chain(info_files) {
+        let mut header = raw_header(tar::EntryType::Regular, 0o644, RAW_MTIME);
+        header.set_size(data.len() as u64);
+        header.set_cksum();
+        info.append_data(&mut header, path, *data).unwrap();
+    }
     let info_tar = info.into_inner().unwrap();
 
     let options =

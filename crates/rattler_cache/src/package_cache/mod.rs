@@ -28,7 +28,7 @@ use rattler_networking::{
     LazyClient,
     retry_policies::{DoNotRetryPolicy, RetryDecision, RetryPolicy},
 };
-use rattler_package_streaming::{DownloadReporter, ExtractError, ExtractOptions};
+use rattler_package_streaming::{DownloadReporter, ExtractError, ExtractOptions, FileStore};
 use rattler_redaction::Redact;
 pub use reporter::CacheReporter;
 use simple_spawn_blocking::Cancelled;
@@ -52,7 +52,7 @@ mod reporter;
 pub struct PackageCache {
     inner: Arc<PackageCacheInner>,
     cache_origin: bool,
-    file_store: Option<PathBuf>,
+    file_store: Option<FileStore>,
 }
 
 #[derive(Clone, Default)]
@@ -471,14 +471,14 @@ impl PackageCache {
         }
     }
 
-    /// Shares the files of extracted packages through a content-addressed
-    /// store rooted at `path`, so packages that ship identical files occupy
-    /// the disk once. The store must be on the same filesystem as the cache
-    /// layer that is written to; otherwise packages keep private copies. See
+    /// Shares the files of extracted packages through `store`, so packages
+    /// that ship identical files occupy the disk once. The store must be on
+    /// the same filesystem as the cache layer that is written to; otherwise
+    /// packages keep private copies. See
     /// [`rattler_package_streaming::file_store`].
-    pub fn with_file_store(self, path: impl Into<PathBuf>) -> Self {
+    pub fn with_file_store(self, store: FileStore) -> Self {
         Self {
-            file_store: Some(path.into()),
+            file_store: Some(store),
             ..self
         }
     }

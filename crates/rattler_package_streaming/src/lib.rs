@@ -24,16 +24,16 @@ pub mod fs;
 pub mod tokio;
 pub mod write;
 
-pub use file_store::FileStoreStats;
+pub use file_store::{FileStore, FileStoreStats};
 
 /// Options that change how a package is extracted.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOptions {
-    /// Root directory of a content-addressed store that deduplicates the
-    /// extracted files across packages. See [`file_store`]. The store must be
-    /// on the same filesystem as the destination for files to be shared;
-    /// otherwise the package keeps private copies.
-    pub file_store: Option<PathBuf>,
+    /// A content-addressed store that deduplicates the extracted files
+    /// across packages. See [`file_store`]. The store must be on the same
+    /// filesystem as the destination for files to be shared; otherwise the
+    /// package keeps private copies.
+    pub file_store: Option<FileStore>,
 }
 
 /// An error that can occur when extracting a package archive.

@@ -2238,6 +2238,7 @@ dependencies = [
  "rattler_digest",
  "rattler_networking",
  "rattler_redaction",
+ "rayon",
  "reqwest",
  "serde_json",
  "simple_spawn_blocking",

@@ -2,11 +2,13 @@
 //! packages.
 //!
 //! Every regular file of a package is extracted into the package directory as
-//! usual. Afterwards each file is hard linked into the store under the BLAKE3
+//! usual. Afterwards each file is hard linked into the store under the SHA-256
 //! hash of its contents and executable bit, so packages that ship identical
 //! files share one inode. When a store object already exists, the package's
 //! private copy is replaced by a link to it. Small files are looked up before
-//! they are written at all.
+//! they are written at all, and larger files are looked up through the
+//! SHA-256 that `info/paths.json` records for them, so on a warm store they
+//! are never written.
 //!
 //! Package directories stay complete on their own: a file that cannot be
 //! linked, for example because the store is on another filesystem or the
@@ -16,46 +18,38 @@
 //!
 //! Objects are immutable once published. Their mode and timestamps are set
 //! while the file is still private, and never touched afterwards, since every
-//! package sharing the object would see the change.
+//! package sharing the object would see the change. Objects that no package
+//! links to any more are removed by [`FileStore::prune`].
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
 };
 
+use rattler_conda_types::package::{PackageFile, PathType, PathsJson};
+use rattler_digest::Sha256Hash;
 use rayon::prelude::*;
 
 /// Files up to this size are hashed in memory and linked from an existing
 /// store object before anything is written to the package directory.
 pub(crate) const SMALL_FILE_LIMIT: u64 = 64 * 1024;
 
-/// Domain separation for object keys, so a key never equals a plain content
-/// hash and the executable bit is part of the identity.
-const OBJECT_KEY_CONTEXT: &str = "rattler package file store v1";
-
-/// Files smaller than this are not shared. Tiny files carry almost none of
-/// the space savings while each one costs a link call per package. The value
-/// still has to be chosen from measurements; see
-/// `docs/design/package-file-store.md`.
-pub(crate) fn min_shared_file_size() -> u64 {
-    0
-}
-
 /// A content-addressed file store rooted at a directory.
 #[derive(Debug, Clone)]
 pub struct FileStore {
     root: PathBuf,
+    min_shared_size: u64,
 }
 
 /// The shard directories that exist in a store at the start of an
 /// extraction. A cold store has none, so no object lookup can succeed and the
 /// lookups are skipped entirely; a warm store has all 256.
 #[derive(Debug, Default)]
-pub(crate) struct KnownShards(std::collections::HashSet<String>);
+struct KnownShards(HashSet<String>);
 
 impl KnownShards {
-    pub(crate) fn contains(&self, key: &str) -> bool {
+    fn contains(&self, key: &str) -> bool {
         self.0.contains(&key[..2])
     }
 }
@@ -65,8 +59,8 @@ impl KnownShards {
 pub struct ExtractedFile {
     /// Absolute path of the file in the package directory.
     path: PathBuf,
-    /// Hash of the file contents.
-    digest: blake3::Hash,
+    /// SHA-256 of the file contents.
+    digest: Sha256Hash,
     /// Whether any executable bit is set in the archive entry's mode.
     executable: bool,
     /// Size of the file in bytes.
@@ -78,7 +72,7 @@ pub struct ExtractedFile {
 impl ExtractedFile {
     pub(crate) fn new(
         path: PathBuf,
-        digest: blake3::Hash,
+        digest: Sha256Hash,
         executable: bool,
         size: u64,
         reused: bool,
@@ -108,11 +102,61 @@ pub struct FileStoreStats {
     pub bytes_reused: u64,
 }
 
+/// What pruning a store did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Objects that at least one package still links to.
+    pub kept: usize,
+    /// Objects that no package linked to any more and were removed.
+    pub removed: usize,
+    /// Bytes occupied by the removed objects.
+    pub bytes_freed: u64,
+}
+
+/// What `info/paths.json` records about a file, used to look up a store
+/// object before the file's contents are read.
+#[derive(Debug, Clone, Copy)]
+struct PathHint {
+    sha256: Sha256Hash,
+    size: Option<u64>,
+}
+
+/// The sharing state of one package extraction: the store objects that can
+/// be looked up, the files extracted so far, and the `info/paths.json` hints
+/// once the package's metadata is on disk.
+#[derive(Debug)]
+pub(crate) struct FileStoreSession<'a> {
+    store: &'a FileStore,
+    shards: KnownShards,
+    files: Vec<ExtractedFile>,
+    /// `None` until the first lookup; an empty map when the package has no
+    /// usable `info/paths.json`.
+    hints: Option<HashMap<PathBuf, PathHint>>,
+}
+
 impl FileStore {
+    /// Files smaller than this are not shared by default. Tiny files carry
+    /// almost none of the space savings while each one costs a link call
+    /// per package. The value still has to be chosen from measurements; see
+    /// `docs/design/package-file-store.md`.
+    pub const DEFAULT_MIN_SHARED_SIZE: u64 = 0;
+
     /// Creates a store rooted at `root`. The directory is created on first
     /// use.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            min_shared_size: Self::DEFAULT_MIN_SHARED_SIZE,
+        }
+    }
+
+    /// Leaves files smaller than `size` bytes private instead of sharing
+    /// them through the store.
+    pub fn with_min_shared_size(self, size: u64) -> Self {
+        Self {
+            min_shared_size: size,
+            ..self
+        }
     }
 
     /// The directory that holds the store.
@@ -122,7 +166,7 @@ impl FileStore {
 
     /// The path of the object for the given contents and executable bit,
     /// whether or not it exists.
-    pub fn object_path(&self, digest: &blake3::Hash, executable: bool) -> PathBuf {
+    pub fn object_path(&self, digest: &Sha256Hash, executable: bool) -> PathBuf {
         self.object_path_for_key(&object_key(digest, executable))
     }
 
@@ -130,8 +174,18 @@ impl FileStore {
         self.root.join(&key[..2]).join(key)
     }
 
+    /// Starts sharing the files of one package.
+    pub(crate) fn begin(&self) -> FileStoreSession<'_> {
+        FileStoreSession {
+            store: self,
+            shards: self.known_shards(),
+            files: Vec::new(),
+            hints: None,
+        }
+    }
+
     /// Lists the shard directories that currently exist.
-    pub(crate) fn known_shards(&self) -> KnownShards {
+    fn known_shards(&self) -> KnownShards {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return KnownShards::default();
         };
@@ -148,10 +202,10 @@ impl FileStore {
     /// the object does not exist, so the caller writes the file instead.
     /// Objects in shards that did not exist when `shards` was listed are
     /// assumed absent without touching the filesystem.
-    pub(crate) fn link_existing(
+    fn link_existing(
         &self,
         shards: &KnownShards,
-        digest: &blake3::Hash,
+        digest: &Sha256Hash,
         executable: bool,
         destination: &Path,
     ) -> io::Result<bool> {
@@ -172,7 +226,7 @@ impl FileStore {
     /// Files are grouped by shard directory so each shard is created once and
     /// linked by one worker, which avoids contention on the shard directory.
     /// Never fails: a file that cannot be shared stays a private copy.
-    pub(crate) fn publish(&self, files: &[ExtractedFile]) -> FileStoreStats {
+    fn publish(&self, files: &[ExtractedFile]) -> FileStoreStats {
         let mut stats = FileStoreStats {
             files: files.len(),
             ..FileStoreStats::default()
@@ -233,6 +287,192 @@ impl FileStore {
         stats.bytes_reused += linked.bytes_reused;
         stats
     }
+
+    /// Removes every object that no package links to any more, and every
+    /// shard directory that became empty. A missing store is empty.
+    ///
+    /// Safe to run next to extractions: an object is removed only while its
+    /// link count is one, and an extraction that loses the race to link it
+    /// simply writes the file and creates the object again.
+    pub fn prune(&self) -> io::Result<PruneStats> {
+        let shards = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        shards
+            .par_iter()
+            .map(|shard| prune_shard(shard))
+            .try_reduce(PruneStats::default, |a, b| {
+                Ok(PruneStats {
+                    kept: a.kept + b.kept,
+                    removed: a.removed + b.removed,
+                    bytes_freed: a.bytes_freed + b.bytes_freed,
+                })
+            })
+    }
+}
+
+impl FileStoreSession<'_> {
+    /// Whether a regular file at `relative` in the package may be shared.
+    /// Package metadata under `info/` is rewritten in place by some tools,
+    /// so it is never shared between packages.
+    pub(crate) fn is_shareable(&self, relative: &Path, size: u64) -> bool {
+        size >= self.store.min_shared_size && !relative.starts_with("info")
+    }
+
+    /// Links `destination` to the object for `digest`, if it exists. Returns
+    /// whether it did; a failed link is reported and treated as absent.
+    pub(crate) fn link_existing(
+        &self,
+        digest: &Sha256Hash,
+        executable: bool,
+        destination: &Path,
+    ) -> bool {
+        match self
+            .store
+            .link_existing(&self.shards, digest, executable, destination)
+        {
+            Ok(linked) => linked,
+            Err(err) => {
+                tracing::debug!(
+                    "could not link {} from the store: {err}",
+                    destination.display()
+                );
+                false
+            }
+        }
+    }
+
+    /// The SHA-256 that the package's `info/paths.json` records for the file
+    /// at `relative`, when the metadata is already extracted below
+    /// `destination` and agrees with the entry's `size`. The hint is only
+    /// worth looking up when its object can exist, so a cold store never
+    /// reads `paths.json`.
+    pub(crate) fn hinted_digest(
+        &mut self,
+        destination: &Path,
+        relative: &Path,
+        size: u64,
+    ) -> Option<Sha256Hash> {
+        if self.shards.0.is_empty() {
+            return None;
+        }
+        let hints = self
+            .hints
+            .get_or_insert_with(|| load_hints(&destination.join("info").join("paths.json")));
+        let hint = hints.get(relative)?;
+        (hint.size.is_none_or(|hinted| hinted == size)).then_some(hint.sha256)
+    }
+
+    /// Records an extracted regular file for publishing.
+    pub(crate) fn record(&mut self, file: ExtractedFile) {
+        self.files.push(file);
+    }
+
+    /// Shares the recorded files through the store and reports what that
+    /// did. Never fails: a file that cannot be shared stays a private copy.
+    pub(crate) fn publish(self) -> FileStoreStats {
+        self.store.publish(&self.files)
+    }
+}
+
+/// Reads the hints from a `paths.json`. Anything that cannot be read or
+/// parsed yields no hints; the files are then hashed while they are written.
+fn load_hints(path: &Path) -> HashMap<PathBuf, PathHint> {
+    let paths = match PathsJson::from_path(path) {
+        Ok(paths) => paths,
+        Err(err) => {
+            tracing::debug!("no file store hints from {}: {err}", path.display());
+            return HashMap::new();
+        }
+    };
+    paths
+        .paths
+        .into_iter()
+        .filter_map(|entry| {
+            let sha256 = entry.sha256?;
+            match entry.path_type {
+                PathType::HardLink => Some((
+                    entry.relative_path,
+                    PathHint {
+                        sha256,
+                        size: entry.size_in_bytes,
+                    },
+                )),
+                PathType::SoftLink | PathType::Directory => None,
+            }
+        })
+        .collect()
+}
+
+/// Removes the objects in one shard directory that no package links to.
+fn prune_shard(shard: &Path) -> io::Result<PruneStats> {
+    let mut stats = PruneStats::default();
+    for entry in std::fs::read_dir(shard)? {
+        let object = entry?.path();
+        let (links, size) = match object_links(&object) {
+            Ok(info) => info,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if links > 1 {
+            stats.kept += 1;
+            continue;
+        }
+        match std::fs::remove_file(&object) {
+            Ok(()) => {
+                stats.removed += 1;
+                stats.bytes_freed += size;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    // Only an empty shard can be removed; a package racing to publish into
+    // it recreates the directory.
+    if let Err(err) = std::fs::remove_dir(shard)
+        && err.kind() != io::ErrorKind::DirectoryNotEmpty
+    {
+        tracing::debug!("could not remove {}: {err}", shard.display());
+    }
+    Ok(stats)
+}
+
+/// The number of hard links to an object and its size.
+#[cfg(unix)]
+fn object_links(object: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(object)?;
+    Ok((metadata.nlink(), metadata.len()))
+}
+
+/// The number of hard links to an object and its size. Windows only reports
+/// the link count through an open handle.
+#[cfg(windows)]
+fn object_links(object: &Path) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(object)?;
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` keeps the handle open for the duration of the call, and
+    // `info` is a valid, writable location for a `BY_HANDLE_FILE_INFORMATION`
+    // that is only read after the call reports success.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call succeeded, so the structure is fully initialized.
+    let info = unsafe { info.assume_init() };
+    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    Ok((u64::from(info.nNumberOfLinks), size))
 }
 
 /// Publishes one private file. Most objects are new, so the link is attempted
@@ -282,22 +522,29 @@ fn replace_with_link(source: &Path, object: &Path) -> io::Result<()> {
     }
 }
 
-/// Derives the object key from the content hash and executable bit.
-fn object_key(digest: &blake3::Hash, executable: bool) -> String {
-    let mut hasher = blake3::Hasher::new_derive_key(OBJECT_KEY_CONTEXT);
-    hasher.update(digest.as_bytes());
-    hasher.update(&[u8::from(executable)]);
-    hasher.finalize().to_hex().to_string()
+/// The object name for a content hash and executable bit: the hex SHA-256,
+/// with an `x` suffix for executables so the two never collide.
+fn object_key(digest: &Sha256Hash, executable: bool) -> String {
+    let mut key = hex::encode(digest);
+    if executable {
+        key.push('x');
+    }
+    key
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rattler_digest::{Sha256, compute_bytes_digest};
+
+    fn digest(contents: &[u8]) -> Sha256Hash {
+        compute_bytes_digest::<Sha256>(contents)
+    }
 
     #[test]
     fn executable_bit_is_part_of_the_key() {
         let store = FileStore::new("store");
-        let digest = blake3::hash(b"same bytes");
+        let digest = digest(b"same bytes");
         assert_ne!(
             store.object_path(&digest, false),
             store.object_path(&digest, true)
@@ -335,13 +582,7 @@ mod tests {
         std::fs::write(pkg_b.join("z"), b"only in b").unwrap();
 
         let file = |path: PathBuf, contents: &[u8]| {
-            ExtractedFile::new(
-                path,
-                blake3::hash(contents),
-                false,
-                contents.len() as u64,
-                false,
-            )
+            ExtractedFile::new(path, digest(contents), false, contents.len() as u64, false)
         };
 
         let stats = store.publish(&[file(pkg_a.join("x"), &same)]);
@@ -357,7 +598,7 @@ mod tests {
         assert_eq!(stats.bytes_reused, same.len() as u64);
 
         // Both packages now point at the same object and read the same bytes.
-        let object = store.object_path(&blake3::hash(&same), false);
+        let object = store.object_path(&digest(&same), false);
         assert!(object.exists());
         assert_eq!(std::fs::read(pkg_a.join("x")).unwrap(), same);
         assert_eq!(std::fs::read(pkg_b.join("y")).unwrap(), same);
@@ -373,26 +614,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FileStore::new(dir.path().join("store"));
         let contents = b"lookup";
-        let digest = blake3::hash(contents);
+        let digest = digest(contents);
         let target = dir.path().join("target");
 
-        assert!(
-            !store
-                .link_existing(&store.known_shards(), &digest, false, &target)
-                .unwrap()
-        );
+        assert!(!store.begin().link_existing(&digest, false, &target));
         assert!(!target.exists());
 
         let object = store.object_path(&digest, false);
         std::fs::create_dir_all(object.parent().unwrap()).unwrap();
         std::fs::write(&object, contents).unwrap();
-        assert!(
-            store
-                .link_existing(&store.known_shards(), &digest, false, &target)
-                .unwrap()
-        );
+        assert!(store.begin().link_existing(&digest, false, &target));
         assert_eq!(std::fs::read(&target).unwrap(), contents);
         assert!(same_file(&object, &target));
+    }
+
+    #[test]
+    fn prune_removes_objects_without_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path().join("store"));
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+
+        // A store that does not exist yet is empty.
+        assert_eq!(store.prune().unwrap(), PruneStats::default());
+
+        let kept = b"still in a package".to_vec();
+        let orphan = b"package was deleted".to_vec();
+        std::fs::write(pkg.join("kept"), &kept).unwrap();
+        std::fs::write(pkg.join("orphan"), &orphan).unwrap();
+        let stats = store.publish(&[
+            ExtractedFile::new(
+                pkg.join("kept"),
+                digest(&kept),
+                false,
+                kept.len() as u64,
+                false,
+            ),
+            ExtractedFile::new(
+                pkg.join("orphan"),
+                digest(&orphan),
+                true,
+                orphan.len() as u64,
+                false,
+            ),
+        ]);
+        assert_eq!(stats.added, 2);
+        std::fs::remove_file(pkg.join("orphan")).unwrap();
+
+        let stats = store.prune().unwrap();
+        assert_eq!(
+            stats,
+            PruneStats {
+                kept: 1,
+                removed: 1,
+                bytes_freed: orphan.len() as u64,
+            }
+        );
+        assert!(store.object_path(&digest(&kept), false).exists());
+        assert!(!store.object_path(&digest(&orphan), true).exists());
+        assert_eq!(std::fs::read(pkg.join("kept")).unwrap(), kept);
+
+        // Deleting the last package empties the store, shard directories
+        // included.
+        std::fs::remove_dir_all(&pkg).unwrap();
+        let stats = store.prune().unwrap();
+        assert_eq!((stats.kept, stats.removed), (0, 1));
+        assert_eq!(std::fs::read_dir(store.root()).unwrap().count(), 0);
+        assert_eq!(store.prune().unwrap(), PruneStats::default());
     }
 
     fn same_file(a: &Path, b: &Path) -> bool {

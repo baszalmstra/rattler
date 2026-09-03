@@ -2,7 +2,10 @@
 //! [`std::io::Read`] trait.
 
 use super::{ExtractError, ExtractOptions, ExtractResult};
-use crate::file_store::{ExtractedFile, FileStore, FileStoreStats, KnownShards, SMALL_FILE_LIMIT};
+use crate::file_store::{
+    ExtractedFile, FileStore, FileStoreSession, FileStoreStats, SMALL_FILE_LIMIT,
+};
+use rattler_digest::{Sha256, digest::Digest};
 use std::io::{Seek, SeekFrom, Write, copy};
 use std::mem::ManuallyDrop;
 use std::{
@@ -58,13 +61,13 @@ pub(crate) fn extract_tar_bz2_without_hashing(
     options: &ExtractOptions,
 ) -> Result<Option<FileStoreStats>, ExtractError> {
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
-    let store = options.file_store.as_deref().map(FileStore::new);
+    let store = options.file_store.as_ref();
+    let mut session = store.map(FileStore::begin);
     let mut archive = stream_tar_bz2(&mut reader);
-    let mut files = Vec::new();
-    unpack_tar_archive_sync(&mut archive, destination, store.as_ref(), &mut files)?;
+    unpack_tar_archive_sync(&mut archive, destination, session.as_mut())?;
     drain_decoder(archive.into_inner())?;
     copy(&mut reader, &mut std::io::sink())?;
-    Ok(store.as_ref().map(|store| store.publish(&files)))
+    Ok(session.map(FileStoreSession::publish))
 }
 
 /// Reads a decompressor to its end after the tar reader stopped at the
@@ -101,13 +104,13 @@ pub(crate) fn extract_conda_via_streaming_without_hashing(
     options: &ExtractOptions,
 ) -> Result<Option<FileStoreStats>, ExtractError> {
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
-    let store = options.file_store.as_deref().map(FileStore::new);
-    let mut files = Vec::new();
+    let store = options.file_store.as_ref();
+    let mut session = store.map(FileStore::begin);
     while let Some(file) = read_zipfile_from_stream(&mut reader)? {
-        extract_zipfile(file, destination, store.as_ref(), &mut files)?;
+        extract_zipfile(file, destination, session.as_mut())?;
     }
     copy(&mut reader, &mut std::io::sink())?;
-    Ok(store.as_ref().map(|store| store.publish(&files)))
+    Ok(session.map(FileStoreSession::publish))
 }
 
 /// Extracts the contents of a .conda package archive by fully reading the stream and then decompressing
@@ -141,7 +144,8 @@ pub(crate) fn extract_conda_via_buffering_without_hashing(
         std::fs::remove_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
     }
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
-    let store = options.file_store.as_deref().map(FileStore::new);
+    let store = options.file_store.as_ref();
+    let mut session = store.map(FileStore::begin);
 
     // Create a SpooledTempFile with a 5MB limit
     let mut temp_file = SpooledTempFile::new(5 * 1024 * 1024);
@@ -149,19 +153,17 @@ pub(crate) fn extract_conda_via_buffering_without_hashing(
     temp_file.seek(SeekFrom::Start(0))?;
     let mut archive = ZipArchive::new(temp_file)?;
 
-    let mut files = Vec::new();
     for index in 0..archive.len() {
         let file = archive.by_index(index)?;
-        extract_zipfile(file, destination, store.as_ref(), &mut files)?;
+        extract_zipfile(file, destination, session.as_mut())?;
     }
-    Ok(store.as_ref().map(|store| store.publish(&files)))
+    Ok(session.map(FileStoreSession::publish))
 }
 
 fn extract_zipfile<R: std::io::Read>(
     zip_file: ZipFile<'_, R>,
     destination: &Path,
-    store: Option<&FileStore>,
-    files: &mut Vec<ExtractedFile>,
+    session: Option<&mut FileStoreSession<'_>>,
 ) -> Result<(), ExtractError> {
     // If an error occurs while we are reading the contents of the zip we don't want to
     // seek to the end of the file. Using [`ManuallyDrop`] we prevent `drop` to be called on
@@ -175,7 +177,7 @@ fn extract_zipfile<R: std::io::Read>(
         .is_some_and(|file_name| file_name.ends_with(".tar.zst"))
     {
         let mut archive = stream_tar_zst(&mut *file)?;
-        unpack_tar_archive_sync(&mut archive, destination, store, files)?;
+        unpack_tar_archive_sync(&mut archive, destination, session)?;
         drain_decoder(archive.into_inner())?;
     } else {
         // Manually read to the end of the stream if that didn't happen.
@@ -201,8 +203,7 @@ fn extract_zipfile<R: std::io::Read>(
 fn unpack_tar_archive_sync<R: Read>(
     archive: &mut tar::Archive<R>,
     destination: &Path,
-    store: Option<&FileStore>,
-    files: &mut Vec<ExtractedFile>,
+    mut session: Option<&mut FileStoreSession<'_>>,
 ) -> Result<(), ExtractError> {
     archive.set_preserve_mtime(false);
 
@@ -212,8 +213,6 @@ fn unpack_tar_archive_sync<R: Read>(
     let mut validated_parents: HashSet<PathBuf> = HashSet::new();
     // Holds one small file at a time while its store object is looked up.
     let mut small_file = Vec::new();
-    let known_shards = store.map(FileStore::known_shards).unwrap_or_default();
-    let min_shared_size = crate::file_store::min_shared_file_size();
 
     for entry in archive.entries().map_err(ExtractError::IoError)? {
         let mut entry = entry.map_err(ExtractError::IoError)?;
@@ -254,24 +253,26 @@ fn unpack_tar_archive_sync<R: Read>(
         }
 
         if is_regular_file {
-            // Package metadata under `info/` is rewritten in place by some
-            // tools, so it is never shared between packages.
-            let shareable = entry.size() >= min_shared_size
-                && file_dst
+            let shared = match session.as_deref_mut() {
+                Some(session) => file_dst
                     .strip_prefix(&destination)
-                    .is_ok_and(|relative| !relative.starts_with("info"));
-            match store.filter(|_| shareable) {
-                Some(store) => {
-                    let file = unpack_shared_file(
-                        store,
-                        &known_shards,
+                    .ok()
+                    .filter(|relative| session.is_shareable(relative, entry.size()))
+                    .map(|relative| (session, relative.to_path_buf())),
+                None => None,
+            };
+            match shared {
+                Some((session, relative)) => {
+                    unpack_shared_file(
+                        session,
+                        &destination,
+                        &relative,
                         &mut entry,
                         &file_dst,
                         mtime,
                         &mut small_file,
                     )
                     .map_err(|err| unpack_error(&entry_path, err))?;
-                    files.push(file);
                 }
                 None => {
                     unpack_file(&mut entry, &file_dst, mtime)
@@ -324,16 +325,19 @@ fn unpack_file<R: Read>(
 ///
 /// Small files are hashed in memory first and linked from an existing object
 /// when there is one, so on a warm store they cost a single link call. Larger
-/// files are hashed while they are written and shared afterwards by
-/// [`FileStore::publish`].
+/// files are looked up through the SHA-256 that `info/paths.json` records
+/// for them; when the object exists the entry is only read to verify that
+/// hash. Otherwise they are hashed while they are written and shared
+/// afterwards by the session.
 fn unpack_shared_file<R: Read>(
-    store: &FileStore,
-    shards: &KnownShards,
+    session: &mut FileStoreSession<'_>,
+    destination: &Path,
+    relative: &Path,
     entry: &mut tar::Entry<'_, R>,
     file_dst: &Path,
     mtime: u64,
     buffer: &mut Vec<u8>,
-) -> std::io::Result<ExtractedFile> {
+) -> std::io::Result<()> {
     let mode = entry.header().mode().ok();
     let executable = mode.is_some_and(|mode| mode & 0o111 != 0);
     let size = entry.size();
@@ -341,39 +345,57 @@ fn unpack_shared_file<R: Read>(
     if size <= SMALL_FILE_LIMIT {
         buffer.clear();
         entry.read_to_end(buffer)?;
-        let digest = blake3::hash(buffer);
-        match store.link_existing(shards, &digest, executable, file_dst) {
-            Ok(true) => {
-                return Ok(ExtractedFile::new(
-                    file_dst.to_path_buf(),
-                    digest,
-                    executable,
-                    buffer.len() as u64,
-                    true,
-                ));
-            }
-            Ok(false) => {}
-            Err(err) => {
-                tracing::debug!(
-                    "could not link {} from the store: {err}",
-                    file_dst.display()
-                );
-            }
-        }
-        let written = write_file(file_dst, mode, mtime, buffer.len(), |writer| {
-            writer.write_all(buffer)?;
-            Ok(buffer.len() as u64)
-        })?;
-        return Ok(ExtractedFile::new(
+        let digest = Sha256::digest(&*buffer);
+        let reused = session.link_existing(&digest, executable, file_dst);
+        let written = if reused {
+            buffer.len() as u64
+        } else {
+            write_file(file_dst, mode, mtime, buffer.len(), |writer| {
+                writer.write_all(buffer)?;
+                Ok(buffer.len() as u64)
+            })?
+        };
+        session.record(ExtractedFile::new(
             file_dst.to_path_buf(),
             digest,
             executable,
             written,
-            false,
+            reused,
         ));
+        return Ok(());
     }
 
-    let mut hasher = blake3::Hasher::new();
+    if let Some(hinted) = session.hinted_digest(destination, relative, size)
+        && session.link_existing(&hinted, executable, file_dst)
+    {
+        // The object is linked in place of the file; the entry is read only
+        // to check that the package really contains what it claims.
+        let mut hasher = Sha256::new();
+        let read = copy(
+            &mut HashingRead {
+                inner: entry,
+                hasher: &mut hasher,
+            },
+            &mut std::io::sink(),
+        )?;
+        if hasher.finalize() != hinted || read != size {
+            let _ = std::fs::remove_file(file_dst);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the file's contents do not match the SHA-256 in info/paths.json",
+            ));
+        }
+        session.record(ExtractedFile::new(
+            file_dst.to_path_buf(),
+            hinted,
+            executable,
+            size,
+            true,
+        ));
+        return Ok(());
+    }
+
+    let mut hasher = Sha256::new();
     let capacity = write_buffer_capacity(size);
     let written = write_file(file_dst, mode, mtime, capacity, |writer| {
         let mut reader = HashingRead {
@@ -382,19 +404,20 @@ fn unpack_shared_file<R: Read>(
         };
         copy(&mut reader, writer)
     })?;
-    Ok(ExtractedFile::new(
+    session.record(ExtractedFile::new(
         file_dst.to_path_buf(),
         hasher.finalize(),
         executable,
         written,
         false,
-    ))
+    ));
+    Ok(())
 }
 
-/// Feeds everything read through it to a BLAKE3 hasher.
+/// Feeds everything read through it to a SHA-256 hasher.
 struct HashingRead<'a, R> {
     inner: &'a mut R,
-    hasher: &'a mut blake3::Hasher,
+    hasher: &'a mut Sha256,
 }
 
 impl<R: Read> Read for HashingRead<'_, R> {

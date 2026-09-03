@@ -6,7 +6,7 @@ use std::{
 use futures_util::{StreamExt, stream};
 use miette::{Context, IntoDiagnostic};
 use rattler_conda_types::package::{CondaArchiveIdentifier, CondaArchiveType};
-use rattler_package_streaming::{ExtractOptions, ExtractResult};
+use rattler_package_streaming::{ExtractOptions, ExtractResult, FileStore};
 use reqwest_middleware::ClientWithMiddleware;
 use url::Url;
 
@@ -36,6 +36,11 @@ pub struct Opt {
     /// directory. Must be on the same filesystem as the destination.
     #[clap(long)]
     file_store: Option<PathBuf>,
+
+    /// Keep files smaller than this many bytes private instead of sharing
+    /// them through the file store.
+    #[clap(long, requires = "file_store", default_value_t = FileStore::DEFAULT_MIN_SHARED_SIZE)]
+    file_store_min_size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -165,7 +170,9 @@ pub async fn extract(opt: Opt, offline: bool) -> miette::Result<()> {
     let total = jobs.len();
     let client = super::client::create_client_with_middleware(offline)?;
     let options = ExtractOptions {
-        file_store: opt.file_store,
+        file_store: opt
+            .file_store
+            .map(|root| FileStore::new(root).with_min_shared_size(opt.file_store_min_size)),
     };
     let mut results = stream::iter(jobs)
         .map(|(source, destination)| extract_one(source, destination, mode, &client, &options))
