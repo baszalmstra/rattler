@@ -1,11 +1,12 @@
 # Package extraction performance and the package file store
 
-Status, 2 September 2026. Working notes from a day spent on extraction
-performance and a content-addressed store for extracted package files. Two
-parts have PRs; the store itself lives on this branch and is not finished.
+Status, 3 September 2026. Working notes on extraction performance and a
+content-addressed store for extracted package files. Two parts have PRs; the
+store itself lives on this branch and is not wired into pixi yet.
 
 - [#2748](https://github.com/conda/rattler/pull/2748) extracts packages on a
-  blocking worker and fixes two per-file costs in the tar loop. Draft.
+  blocking worker, hashes the package on the async pump and fixes two
+  per-file costs in the tar loop.
 - [#2750](https://github.com/conda/rattler/pull/2750) hard links executables
   and native libraries on macOS instead of reflinking them. Draft.
 - This branch adds `rattler_package_streaming::file_store` on top of #2748.
@@ -86,93 +87,151 @@ files and throttling the process; a faster writer gets hit harder.
 
 `rattler_package_streaming::file_store` follows uv's shape:
 
-- Files are extracted into the package directory as usual. Each regular file
-  is hashed with BLAKE3 while it is written.
-- After the archive is done, a post-pass on a rayon pool hard links every
-  file into the store, grouped by shard so each shard directory is created
-  once and linked by one worker. `hard_link(package_file, object)` is the
-  existence probe: success means a new object; `AlreadyExists` means the
-  private copy is replaced by a link to the object.
-- Object identity is `derive_key("rattler package file store v1", blake3 ‖
-  executable bit)`, sharded by the first two hex characters into 256
-  directories. Mode and mtime are set while the file is still private and
-  never touched afterwards.
-- Files up to 64 KiB are hashed in memory and linked from an existing object
-  before anything is written. The lookup is skipped when the object's shard
+- Files are extracted into the package directory as usual. A regular file
+  up to 64 KiB is hashed in memory and linked from an existing object before
+  anything is written; the lookup is skipped when the object's shard
   directory did not exist when extraction started, so a cold store costs no
-  failed link calls.
+  failed link calls. Larger files are written exactly like a plain
+  extraction, without hashing on the extraction thread.
+- After the archive is done, `FileStoreSession::publish` hashes the large
+  files from disk on a rayon pool, then hard links every file into the
+  store, grouped by shard so each shard directory is created once and linked
+  by one worker. `hard_link(package_file, object)` is the existence probe:
+  success means a new object; `AlreadyExists` means the private copy is
+  replaced by a link to the object.
+- Object identity is the hex SHA-256 of the contents, with an `x` suffix for
+  files with an executable bit, sharded by the first two hex characters into
+  256 directories. Mode and mtime are set while the file is still private and
+  never touched afterwards.
+- When `info/paths.json` is already on disk and the store has objects, a
+  large file is looked up through the SHA-256 that `paths.json` records for
+  it before its contents are read. On a hit the object is linked and the
+  entry is only drained to verify that hash; a mismatch rejects the package
+  (`InvalidData`) instead of linking wrong contents, and a size disagreement
+  ignores the hint. See below for when this can actually fire.
 - `info/` is never shared, so package metadata can be rewritten in place.
 - Nothing fails: a store that cannot be written, a cross-filesystem store, or
   a file that hits the link limit leaves a private copy and is counted as
   `unshared` in `FileStoreStats`.
+- `FileStore::prune` removes objects whose link count dropped to one and the
+  shard directories that became empty. It is safe next to extractions: an
+  object is only removed while no package links to it, and an extraction
+  that loses the race writes the file and creates the object again. Link
+  counts come from `nlink` on unix and `GetFileInformationByHandle` on
+  Windows.
 
-It is reached through `ExtractOptions { file_store }` on the `_with_options`
-variants of every extract function, `PackageCache::with_file_store`, and
-`rattler extract --file-store <dir>`.
+It is reached through `ExtractOptions { file_store: Option<FileStore> }` on
+the `_with_options` variants of every extract function,
+`PackageCache::with_file_store(FileStore)`, and `rattler extract --file-store
+<dir> [--file-store-min-size <bytes>]`. `FileStore::with_min_shared_size`
+leaves files below a size private.
+
+### `paths.json` hints do not fire for streamed `.conda` files
+
+The hint was planned on the assumption that `info-*.tar.zst` precedes
+`pkg-*.tar.zst` in a `.conda`. It does not: every conda-forge package checked
+(python, numpy, rust, pip, setuptools, wheel) stores `metadata.json`, then
+`pkg-`, then `info-`, so while streaming a `.conda` the metadata arrives
+after the files it describes. `.tar.bz2` packages do put `info/` first
+(conda 22.9.0: entries 1 to 24), so the hint works for the legacy format and
+for any caller that extracts the metadata first. For the streaming `.conda`
+path, which is what the package cache uses, it would take one or two range
+requests for the central directory and the info member before the download,
+or a local seek for `.conda` files on disk. Neither is implemented.
+
+This also settled where hashing happens. With the hint out of reach, the
+SHA-256 of a large file is only needed after it is written, and hashing on
+the extraction thread runs in series with decompression: it cost 330 ms of
+the 900 MiB rust package on every filesystem. Hashing from disk in the
+publish post-pass runs on all cores and reads from the page cache, which
+removed most of that on ext4 and ReFS. On NTFS the read-back pays the
+Defender tax instead (system time 495 → 935 ms), so there it is a wash.
 
 ### Measurements
 
-Loopback HTTP, hyperfine means, one binary with and without a store. "cold"
-clears the store before every run, "warm" keeps it populated.
+Loopback HTTP, hyperfine means with one warmup and ten runs, one binary
+with and without a store. "cold" clears the store before every run, "warm"
+keeps it populated. ext4 is WSL2 on the same machine; all runs are on an
+otherwise idle machine.
 
-| | Linux: none / cold / warm | NTFS: none / cold / warm |
-| --- | --- | --- |
-| python 3.13 | 321 / 430 / 334 ms | 1.37 / 3.64 / 2.24 s |
-| numpy | 169 / 240 / 160 ms | 0.93 / 1.66 / 1.55 s |
-| rust | 2.75 / 8.0 ± 5.2 / 2.64 s | ~3.2 / 3.43 / 3.43 s |
+| | ext4 none / cold / warm | ReFS none / cold / warm | NTFS none / cold / warm |
+| --- | --- | --- | --- |
+| python 3.13 | 169 / 277 / 169 ms | 170 / 234 / 185 ms | 654 / 741 / 516 ms |
+| numpy | 124 / 224 / 123 ms | 102 / 147 / 109 ms | 410 / 503 / 392 ms |
+| rust | 834 / 945 / 938 ms | 854 / 979 / 1021 ms | 1006 / 1320 / 1438 ms |
 
-Local files, Linux: python 266 / 296 / 250 ms, five-package env 2.43 / 2.62 /
-2.82 s. Windows local: python 1.77 / 3.46 / 2.56 s, env 12.4 / 17.4 / 21.8 s.
+The rust package across the three hashing designs, cold / warm:
 
-Skipping the object lookup for shards that do not exist yet brought NTFS cold
-python from 3.64 to 2.48 s and numpy from 1.66 to 1.54 s. A size threshold
-below which files are not shared was set up but the runs were taken on a busy
-machine and are not usable; the value in `min_shared_file_size` is a
-placeholder.
+| | ext4 | ReFS | NTFS |
+| --- | --- | --- | --- |
+| BLAKE3 on the extraction thread | 1009 / 978 ms | | |
+| SHA-256 on the extraction thread | 1196 / 1230 ms | 1179 / 1216 ms | 1382 / 1491 ms |
+| SHA-256 in the post-pass | 945 / 938 ms | 979 / 1021 ms | 1320 / 1438 ms |
+
+The minimum shared size, python and numpy, cold / warm:
+
+| | ext4 python | ext4 numpy | NTFS python | NTFS numpy |
+| --- | --- | --- | --- | --- |
+| 0 | 283 / 174 ms | 229 / 127 ms | 741 / 516 ms | 503 / 392 ms |
+| 4 KiB | 277 / 183 ms | 214 / 138 ms | 740 / 631 ms | 599 / 498 ms |
+| 16 KiB | 264 / 193 ms | 209 / 137 ms | | |
+| 64 KiB | 218 / 189 ms | 164 / 136 ms | 684 / 899 ms | 438 / 599 ms |
 
 What the numbers say:
 
-- On Linux a cold store costs about a third on many-small-file packages and a
-  warm store is neutral to slightly faster. The rust cold outlier needs a
-  rerun.
-- On NTFS a hard link costs about as much as writing the file, and system
-  time goes up four to seven times. The store is a disk-space feature there,
-  never a time win, and a warm store with large files is the worst case:
-  each file is written in full and then replaced by a link, while Defender
-  still holds the fresh file.
+- A warm store is neutral on ext4 and ReFS for many-small-file packages and
+  a win on NTFS: python 654 → 516 ms, because a hard link is cheaper than a
+  write that Defender inspects. The earlier note that the store could never
+  be a time win on NTFS predates hashing on the pump and the post-pass.
+- A cold store costs about 100 ms on python and numpy on every filesystem.
+  That is the link call per file; hashing small files in memory is not
+  visible.
+- Large files: cold overhead is now 13% on ext4, 15% on ReFS and 31% on
+  NTFS for the rust package. Warm is no better than cold because a file
+  above 64 KiB is still written before it is replaced by a link. Only the
+  `paths.json` hint avoids that write, and it needs the metadata first.
+- Not sharing small files buys a little cold time and loses more warm time,
+  on NTFS a lot (python warm 516 → 899 ms at 64 KiB), because every file
+  that is not linked has to be written. The default shares every file.
+- Removing the verification hash from the hinted path changed nothing,
+  because the hint never fired for `.conda`; the scratch build was
+  discarded.
 
 ### Open items
 
-1. Choose the minimum shared size from a quiet measurement (0, 4 KiB, 16 KiB
-   were prepared). uv's cache analysis suggests files under 1 KiB carry under
-   2% of the savings.
-2. Warm large files: use `info/paths.json` (which precedes `pkg-*.tar.zst`
-   in a `.conda`) as a hint, link the object for the listed SHA-256 before
-   reading the entry, and verify the hash while draining the entry. That
-   removes the write entirely on a warm store. Would move the key to SHA-256.
-3. Pruning: remove objects whose link count is 1 during cache cleanup;
-   `GetFileInformationByHandle` on Windows, `nlink` on unix, uv #21344 for a
-   macOS bulk path. Needed before the store can be on by default.
-4. Wire it into pixi behind a setting, off by default on Windows.
-5. Windows only: consider sharing files above a larger threshold, since the
-   per-link cost dominates and the savings are in large files.
+1. Hints for streamed `.conda` packages: fetch the central directory and
+   the `info-` member by range request before streaming, only when the
+   store has objects, and hand the parsed `paths.json` to the session. Local
+   `.conda` files can seek instead. This is the only way to skip the write
+   of a large file on a warm store.
+2. Pruning is not called from anywhere yet; the package cache's cleanup
+   should call `FileStore::prune` after it removes package directories.
+3. Wire it into pixi behind a setting. The measurements no longer argue for
+   keeping it off on Windows; NTFS warm runs are faster with the store.
+4. `SMALL_FILE_LIMIT` (64 KiB) is untested as a knob; files between 64 KiB
+   and a few MiB might be worth hashing in memory too, since that is the
+   only path that avoids the write on a warm store without hints.
 
 ## Methodology
 
 Numbers come from hyperfine around `rattler extract`, which #2748 teaches to
 take several packages, `--mode sync|async`, `--concurrency`, and to print the
-time per package. Packages: conda-forge `rust-1.98.0-hf8d6059_0.conda`,
+time per package. The store measurements use the win-64 packages
+`rust-1.98.0-hf8d6059_0.conda` (176 files, 901 MiB extracted),
+`python-3.13.7-hdf00ec1_100_cp313.conda` and
+`numpy-2.5.2-py313ha8dc839_1.conda`, on every filesystem, so the trees are
+identical across platforms. The earlier #2748 table used
 `python-3.13.15-h254dcb4_101_cp313.conda`, `numpy-2.5.2-py314hffb9209_1.conda`,
-`pytweening-1.2.0-pyhd8ed1ab_1.conda`, `mamba-1.0.0-py38hecfeebb_2.tar.bz2`.
+`pytweening-1.2.0-pyhd8ed1ab_1.conda` and `mamba-1.0.0-py38hecfeebb_2.tar.bz2`.
 The HTTP runs serve that directory with `python -m http.server` on loopback,
 which is where pixi's package cache reads from; local-file runs on NTFS carry
 a Defender read tax that HTTP runs do not, so the two are not comparable.
 
 ```
-hyperfine --shell=none --warmup 2 --runs 8 \
+hyperfine --warmup 1 --runs 10 \
   --prepare '<clear the output dir, and the store for cold runs>' \
-  -n main '<main binary> extract --mode async -d out http://127.0.0.1:8765/<pkg>' \
-  -n new  '<new binary>  extract --mode async -d out http://127.0.0.1:8765/<pkg>'
+  -n python/none '<binary> extract --mode async --destination out http://127.0.0.1:8765/<pkg>' \
+  -n python/cold '<binary> extract --mode async --destination out --file-store store http://127.0.0.1:8765/<pkg>'
 ```
 
 Windows numbers must be taken on NTFS with Defender on; the E: dev drive is

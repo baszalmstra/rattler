@@ -136,9 +136,10 @@ pub(crate) struct FileStoreSession<'a> {
 }
 
 impl FileStore {
-    /// Files smaller than this are not shared by default. Tiny files carry
-    /// almost none of the space savings while each one costs a link call
-    /// per package. The value still has to be chosen from measurements; see
+    /// Files smaller than this are not shared by default. Sharing every
+    /// file is the measured default: a small file linked from a warm store
+    /// is cheaper than writing it, on NTFS by a wide margin, and leaving
+    /// small files private only saves a few link calls on a cold store. See
     /// `docs/design/package-file-store.md`.
     pub const DEFAULT_MIN_SHARED_SIZE: u64 = 0;
 
