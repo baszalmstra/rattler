@@ -357,7 +357,7 @@ fn unpack_shared_file<R: Read>(
         };
         session.record(ExtractedFile::new(
             file_dst.to_path_buf(),
-            digest,
+            Some(digest),
             executable,
             written,
             reused,
@@ -393,7 +393,7 @@ fn unpack_shared_file<R: Read>(
         }
         session.record(ExtractedFile::new(
             file_dst.to_path_buf(),
-            hinted,
+            Some(hinted),
             executable,
             size,
             true,
@@ -401,37 +401,18 @@ fn unpack_shared_file<R: Read>(
         return Ok(());
     }
 
-    let mut hasher = Sha256::new();
-    let capacity = write_buffer_capacity(size);
-    let written = write_file(file_dst, mode, mtime, capacity, |writer| {
-        let mut reader = HashingRead {
-            inner: entry,
-            hasher: &mut hasher,
-        };
-        copy(&mut reader, writer)
-    })?;
+    // Hashing here would run on the extraction thread, in series with
+    // decompression; the file is written as is and hashed from disk when
+    // the session publishes it.
+    unpack_file(entry, file_dst, mtime)?;
     session.record(ExtractedFile::new(
         file_dst.to_path_buf(),
-        hasher.finalize(),
+        None,
         executable,
-        written,
+        size,
         false,
     ));
     Ok(())
-}
-
-/// Feeds everything read through it to a SHA-256 hasher.
-struct HashingRead<'a, R> {
-    inner: &'a mut R,
-    hasher: &'a mut Sha256,
-}
-
-impl<R: Read> Read for HashingRead<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        self.hasher.update(&buf[..read]);
-        Ok(read)
-    }
 }
 
 /// A write buffer sized to the file, capped so large files stream.

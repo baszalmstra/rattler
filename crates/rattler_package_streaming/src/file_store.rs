@@ -59,8 +59,9 @@ impl KnownShards {
 pub struct ExtractedFile {
     /// Absolute path of the file in the package directory.
     path: PathBuf,
-    /// SHA-256 of the file contents.
-    digest: Sha256Hash,
+    /// SHA-256 of the file contents, or `None` for a file that was written
+    /// without hashing and is hashed from disk when it is published.
+    digest: Option<Sha256Hash>,
     /// Whether any executable bit is set in the archive entry's mode.
     executable: bool,
     /// Size of the file in bytes.
@@ -72,7 +73,7 @@ pub struct ExtractedFile {
 impl ExtractedFile {
     pub(crate) fn new(
         path: PathBuf,
-        digest: Sha256Hash,
+        digest: Option<Sha256Hash>,
         executable: bool,
         size: u64,
         reused: bool,
@@ -223,23 +224,42 @@ impl FileStore {
     /// Shares the given files through the store. Files that were linked from
     /// an existing object during extraction are counted but not touched.
     ///
-    /// Files are grouped by shard directory so each shard is created once and
-    /// linked by one worker, which avoids contention on the shard directory.
-    /// Never fails: a file that cannot be shared stays a private copy.
-    fn publish(&self, files: &[ExtractedFile]) -> FileStoreStats {
+    /// Files that were written without hashing are hashed here from disk, in
+    /// parallel, which keeps the hashing of large files off the extraction
+    /// thread. Files are then grouped by shard directory so each shard is
+    /// created once and linked by one worker, which avoids contention on the
+    /// shard directory. Never fails: a file that cannot be shared stays a
+    /// private copy.
+    fn publish(&self, mut files: Vec<ExtractedFile>) -> FileStoreStats {
         let mut stats = FileStoreStats {
             files: files.len(),
             ..FileStoreStats::default()
         };
 
+        files
+            .par_iter_mut()
+            .filter(|file| file.digest.is_none() && !file.reused)
+            .for_each(|file| {
+                match rattler_digest::compute_file_digest::<rattler_digest::Sha256>(&file.path) {
+                    Ok(digest) => file.digest = Some(digest),
+                    Err(err) => {
+                        tracing::debug!("could not hash {}: {err}", file.path.display());
+                    }
+                }
+            });
+
         let mut shards: HashMap<PathBuf, Vec<(&ExtractedFile, PathBuf)>> = HashMap::new();
-        for file in files {
+        for file in &files {
             if file.reused {
                 stats.reused += 1;
                 stats.bytes_reused += file.size;
                 continue;
             }
-            let object = self.object_path(&file.digest, file.executable);
+            let Some(digest) = &file.digest else {
+                stats.unshared += 1;
+                continue;
+            };
+            let object = self.object_path(digest, file.executable);
             let shard = object
                 .parent()
                 .expect("object paths always have a shard directory")
@@ -377,7 +397,7 @@ impl FileStoreSession<'_> {
     /// Shares the recorded files through the store and reports what that
     /// did. Never fails: a file that cannot be shared stays a private copy.
     pub(crate) fn publish(self) -> FileStoreStats {
-        self.store.publish(&self.files)
+        self.store.publish(self.files)
     }
 }
 
@@ -582,14 +602,20 @@ mod tests {
         std::fs::write(pkg_b.join("z"), b"only in b").unwrap();
 
         let file = |path: PathBuf, contents: &[u8]| {
-            ExtractedFile::new(path, digest(contents), false, contents.len() as u64, false)
+            ExtractedFile::new(
+                path,
+                Some(digest(contents)),
+                false,
+                contents.len() as u64,
+                false,
+            )
         };
 
-        let stats = store.publish(&[file(pkg_a.join("x"), &same)]);
+        let stats = store.publish(vec![file(pkg_a.join("x"), &same)]);
         assert_eq!(stats.added, 1);
         assert_eq!(stats.reused, 0);
 
-        let stats = store.publish(&[
+        let stats = store.publish(vec![
             file(pkg_b.join("y"), &same),
             file(pkg_b.join("z"), b"only in b"),
         ]);
@@ -605,7 +631,28 @@ mod tests {
         assert!(same_file(&pkg_a.join("x"), &pkg_b.join("y")));
 
         // A missing source is reported as unshared, not as an error.
-        let stats = store.publish(&[file(pkg_b.join("missing"), b"nope")]);
+        let stats = store.publish(vec![file(pkg_b.join("missing"), b"nope")]);
+        assert_eq!(stats.unshared, 1);
+
+        // A file recorded without a digest is hashed from disk before it is
+        // shared, and lands on the same object as its in-memory twin.
+        std::fs::write(pkg_b.join("w"), &same).unwrap();
+        let stats = store.publish(vec![ExtractedFile::new(
+            pkg_b.join("w"),
+            None,
+            false,
+            same.len() as u64,
+            false,
+        )]);
+        assert_eq!((stats.added, stats.reused), (0, 1));
+        assert!(same_file(&pkg_a.join("x"), &pkg_b.join("w")));
+        let stats = store.publish(vec![ExtractedFile::new(
+            pkg_b.join("missing"),
+            None,
+            false,
+            0,
+            false,
+        )]);
         assert_eq!(stats.unshared, 1);
     }
 
@@ -642,17 +689,17 @@ mod tests {
         let orphan = b"package was deleted".to_vec();
         std::fs::write(pkg.join("kept"), &kept).unwrap();
         std::fs::write(pkg.join("orphan"), &orphan).unwrap();
-        let stats = store.publish(&[
+        let stats = store.publish(vec![
             ExtractedFile::new(
                 pkg.join("kept"),
-                digest(&kept),
+                Some(digest(&kept)),
                 false,
                 kept.len() as u64,
                 false,
             ),
             ExtractedFile::new(
                 pkg.join("orphan"),
-                digest(&orphan),
+                Some(digest(&orphan)),
                 true,
                 orphan.len() as u64,
                 false,
