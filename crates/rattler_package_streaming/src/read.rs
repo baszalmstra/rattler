@@ -369,15 +369,21 @@ fn unpack_shared_file<R: Read>(
         && session.link_existing(&hinted, executable, file_dst)
     {
         // The object is linked in place of the file; the entry is read only
-        // to check that the package really contains what it claims.
+        // to check that the package really contains what it claims. Reading
+        // through a large buffer matters: the decompressor produces output
+        // at the granularity it is asked for, and 8 KiB steps cost more than
+        // the hashing does.
         let mut hasher = Sha256::new();
-        let read = copy(
-            &mut HashingRead {
-                inner: entry,
-                hasher: &mut hasher,
-            },
-            &mut std::io::sink(),
-        )?;
+        buffer.resize(UNPACK_WRITE_BUFFER_SIZE, 0);
+        let mut read = 0;
+        loop {
+            let count = entry.read(buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            read += count as u64;
+        }
         if hasher.finalize() != hinted || read != size {
             let _ = std::fs::remove_file(file_dst);
             return Err(std::io::Error::new(
