@@ -264,7 +264,7 @@ impl FileStore {
             .collect::<Vec<_>>();
         shards.sort_unstable_by_key(|(_, files, _)| Reverse(files.len()));
 
-        if overlap_shard_creation(&self.root) {
+        if should_overlap_directory_creation(&self.root) {
             // ReFS and Unix benefit when serial shard creation overlaps links
             // into shards that are already ready.
             rayon::in_place_scope(|scope| {
@@ -410,16 +410,18 @@ fn hash_file(path: &Path) -> io::Result<blake3::Hash> {
     Ok(hasher.finalize())
 }
 
-/// Whether shard creation should overlap file publication on this filesystem.
+/// Whether serial directory creation should overlap file linking on this filesystem.
+#[doc(hidden)]
 #[cfg(not(windows))]
-fn overlap_shard_creation(_root: &Path) -> bool {
+pub fn should_overlap_directory_creation(_root: &Path) -> bool {
     true
 }
 
-/// `ReFS` benefits from uv's overlapping publication schedule, while `NTFS`
-/// performs better with a directory-creation barrier.
+/// `ReFS` benefits from overlapping directory creation and file linking, while
+/// `NTFS` performs better with a directory-creation barrier.
+#[doc(hidden)]
 #[cfg(windows)]
-fn overlap_shard_creation(root: &Path) -> bool {
+pub fn should_overlap_directory_creation(root: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
     use windows_sys::Win32::System::Diagnostics::Debug::{

@@ -215,6 +215,36 @@ rounds. Rattler therefore selects the overlapping schedule only on ReFS.
 The Unix path already used that schedule; an ext4 smoke benchmark remained
 neutral at 297.2→296.2 ms for Python and 237.3→237.5 ms for NumPy.
 
+#### Package linking
+
+The production synchronous package linker used the directory barrier on every
+filesystem and then applied `with_min_len(100)` to an iterator whose items are
+whole destination-directory groups. For packages with fewer than a few hundred
+groups, that minimum left most file linking serial. The installer now reuses
+the file-store filesystem policy: Unix and ReFS create actual destination
+directories parent-first and start each ready group immediately, while NTFS,
+unknown Windows filesystems, and macOS retain the barrier. Actual destinations
+include clobber paths under `__clobbers__`. A transaction-scoped context shares
+completed directory creation between concurrently linked packages.
+
+A warm package cache and fresh prefix isolated production `Installer` linking
+for Python, NumPy, pip, setuptools, and wheel. Thirty paired alternating rounds
+measured:
+
+| Filesystem | Baseline median | New median | Median paired change | 95% bootstrap interval |
+| --- | ---: | ---: | ---: | ---: |
+| ext4 | 287.7 ms | 278.6 ms | -3.7% | -4.4% to -2.4% |
+| ReFS | 476.3 ms | 105.8 ms | -79.5% | -90.4% to -65.2% |
+| NTFS | 366.2 ms | 366.0 ms | +0.4% | -13.5% to +17.1% |
+
+The ReFS samples contained large Defender outliers, but the paired median and
+ratio-of-means bootstrap agree on the direction and size of the improvement.
+Most of that gain comes from scheduling ready directory groups independently:
+with fine-grained groups on both sides, adding overlap on ReFS was
+inconclusive. On ext4, the corresponding barrier-only variant regressed by
+2.4%, so the complete overlapping schedule is retained. NTFS remains on the
+existing barrier and is unchanged within measurement noise.
+
 Three deeper parallelism variants did not improve ReFS: publishing already
 hashed small files while large-file hashing ran was 1.0% / 0.7% slower for
 Python / NumPy, parallel object-path construction was +0.3% / -0.9%, and
