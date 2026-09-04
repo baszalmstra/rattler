@@ -99,16 +99,11 @@ files and throttling the process; a faster writer gets hit harder.
   by one worker. `hard_link(package_file, object)` is the existence probe:
   success means a new object; `AlreadyExists` means the private copy is
   replaced by a link to the object.
-- Object identity is the hex SHA-256 of the contents, with an `x` suffix for
-  files with an executable bit, sharded by the first two hex characters into
-  256 directories. Mode and mtime are set while the file is still private and
-  never touched afterwards.
-- When `info/paths.json` is already on disk and the store has objects, a
-  large file is looked up through the SHA-256 that `paths.json` records for
-  it before its contents are read. On a hit the object is linked and the
-  entry is only drained to verify that hash; a mismatch rejects the package
-  (`InvalidData`) instead of linking wrong contents, and a size disagreement
-  ignores the hint. See below for when this can actually fire.
+- Object identity is the hex BLAKE3 digest of the contents, with an `x`
+  suffix for files with an executable bit, sharded by the first two hex
+  characters into 256 directories. Mode and mtime are set while the file is
+  still private and never touched afterwards. Package archive MD5 and
+  SHA-256 verification is separate and unchanged.
 - `info/` is never shared, so package metadata can be rewritten in place.
 - Nothing fails: a store that cannot be written, a cross-filesystem store, or
   a file that hits the link limit leaves a private copy and is counted as
@@ -126,47 +121,51 @@ the `_with_options` variants of every extract function,
 <dir> [--file-store-min-size <bytes>]`. `FileStore::with_min_shared_size`
 leaves files below a size private.
 
-### `paths.json` hints do not fire for streamed `.conda` files
+### Why the store uses BLAKE3, not `paths.json` SHA-256
 
-The hint was planned on the assumption that `info-*.tar.zst` precedes
-`pkg-*.tar.zst` in a `.conda`. It does not: every conda-forge package checked
-(python, numpy, rust, pip, setuptools, wheel) stores `metadata.json`, then
-`pkg-`, then `info-`, so while streaming a `.conda` the metadata arrives
-after the files it describes. `.tar.bz2` packages do put `info/` first
-(conda 22.9.0: entries 1 to 24), so the hint works for the legacy format and
-for any caller that extracts the metadata first. For the streaming `.conda`
-path, which is what the package cache uses, it would take one or two range
-requests for the central directory and the info member before the download,
-or a local seek for `.conda` files on disk. Neither is implemented.
+The first implementation used SHA-256 so the digest in `info/paths.json`
+could look up a large object before reading its contents. Those digests are
+untrusted input, so the entry still had to be hashed and checked before
+extraction could succeed. More importantly, the hint is unavailable when it
+would matter: every conda-forge `.conda` package checked (python, numpy, rust,
+pip, setuptools and wheel) stores `metadata.json`, then `pkg-*.tar.zst`, then
+`info-*.tar.zst`. The metadata arrives after the payload it describes.
+`.tar.bz2` packages put `info/` first, but retaining a second, slower object
+identity for the legacy format is not worth its weight.
 
-This also settled where hashing happens. With the hint out of reach, the
-SHA-256 of a large file is only needed after it is written, and hashing on
-the extraction thread runs in series with decompression: it cost 330 ms of
-the 900 MiB rust package on every filesystem. Hashing from disk in the
-publish post-pass runs on all cores and reads from the page cache, which
-removed most of that on ext4 and ReFS. On NTFS the read-back pays the
-Defender tax instead (system time 495 → 935 ms), so there it is a wash.
+The store therefore follows uv and keys objects directly by BLAKE3. Small
+files are hashed before writing. Large files are written normally, then
+hashed from the page cache in the parallel publish pass. This removes all
+`paths.json` parsing, speculative linking and verification from the store.
+It also keeps per-file CAS hashing distinct from the package stream's MD5 and
+SHA-256, which still authenticate and describe the complete archive.
+
+Knowing a BLAKE3 digest before extraction could avoid large writes on a warm
+store, but conda package metadata does not provide one. A SHA-256-to-BLAKE3
+index or extra range requests would add persistent state and I/O to optimize
+a path that has not justified that complexity.
 
 ### Measurements
 
 Loopback HTTP, hyperfine means with one warmup and ten runs, one binary
 with and without a store. "cold" clears the store before every run, "warm"
-keeps it populated. ext4 is WSL2 on the same machine; all runs are on an
-otherwise idle machine.
+keeps it populated. ext4 is WSL2 on the same machine; the final package
+groups were rerun after builds and other benchmark jobs stopped.
 
 | | ext4 none / cold / warm | ReFS none / cold / warm | NTFS none / cold / warm |
 | --- | --- | --- | --- |
-| python 3.13 | 169 / 277 / 169 ms | 170 / 234 / 185 ms | 654 / 741 / 516 ms |
-| numpy | 124 / 224 / 123 ms | 102 / 147 / 109 ms | 410 / 503 / 392 ms |
-| rust | 834 / 945 / 938 ms | 854 / 979 / 1021 ms | 1006 / 1320 / 1438 ms |
+| python 3.13 | 193 / 282 / 176 ms | 185 / 240 / 184 ms | 816 / 851 / 557 ms |
+| numpy | 132 / 230 / 128 ms | 109 / 146 / 107 ms | 428 / 529 / 416 ms |
+| rust | 891 / 953 / 984 ms | 900 / 961 / 1014 ms | 1075 / 1328 / 1463 ms |
 
-The rust package across the three hashing designs, cold / warm:
+The rust package across the hashing designs, cold / warm:
 
 | | ext4 | ReFS | NTFS |
 | --- | --- | --- | --- |
 | BLAKE3 on the extraction thread | 1009 / 978 ms | | |
 | SHA-256 on the extraction thread | 1196 / 1230 ms | 1179 / 1216 ms | 1382 / 1491 ms |
 | SHA-256 in the post-pass | 945 / 938 ms | 979 / 1021 ms | 1320 / 1438 ms |
+| BLAKE3 in the post-pass | 953 / 984 ms | 961 / 1014 ms | 1328 / 1463 ms |
 
 The minimum shared size, python and numpy, cold / warm:
 
@@ -179,38 +178,32 @@ The minimum shared size, python and numpy, cold / warm:
 
 What the numbers say:
 
-- A warm store is neutral on ext4 and ReFS for many-small-file packages and
-  a win on NTFS: python 654 → 516 ms, because a hard link is cheaper than a
-  write that Defender inspects. The earlier note that the store could never
-  be a time win on NTFS predates hashing on the pump and the post-pass.
-- A cold store costs about 100 ms on python and numpy on every filesystem.
-  That is the link call per file; hashing small files in memory is not
+- A warm store is neutral or faster for many-small-file packages: Python is
+  9% faster on ext4, neutral on ReFS and 32% faster on NTFS. A hard link is
+  cheaper than a write that Defender inspects.
+- A cold store adds 35 to 101 ms for Python and NumPy. That is mostly the
+  hard-link call per file; BLAKE3 hashing small in-memory buffers is not
   visible.
-- Large files: cold overhead is now 13% on ext4, 15% on ReFS and 31% on
-  NTFS for the rust package. Warm is no better than cold because a file
-  above 64 KiB is still written before it is replaced by a link. Only the
-  `paths.json` hint avoids that write, and it needs the metadata first.
+- For the 901 MiB rust package, the BLAKE3 post-pass adds 7% cold / 11% warm
+  on ext4, 7% / 13% on ReFS and 24% / 36% on NTFS. SHA-256 previously added
+  13% / 12%, 15% / 20% and 31% / 43%, respectively.
+- Hashing large files inline with BLAKE3 on Windows did not consistently
+  reduce the NTFS overhead and materially hurt ReFS, because it serializes
+  hashing with decompression. The post-pass stays enabled on every platform.
 - Not sharing small files buys a little cold time and loses more warm time,
-  on NTFS a lot (python warm 516 → 899 ms at 64 KiB), because every file
-  that is not linked has to be written. The default shares every file.
-- Removing the verification hash from the hinted path changed nothing,
-  because the hint never fired for `.conda`; the scratch build was
-  discarded.
+  on NTFS a lot (the SHA-256 prototype's Python warm run went 516 → 899 ms at
+  64 KiB), because every private file has to be written. The default shares
+  every file.
 
 ### Open items
 
-1. Hints for streamed `.conda` packages: fetch the central directory and
-   the `info-` member by range request before streaming, only when the
-   store has objects, and hand the parsed `paths.json` to the session. Local
-   `.conda` files can seek instead. This is the only way to skip the write
-   of a large file on a warm store.
-2. Pruning is not called from anywhere yet; the package cache's cleanup
+1. Pruning is not called from anywhere yet; the package cache's cleanup
    should call `FileStore::prune` after it removes package directories.
-3. Wire it into pixi behind a setting. The measurements no longer argue for
+2. Wire it into pixi behind a setting. The measurements no longer argue for
    keeping it off on Windows; NTFS warm runs are faster with the store.
-4. `SMALL_FILE_LIMIT` (64 KiB) is untested as a knob; files between 64 KiB
+3. `SMALL_FILE_LIMIT` (64 KiB) is untested as a knob; files between 64 KiB
    and a few MiB might be worth hashing in memory too, since that is the
-   only path that avoids the write on a warm store without hints.
+   only path that avoids the write on a warm store.
 
 ## Methodology
 

@@ -5,7 +5,6 @@ use super::{ExtractError, ExtractOptions, ExtractResult};
 use crate::file_store::{
     ExtractedFile, FileStore, FileStoreSession, FileStoreStats, SMALL_FILE_LIMIT,
 };
-use rattler_digest::{Sha256, digest::Digest};
 use std::io::{Seek, SeekFrom, Write, copy};
 use std::mem::ManuallyDrop;
 use std::{
@@ -253,26 +252,15 @@ fn unpack_tar_archive_sync<R: Read>(
         }
 
         if is_regular_file {
-            let shared = match session.as_deref_mut() {
-                Some(session) => file_dst
+            let shared = session.as_deref_mut().filter(|session| {
+                file_dst
                     .strip_prefix(&destination)
-                    .ok()
-                    .filter(|relative| session.is_shareable(relative, entry.size()))
-                    .map(|relative| (session, relative.to_path_buf())),
-                None => None,
-            };
+                    .is_ok_and(|relative| session.is_shareable(relative, entry.size()))
+            });
             match shared {
-                Some((session, relative)) => {
-                    unpack_shared_file(
-                        session,
-                        &destination,
-                        &relative,
-                        &mut entry,
-                        &file_dst,
-                        mtime,
-                        &mut small_file,
-                    )
-                    .map_err(|err| unpack_error(&entry_path, err))?;
+                Some(session) => {
+                    unpack_shared_file(session, &mut entry, &file_dst, mtime, &mut small_file)
+                        .map_err(|err| unpack_error(&entry_path, err))?;
                 }
                 None => {
                     unpack_file(&mut entry, &file_dst, mtime)
@@ -325,14 +313,10 @@ fn unpack_file<R: Read>(
 ///
 /// Small files are hashed in memory first and linked from an existing object
 /// when there is one, so on a warm store they cost a single link call. Larger
-/// files are looked up through the SHA-256 that `info/paths.json` records
-/// for them; when the object exists the entry is only read to verify that
-/// hash. Otherwise they are hashed while they are written and shared
-/// afterwards by the session.
+/// files are written normally and hashed from disk by the session's parallel
+/// publish pass.
 fn unpack_shared_file<R: Read>(
     session: &mut FileStoreSession<'_>,
-    destination: &Path,
-    relative: &Path,
     entry: &mut tar::Entry<'_, R>,
     file_dst: &Path,
     mtime: u64,
@@ -345,7 +329,7 @@ fn unpack_shared_file<R: Read>(
     if size <= SMALL_FILE_LIMIT {
         buffer.clear();
         entry.read_to_end(buffer)?;
-        let digest = Sha256::digest(&*buffer);
+        let digest = blake3::hash(buffer);
         let reused = session.link_existing(&digest, executable, file_dst);
         let written = if reused {
             buffer.len() as u64
@@ -361,42 +345,6 @@ fn unpack_shared_file<R: Read>(
             executable,
             written,
             reused,
-        ));
-        return Ok(());
-    }
-
-    if let Some(hinted) = session.hinted_digest(destination, relative, size)
-        && session.link_existing(&hinted, executable, file_dst)
-    {
-        // The object is linked in place of the file; the entry is read only
-        // to check that the package really contains what it claims. Reading
-        // through a large buffer matters: the decompressor produces output
-        // at the granularity it is asked for, and 8 KiB steps cost more than
-        // the hashing does.
-        let mut hasher = Sha256::new();
-        buffer.resize(UNPACK_WRITE_BUFFER_SIZE, 0);
-        let mut read = 0;
-        loop {
-            let count = entry.read(buffer)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-            read += count as u64;
-        }
-        if hasher.finalize() != hinted || read != size {
-            let _ = std::fs::remove_file(file_dst);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "the file's contents do not match the SHA-256 in info/paths.json",
-            ));
-        }
-        session.record(ExtractedFile::new(
-            file_dst.to_path_buf(),
-            Some(hinted),
-            executable,
-            size,
-            true,
         ));
         return Ok(());
     }

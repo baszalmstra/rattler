@@ -2,13 +2,12 @@
 //! packages.
 //!
 //! Every regular file of a package is extracted into the package directory as
-//! usual. Afterwards each file is hard linked into the store under the SHA-256
+//! usual. Afterwards each file is hard linked into the store under the BLAKE3
 //! hash of its contents and executable bit, so packages that ship identical
 //! files share one inode. When a store object already exists, the package's
-//! private copy is replaced by a link to it. Small files are looked up before
-//! they are written at all, and larger files are looked up through the
-//! SHA-256 that `info/paths.json` records for them, so on a warm store they
-//! are never written.
+//! private copy is replaced by a link to it. Small files are hashed and looked
+//! up before they are written at all. Larger files are written normally and
+//! hashed in parallel from the page cache after extraction.
 //!
 //! Package directories stay complete on their own: a file that cannot be
 //! linked, for example because the store is on another filesystem or the
@@ -27,8 +26,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rattler_conda_types::package::{PackageFile, PathType, PathsJson};
-use rattler_digest::Sha256Hash;
 use rayon::prelude::*;
 
 /// Files up to this size are hashed in memory and linked from an existing
@@ -59,9 +56,9 @@ impl KnownShards {
 pub struct ExtractedFile {
     /// Absolute path of the file in the package directory.
     path: PathBuf,
-    /// SHA-256 of the file contents, or `None` for a file that was written
-    /// without hashing and is hashed from disk when it is published.
-    digest: Option<Sha256Hash>,
+    /// BLAKE3 hash of the file contents, or `None` for a file that was
+    /// written without hashing and is hashed from disk when it is published.
+    digest: Option<blake3::Hash>,
     /// Whether any executable bit is set in the archive entry's mode.
     executable: bool,
     /// Size of the file in bytes.
@@ -73,7 +70,7 @@ pub struct ExtractedFile {
 impl ExtractedFile {
     pub(crate) fn new(
         path: PathBuf,
-        digest: Option<Sha256Hash>,
+        digest: Option<blake3::Hash>,
         executable: bool,
         size: u64,
         reused: bool,
@@ -114,25 +111,13 @@ pub struct PruneStats {
     pub bytes_freed: u64,
 }
 
-/// What `info/paths.json` records about a file, used to look up a store
-/// object before the file's contents are read.
-#[derive(Debug, Clone, Copy)]
-struct PathHint {
-    sha256: Sha256Hash,
-    size: Option<u64>,
-}
-
 /// The sharing state of one package extraction: the store objects that can
-/// be looked up, the files extracted so far, and the `info/paths.json` hints
-/// once the package's metadata is on disk.
+/// be looked up and the files extracted so far.
 #[derive(Debug)]
 pub(crate) struct FileStoreSession<'a> {
     store: &'a FileStore,
     shards: KnownShards,
     files: Vec<ExtractedFile>,
-    /// `None` until the first lookup; an empty map when the package has no
-    /// usable `info/paths.json`.
-    hints: Option<HashMap<PathBuf, PathHint>>,
 }
 
 impl FileStore {
@@ -168,7 +153,7 @@ impl FileStore {
 
     /// The path of the object for the given contents and executable bit,
     /// whether or not it exists.
-    pub fn object_path(&self, digest: &Sha256Hash, executable: bool) -> PathBuf {
+    pub fn object_path(&self, digest: &blake3::Hash, executable: bool) -> PathBuf {
         self.object_path_for_key(&object_key(digest, executable))
     }
 
@@ -182,7 +167,6 @@ impl FileStore {
             store: self,
             shards: self.known_shards(),
             files: Vec::new(),
-            hints: None,
         }
     }
 
@@ -207,7 +191,7 @@ impl FileStore {
     fn link_existing(
         &self,
         shards: &KnownShards,
-        digest: &Sha256Hash,
+        digest: &blake3::Hash,
         executable: bool,
         destination: &Path,
     ) -> io::Result<bool> {
@@ -240,12 +224,10 @@ impl FileStore {
         files
             .par_iter_mut()
             .filter(|file| file.digest.is_none() && !file.reused)
-            .for_each(|file| {
-                match rattler_digest::compute_file_digest::<rattler_digest::Sha256>(&file.path) {
-                    Ok(digest) => file.digest = Some(digest),
-                    Err(err) => {
-                        tracing::debug!("could not hash {}: {err}", file.path.display());
-                    }
+            .for_each(|file| match hash_file(&file.path) {
+                Ok(digest) => file.digest = Some(digest),
+                Err(err) => {
+                    tracing::debug!("could not hash {}: {err}", file.path.display());
                 }
             });
 
@@ -350,7 +332,7 @@ impl FileStoreSession<'_> {
     /// whether it did; a failed link is reported and treated as absent.
     pub(crate) fn link_existing(
         &self,
-        digest: &Sha256Hash,
+        digest: &blake3::Hash,
         executable: bool,
         destination: &Path,
     ) -> bool {
@@ -369,27 +351,6 @@ impl FileStoreSession<'_> {
         }
     }
 
-    /// The SHA-256 that the package's `info/paths.json` records for the file
-    /// at `relative`, when the metadata is already extracted below
-    /// `destination` and agrees with the entry's `size`. The hint is only
-    /// worth looking up when its object can exist, so a cold store never
-    /// reads `paths.json`.
-    pub(crate) fn hinted_digest(
-        &mut self,
-        destination: &Path,
-        relative: &Path,
-        size: u64,
-    ) -> Option<Sha256Hash> {
-        if self.shards.0.is_empty() {
-            return None;
-        }
-        let hints = self
-            .hints
-            .get_or_insert_with(|| load_hints(&destination.join("info").join("paths.json")));
-        let hint = hints.get(relative)?;
-        (hint.size.is_none_or(|hinted| hinted == size)).then_some(hint.sha256)
-    }
-
     /// Records an extracted regular file for publishing.
     pub(crate) fn record(&mut self, file: ExtractedFile) {
         self.files.push(file);
@@ -402,33 +363,11 @@ impl FileStoreSession<'_> {
     }
 }
 
-/// Reads the hints from a `paths.json`. Anything that cannot be read or
-/// parsed yields no hints; the files are then hashed while they are written.
-fn load_hints(path: &Path) -> HashMap<PathBuf, PathHint> {
-    let paths = match PathsJson::from_path(path) {
-        Ok(paths) => paths,
-        Err(err) => {
-            tracing::debug!("no file store hints from {}: {err}", path.display());
-            return HashMap::new();
-        }
-    };
-    paths
-        .paths
-        .into_iter()
-        .filter_map(|entry| {
-            let sha256 = entry.sha256?;
-            match entry.path_type {
-                PathType::HardLink => Some((
-                    entry.relative_path,
-                    PathHint {
-                        sha256,
-                        size: entry.size_in_bytes,
-                    },
-                )),
-                PathType::SoftLink | PathType::Directory => None,
-            }
-        })
-        .collect()
+/// Computes the BLAKE3 hash of a file through a wide read buffer.
+fn hash_file(path: &Path) -> io::Result<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize())
 }
 
 /// Removes the objects in one shard directory that no package links to.
@@ -543,10 +482,11 @@ fn replace_with_link(source: &Path, object: &Path) -> io::Result<()> {
     }
 }
 
-/// The object name for a content hash and executable bit: the hex SHA-256,
-/// with an `x` suffix for executables so the two never collide.
-fn object_key(digest: &Sha256Hash, executable: bool) -> String {
-    let mut key = hex::encode(digest);
+/// The object name for a content hash and executable bit: the hex BLAKE3
+/// digest, with an `x` suffix for executables so the two never collide.
+fn object_key(digest: &blake3::Hash, executable: bool) -> String {
+    let mut key = String::with_capacity(65);
+    key.push_str(digest.to_hex().as_str());
     if executable {
         key.push('x');
     }
@@ -556,10 +496,9 @@ fn object_key(digest: &Sha256Hash, executable: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rattler_digest::{Sha256, compute_bytes_digest};
 
-    fn digest(contents: &[u8]) -> Sha256Hash {
-        compute_bytes_digest::<Sha256>(contents)
+    fn digest(contents: &[u8]) -> blake3::Hash {
+        blake3::hash(contents)
     }
 
     #[test]

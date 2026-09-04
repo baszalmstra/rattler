@@ -13,6 +13,7 @@ readme.workspace = true
 
 [dependencies]
 bzip2 = { workspace = true }
+blake3 = { workspace = true }
 dunce = { workspace = true }
 rayon = { workspace = true }
 jiff = { workspace = true }
