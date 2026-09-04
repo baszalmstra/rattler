@@ -264,10 +264,30 @@ impl FileStore {
             .collect::<Vec<_>>();
         shards.sort_unstable_by_key(|(_, files, _)| Reverse(files.len()));
 
-        // Root-directory mutations and links contend heavily on Windows, so
-        // finish creating shard directories before linking there.
-        #[cfg(windows)]
-        {
+        if overlap_shard_creation(&self.root) {
+            // ReFS and Unix benefit when serial shard creation overlaps links
+            // into shards that are already ready.
+            rayon::in_place_scope(|scope| {
+                for (shard, files, shard_stats) in &mut shards {
+                    let shard = self.root.join(format!("{shard:02x}"));
+                    match std::fs::create_dir_all(&shard) {
+                        Ok(()) => {
+                            scope.spawn(move |_| {
+                                for (file, object) in files {
+                                    publish_file(&file.path, object, file.size, shard_stats);
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            tracing::debug!("could not create {}: {err}", shard.display());
+                            shard_stats.unshared += files.len();
+                        }
+                    }
+                }
+            });
+        } else {
+            // NTFS performs better when root-directory mutations finish
+            // before links start.
             for (shard, files, shard_stats) in &mut shards {
                 let shard = self.root.join(format!("{shard:02x}"));
                 if let Err(err) = std::fs::create_dir_all(&shard) {
@@ -282,28 +302,6 @@ impl FileStore {
                 }
             });
         }
-
-        // Other platforms can overlap serial root-directory creation with
-        // links into shards that are already ready.
-        #[cfg(not(windows))]
-        rayon::in_place_scope(|scope| {
-            for (shard, files, shard_stats) in &mut shards {
-                let shard = self.root.join(format!("{shard:02x}"));
-                match std::fs::create_dir_all(&shard) {
-                    Ok(()) => {
-                        scope.spawn(move |_| {
-                            for (file, object) in files {
-                                publish_file(&file.path, object, file.size, shard_stats);
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        tracing::debug!("could not create {}: {err}", shard.display());
-                        shard_stats.unshared += files.len();
-                    }
-                }
-            }
-        });
 
         let linked = shards
             .into_iter()
@@ -410,6 +408,92 @@ fn hash_file(path: &Path) -> io::Result<blake3::Hash> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(std::fs::File::open(path)?)?;
     Ok(hasher.finalize())
+}
+
+/// Whether shard creation should overlap file publication on this filesystem.
+#[cfg(not(windows))]
+fn overlap_shard_creation(_root: &Path) -> bool {
+    true
+}
+
+/// `ReFS` benefits from uv's overlapping publication schedule, while `NTFS`
+/// performs better with a directory-creation barrier.
+#[cfg(windows)]
+fn overlap_shard_creation(root: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode,
+    };
+
+    struct ErrorModeGuard(u32);
+
+    impl ErrorModeGuard {
+        fn suppress_critical_errors() -> Option<Self> {
+            // SAFETY: these functions access error-mode state belonging to
+            // the current thread. The previous mode is saved by value.
+            let previous = unsafe { GetThreadErrorMode() };
+            // SAFETY: the null output pointer is explicitly supported.
+            let success = unsafe {
+                SetThreadErrorMode(previous | SEM_FAILCRITICALERRORS, std::ptr::null_mut())
+            };
+            (success != 0).then_some(Self(previous))
+        }
+    }
+
+    impl Drop for ErrorModeGuard {
+        fn drop(&mut self) {
+            // SAFETY: this restores the value read from this thread before
+            // the guard was created. The null output pointer is supported.
+            let _ = unsafe { SetThreadErrorMode(self.0, std::ptr::null_mut()) };
+        }
+    }
+
+    let Ok(absolute) = std::path::absolute(root) else {
+        return false;
+    };
+    let Some(_error_mode) = ErrorModeGuard::suppress_critical_errors() else {
+        return false;
+    };
+    let Some(existing) = absolute.ancestors().find(|path| path.exists()) else {
+        return false;
+    };
+    let existing = existing
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut volume_root = [0u16; 260];
+    // SAFETY: both buffers remain valid for the duration of the call. The
+    // input is null-terminated and the writable buffer length is exact.
+    let success = unsafe {
+        GetVolumePathNameW(
+            existing.as_ptr(),
+            volume_root.as_mut_ptr(),
+            volume_root.len() as u32,
+        )
+    };
+    if success == 0 {
+        return false;
+    }
+
+    let mut filesystem_name = [0u16; 16];
+    // SAFETY: the volume-root buffer was initialized and null-terminated by
+    // GetVolumePathNameW. The optional output pointers are null, and the
+    // writable filesystem-name buffer length matches the value passed.
+    let success = unsafe {
+        GetVolumeInformationW(
+            volume_root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem_name.as_mut_ptr(),
+            16,
+        )
+    };
+    success != 0 && filesystem_name.starts_with(&[0x52, 0x65, 0x46, 0x53, 0])
 }
 
 /// Removes the objects in one shard directory that no package links to.

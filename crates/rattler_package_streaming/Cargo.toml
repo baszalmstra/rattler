@@ -65,6 +65,7 @@ zstd = { workspace = true, features = ["zstdmt"] }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Debug",
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

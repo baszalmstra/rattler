@@ -100,10 +100,11 @@ files and throttling the process; a faster writer gets hit harder.
 - After the archive is done, `FileStoreSession::publish` hashes the large
   files from disk on a rayon pool, then hard links every file into the
   store. Targets are grouped in a 256-entry array by digest byte, avoiding
-  path hashing. On Unix, shard creation runs serially, largest shard first,
-  while workers link shards that are already ready. Windows creates all
+  path hashing. On Unix and ReFS, shard creation runs serially, largest shard
+  first, while workers link shards that are already ready. NTFS creates all
   shards before linking because overlapping those metadata operations
-  contends on NTFS. `hard_link(package_file, object)` is the existence probe:
+  regresses there. Failure to identify the Windows filesystem takes the NTFS
+  barrier. `hard_link(package_file, object)` is the existence probe:
   success means a new object; `AlreadyExists` means the private copy is
   replaced by a link to the object.
 - Object identity is the hex BLAKE3 digest of the contents, with an `x`
@@ -197,12 +198,34 @@ worse still on ext4 at 1424 / 1418 ms because it serialized hashing with
 decompression. Reading the freshly written files from the page cache in the
 parallel post-pass remains the lowest measured design.
 
-Compared with the previous BLAKE3 build, the final absolute cold / warm
-results improved from 282 / 176 to 279 / 168 ms for Python on ext4, from
-146 / 107 to 139 / 102 ms for NumPy on ReFS, and from 1328 / 1463 to
-1364 / 1473 ms for rust on NTFS. The last result is a small regression; the
-large-file path is unchanged on Windows and NTFS varies substantially under
-Defender, so this does not justify a filesystem-specific mechanism.
+Compared with the previous BLAKE3 build, these absolute cold / warm results
+improved from 282 / 176 to 279 / 168 ms for Python on ext4, from 146 / 107
+to 139 / 102 ms for NumPy on ReFS, and from 1328 / 1463 to 1364 / 1473 ms
+for rust on NTFS. The last result is a small regression; the large-file path
+is unchanged on Windows and NTFS varies substantially under Defender, so this
+does not justify changing the large-file hashing path.
+
+The Windows publication schedule was subsequently measured in paired,
+alternating cold-store runs. Overlapping serial shard creation with
+per-shard link workers, matching uv's schedule, reduced the ReFS Python median
+by 4.1% (95% bootstrap interval -7.0% to -1.2%) and the NumPy median by 2.4%
+(-6.9% to +3.5%) over 30 rounds. The same schedule on NTFS was neutral for
+Python at +0.3% (-5.7% to +5.9%) and NumPy at -0.5% (-5.0% to +3.4%) over 60
+rounds. Rattler therefore selects the overlapping schedule only on ReFS.
+The Unix path already used that schedule; an ext4 smoke benchmark remained
+neutral at 297.2→296.2 ms for Python and 237.3→237.5 ms for NumPy.
+
+Three deeper parallelism variants did not improve ReFS: publishing already
+hashed small files while large-file hashing ran was 1.0% / 0.7% slower for
+Python / NumPy, parallel object-path construction was +0.3% / -0.9%, and
+limiting Rayon to eight threads was -1.7% / -0.3%. The percentage overhead
+also exaggerates the remaining gap with uv because rattler's store-free
+extraction is faster. The observed cold CAS deltas are already of the same
+order: 101 / 118 ms on ext4, 56 / 40 ms on ReFS, and 89 / 77 ms on NTFS for
+rattler's Python / NumPy packages, versus uv's 99 / 88 ms, 66 / 19 ms, and
+151 / 62 ms for the SymPy / NumPy wheels. These workloads are not directly
+comparable, but they do not show a general missing-publication-parallelism
+bottleneck.
 
 uv's published cold result uses the closest available cache state but a larger
 denominator: complete `uv pip install` rather than extraction. Its published
