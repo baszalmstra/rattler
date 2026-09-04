@@ -1,6 +1,6 @@
 # Package extraction performance and the package file store
 
-Status, 3 September 2026. Working notes on extraction performance and a
+Status, 4 September 2026. Working notes on extraction performance and a
 content-addressed store for extracted package files. Two parts have PRs; the
 store itself lives on this branch and is not wired into pixi yet.
 
@@ -20,8 +20,8 @@ in [astral-sh/uv#21327](https://github.com/astral-sh/uv/pull/21327) with about
 3–4% overhead on cold, complete `uv pip install` benchmarks. That percentage
 does not use the same denominator as the extraction-only benchmarks below:
 uv includes the rest of installation, and its warm path normally reuses an
-already-unpacked wheel instead of extracting it again. The difference between
-the CAS implementations is smaller than the headline percentages suggest.
+already-unpacked wheel instead of extracting it again. A direct benchmark of
+both uv revisions and a forced-extraction warm-store mode is included below.
 
 Per regular file, #2031 did roughly twelve filesystem operations inside the
 serial tar loop: stat the store path, `create_dir_all` on a two-level shard
@@ -30,7 +30,8 @@ rename into the store, hard link back, then chmod and set the mtime on the
 link. Plain extraction does four. uv leaves the extraction loop untouched,
 hashes with BLAKE3 in the write buffer, and runs one post-pass on a thread
 pool that costs one hard link per new file. uv's own inline prototype was
-2.5 to 3.4 times slower; the restructuring brought it to +4%.
+2.5 to 3.4 times slower; its native-Linux benchmark reported +4% after the
+restructuring.
 
 #2031 also had three correctness problems that uv's design avoids: it
 chmods and re-stamps the mtime on a hard link, which mutates the inode shared
@@ -203,12 +204,55 @@ results improved from 282 / 176 to 279 / 168 ms for Python on ext4, from
 large-file path is unchanged on Windows and NTFS varies substantially under
 Defender, so this does not justify a filesystem-specific mechanism.
 
-The closest uv comparison is its cold, complete-install result, not these
-numbers. This benchmark deliberately removes the destination before every
-sample and times only `rattler extract`; uv's warm measurements generally
-skip extraction by reusing its unpacked archive cache. Matching uv's warm
-percentage requires package-directory reuse above this file store, not a
-faster per-file CAS operation.
+uv's published cold result uses the closest available cache state but a larger
+denominator: complete `uv pip install` rather than extraction. Its published
+warm result skips extraction by reusing the unpacked archive. The direct
+comparison below adds a third state that retains only uv's file store and
+therefore forces extraction into a fresh destination.
+
+### uv comparator
+
+The uv benchmark was rerun with profiling builds of the two revisions named in
+its report: `a3f977ece` for the binary-only store and `85c3f7485` for the
+optimized all-file store. Each sample installs one pinned local wheel
+offline, without dependencies or bytecode compilation, through hard links into
+a fresh target. The wheel page cache is warm. Results are medians from 30
+paired, alternating rounds after three warmups; setup and cleanup are untimed.
+The ext4 process was pinned to eight CPUs under WSL2. ReFS and NTFS used the
+same Windows binaries and Python 3.12.13.
+
+Three cache states separate the relevant work:
+
+- **cold** removes the entire uv cache and the target;
+- **store warm** retains only `files-v0`, forcing unzip, hashing, and
+  publication against existing CAS objects;
+- **archive warm** retains uv's complete extracted-wheel cache and removes
+  only the target.
+
+The table shows binary-only to all-file CAS medians and the relative change:
+
+| wheel | ext4 cold / store warm / archive warm | ReFS cold / store warm / archive warm | NTFS cold / store warm / archive warm |
+| --- | --- | --- | --- |
+| AnyIO 4.9.0 | 51→69 ms (+35.7%) / 51→53 ms (+3.7%) / 15→15 ms (+0.1%) | 94→99 ms (+5.3%) / 182→191 ms (+5.3%) / 45→45 ms (-0.1%) | 136→149 ms (+9.2%) / 126→157 ms (+24.9%) / 32→32 ms (-0.2%) |
+| SymPy 1.14.0 | 259→358 ms (+38.3%) / 257→262 ms (+2.2%) / 88→89 ms (+1.3%) | 420→486 ms (+15.8%) / 468→581 ms (+24.0%) / 118→115 ms (-2.9%) | 818→969 ms (+18.5%) / 831→1057 ms (+27.2%) / 291→291 ms (-0.0%) |
+| NumPy 2.2.6 | 211→299 ms (+42.3%) / 206→207 ms (+0.8%) / 54→54 ms (-0.0%) | 282→301 ms (+6.7%) / 279→313 ms (+12.3%) / 120→121 ms (+1.1%) | 525→587 ms (+11.9%) / 514→648 ms (+26.1%) / 205→209 ms (+1.8%) |
+
+On ext4, the paired 95% intervals for cold were 33.2–37.9%, 37.0–39.3%,
+and 39.8–44.4%; for store warm they were 2.6–4.8%, 1.3–3.4%, and
+-0.1–2.4%. A second ext4 run using fresh virtual environments and default link
+mode, matching uv's stated setup more closely, still measured 35.4%, 37.0%,
+and 40.9% cold. The difference from uv's published 3–4% is therefore not a
+`--target` artifact. These ext4 runs used WSL2 rather than uv's native Linux
+VM, so they establish host sensitivity rather than contradicting uv's result.
+ReFS had high variance for SymPy, while the NTFS store-warm intervals
+were 17.6–30.6%, 16.6–37.5%, and 20.3–31.5%.
+
+The store-warm row is the useful comparison with rattler's warm extraction:
+both retain file objects but force extraction into a new destination. uv's
+ordinary archive-warm result is near zero overhead because it does not extract.
+Absolute times are not comparable across the tools: wheels and conda packages
+have different contents, and `uv pip install` still includes resolution and
+installation work outside decompression and file-store publication.
 
 ### Open items
 
