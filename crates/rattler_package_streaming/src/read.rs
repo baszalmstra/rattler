@@ -330,21 +330,19 @@ fn unpack_shared_file<R: Read>(
         buffer.clear();
         entry.read_to_end(buffer)?;
         let digest = blake3::hash(buffer);
-        let reused = session.link_existing(&digest, executable, file_dst);
-        let written = if reused {
-            buffer.len() as u64
-        } else {
-            write_file(file_dst, mode, mtime, buffer.len(), |writer| {
-                writer.write_all(buffer)?;
-                Ok(buffer.len() as u64)
-            })?
-        };
+        if session.link_existing(&digest, executable, file_dst) {
+            session.record_reused(size);
+            return Ok(());
+        }
+        write_file(file_dst, mode, mtime, buffer.len(), |writer| {
+            writer.write_all(buffer)?;
+            Ok(buffer.len() as u64)
+        })?;
         session.record(ExtractedFile::new(
             file_dst.to_path_buf(),
             Some(digest),
             executable,
-            written,
-            reused,
+            size,
         ));
         return Ok(());
     }
@@ -358,7 +356,6 @@ fn unpack_shared_file<R: Read>(
         None,
         executable,
         size,
-        false,
     ));
     Ok(())
 }

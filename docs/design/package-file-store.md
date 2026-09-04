@@ -16,9 +16,12 @@ store itself lives on this branch and is not wired into pixi yet.
 [#2031](https://github.com/conda/rattler/pull/2031) added a content-addressed
 store for extracted files and found that extraction time doubled on Windows
 for the `rust` package while saving 2% of disk space. uv shipped the same idea
-in [astral-sh/uv#21327](https://github.com/astral-sh/uv/pull/21327) at under
-4% overhead. The difference is where the work happens and how many filesystem
-operations each file pays.
+in [astral-sh/uv#21327](https://github.com/astral-sh/uv/pull/21327) with about
+3–4% overhead on cold, complete `uv pip install` benchmarks. That percentage
+does not use the same denominator as the extraction-only benchmarks below:
+uv includes the rest of installation, and its warm path normally reuses an
+already-unpacked wheel instead of extracting it again. The difference between
+the CAS implementations is smaller than the headline percentages suggest.
 
 Per regular file, #2031 did roughly twelve filesystem operations inside the
 serial tar loop: stat the store path, `create_dir_all` on a two-level shard
@@ -95,8 +98,11 @@ files and throttling the process; a faster writer gets hit harder.
   extraction, without hashing on the extraction thread.
 - After the archive is done, `FileStoreSession::publish` hashes the large
   files from disk on a rayon pool, then hard links every file into the
-  store, grouped by shard so each shard directory is created once and linked
-  by one worker. `hard_link(package_file, object)` is the existence probe:
+  store. Targets are grouped in a 256-entry array by digest byte, avoiding
+  path hashing. On Unix, shard creation runs serially, largest shard first,
+  while workers link shards that are already ready. Windows creates all
+  shards before linking because overlapping those metadata operations
+  contends on NTFS. `hard_link(package_file, object)` is the existence probe:
   success means a new object; `AlreadyExists` means the private copy is
   replaced by a link to the object.
 - Object identity is the hex BLAKE3 digest of the contents, with an `x`
@@ -114,6 +120,10 @@ files and throttling the process; a faster writer gets hit harder.
   that loses the race writes the file and creates the object again. Link
   counts come from `nlink` on unix and `GetFileInformationByHandle` on
   Windows.
+- Existing shards are represented by a 256-bit set. Cold lookups test the raw
+  digest byte before formatting an object path. Files linked during extraction
+  update aggregate counters directly instead of retaining a path and digest
+  for the publish pass.
 
 It is reached through `ExtractOptions { file_store: Option<FileStore> }` on
 the `_with_options` variants of every extract function,
@@ -149,51 +159,56 @@ a path that has not justified that complexity.
 
 Loopback HTTP, hyperfine means with one warmup and ten runs, one binary
 with and without a store. "cold" clears the store before every run, "warm"
-keeps it populated. ext4 is WSL2 on the same machine; the final package
-groups were rerun after builds and other benchmark jobs stopped.
+keeps it populated but still deletes and re-extracts the package directory.
+ext4 is WSL2 on the same machine. Builds and other benchmark jobs were stopped
+before each final group.
 
 | | ext4 none / cold / warm | ReFS none / cold / warm | NTFS none / cold / warm |
 | --- | --- | --- | --- |
-| python 3.13 | 193 / 282 / 176 ms | 185 / 240 / 184 ms | 816 / 851 / 557 ms |
-| numpy | 132 / 230 / 128 ms | 109 / 146 / 107 ms | 428 / 529 / 416 ms |
-| rust | 891 / 953 / 984 ms | 900 / 961 / 1014 ms | 1075 / 1328 / 1463 ms |
+| python 3.13 | 178 / 279 / 168 ms | 171 / 227 / 172 ms | 703 / 792 / 550 ms |
+| numpy | 127 / 245 / 125 ms | 99 / 139 / 102 ms | 430 / 507 / 391 ms |
+| rust | 843 / 877 / 920 ms | 860 / 925 / 999 ms | 1166 / 1364 / 1473 ms |
 
-The rust package across the hashing designs, cold / warm:
+The fixed session cost was isolated by setting the minimum shared size above
+every file. It was 0–5% on ext4 and indistinguishable from run-to-run noise on
+ReFS and NTFS. The remaining overhead is hashing and filesystem mutation, not
+store setup or bookkeeping.
 
-| | ext4 | ReFS | NTFS |
-| --- | --- | --- | --- |
-| BLAKE3 on the extraction thread | 1009 / 978 ms | | |
-| SHA-256 on the extraction thread | 1196 / 1230 ms | 1179 / 1216 ms | 1382 / 1491 ms |
-| SHA-256 in the post-pass | 945 / 938 ms | 979 / 1021 ms | 1320 / 1438 ms |
-| BLAKE3 in the post-pass | 953 / 984 ms | 961 / 1014 ms | 1328 / 1463 ms |
+The minimum shared size separates the two important workloads:
 
-The minimum shared size, python and numpy, cold / warm:
+| | ext4 python | ext4 numpy | ReFS python | ReFS numpy | NTFS python | NTFS numpy |
+| --- | --- | --- | --- | --- | --- | --- |
+| disabled | 184 ms | 131 ms | 177 ms | 107 ms | 676 ms | 444 ms |
+| 64 KiB, cold / warm | 219 / 185 ms | 166 / 142 ms | 186 / 191 ms | 106 / 115 ms | 690 / 857 ms | 445 / 576 ms |
+| every file, cold / warm | 279 / 168 ms | 245 / 125 ms | 227 / 172 ms | 139 / 102 ms | 792 / 550 ms | 507 / 391 ms |
 
-| | ext4 python | ext4 numpy | NTFS python | NTFS numpy |
-| --- | --- | --- | --- | --- |
-| 0 | 283 / 174 ms | 229 / 127 ms | 741 / 516 ms | 503 / 392 ms |
-| 4 KiB | 277 / 183 ms | 214 / 138 ms | 740 / 631 ms | 599 / 498 ms |
-| 16 KiB | 264 / 193 ms | 209 / 137 ms | | |
-| 64 KiB | 218 / 189 ms | 164 / 136 ms | 684 / 899 ms | 438 / 599 ms |
+Python has 1,842 shareable files, NumPy 1,356, and rust only 147. Publishing
+small files therefore dominates cold Python and NumPy: the second directory
+entry requires one hard-link call per file, which no hashing or allocation
+change can remove. On a warm store, early links avoid those writes and are
+neutral or faster on every tested filesystem.
 
-What the numbers say:
+For rust, large-file hashing remains the material cost: 4% cold / 9% warm on
+ext4, 8% / 16% on ReFS, and 17% / 26% on NTFS. BLAKE3's
+`update_mmap_rayon` was tested and rejected; it raised the rust result to
+973 / 981 ms on ext4 and 1159 / 1360 ms on ReFS. Hashing while writing was
+worse still on ext4 at 1424 / 1418 ms because it serialized hashing with
+decompression. Reading the freshly written files from the page cache in the
+parallel post-pass remains the lowest measured design.
 
-- A warm store is neutral or faster for many-small-file packages: Python is
-  9% faster on ext4, neutral on ReFS and 32% faster on NTFS. A hard link is
-  cheaper than a write that Defender inspects.
-- A cold store adds 35 to 101 ms for Python and NumPy. That is mostly the
-  hard-link call per file; BLAKE3 hashing small in-memory buffers is not
-  visible.
-- For the 901 MiB rust package, the BLAKE3 post-pass adds 7% cold / 11% warm
-  on ext4, 7% / 13% on ReFS and 24% / 36% on NTFS. SHA-256 previously added
-  13% / 12%, 15% / 20% and 31% / 43%, respectively.
-- Hashing large files inline with BLAKE3 on Windows did not consistently
-  reduce the NTFS overhead and materially hurt ReFS, because it serializes
-  hashing with decompression. The post-pass stays enabled on every platform.
-- Not sharing small files buys a little cold time and loses more warm time,
-  on NTFS a lot (the SHA-256 prototype's Python warm run went 516 → 899 ms at
-  64 KiB), because every private file has to be written. The default shares
-  every file.
+Compared with the previous BLAKE3 build, the final absolute cold / warm
+results improved from 282 / 176 to 279 / 168 ms for Python on ext4, from
+146 / 107 to 139 / 102 ms for NumPy on ReFS, and from 1328 / 1463 to
+1364 / 1473 ms for rust on NTFS. The last result is a small regression; the
+large-file path is unchanged on Windows and NTFS varies substantially under
+Defender, so this does not justify a filesystem-specific mechanism.
+
+The closest uv comparison is its cold, complete-install result, not these
+numbers. This benchmark deliberately removes the destination before every
+sample and times only `rattler extract`; uv's warm measurements generally
+skip extraction by reusing its unpacked archive cache. Matching uv's warm
+percentage requires package-directory reuse above this file store, not a
+faster per-file CAS operation.
 
 ### Open items
 
@@ -201,16 +216,18 @@ What the numbers say:
    should call `FileStore::prune` after it removes package directories.
 2. Wire it into pixi behind a setting. The measurements no longer argue for
    keeping it off on Windows; NTFS warm runs are faster with the store.
-3. `SMALL_FILE_LIMIT` (64 KiB) is untested as a knob; files between 64 KiB
-   and a few MiB might be worth hashing in memory too, since that is the
-   only path that avoids the write on a warm store.
+3. If repeated extraction of large packages remains common after integration,
+   evaluate a package-level BLAKE3 manifest. It could supply digests before
+   writing, but needs a trusted package identity and persistent invalidation;
+   `info/paths.json` arrives too late and cannot provide that contract.
 
 ## Methodology
 
 Numbers come from hyperfine around `rattler extract`, which #2748 teaches to
 take several packages, `--mode sync|async`, `--concurrency`, and to print the
 time per package. The store measurements use the win-64 packages
-`rust-1.98.0-hf8d6059_0.conda` (176 files, 901 MiB extracted),
+`rust-1.98.0-hf8d6059_0.conda` (176 files total, 147 shareable, 901 MiB
+extracted),
 `python-3.13.7-hdf00ec1_100_cp313.conda` and
 `numpy-2.5.2-py313ha8dc839_1.conda`, on every filesystem, so the trees are
 identical across platforms. The earlier #2748 table used

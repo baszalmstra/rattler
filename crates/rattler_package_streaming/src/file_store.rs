@@ -21,7 +21,7 @@
 //! links to any more are removed by [`FileStore::prune`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Reverse,
     io,
     path::{Path, PathBuf},
 };
@@ -43,11 +43,17 @@ pub struct FileStore {
 /// extraction. A cold store has none, so no object lookup can succeed and the
 /// lookups are skipped entirely; a warm store has all 256.
 #[derive(Debug, Default)]
-struct KnownShards(HashSet<String>);
+struct KnownShards([u64; 4]);
 
 impl KnownShards {
-    fn contains(&self, key: &str) -> bool {
-        self.0.contains(&key[..2])
+    fn insert(&mut self, shard: u8) {
+        let shard = usize::from(shard);
+        self.0[shard / 64] |= 1 << (shard % 64);
+    }
+
+    fn contains(&self, digest: &blake3::Hash) -> bool {
+        let shard = usize::from(digest.as_bytes()[0]);
+        self.0[shard / 64] & (1 << (shard % 64)) != 0
     }
 }
 
@@ -63,8 +69,6 @@ pub struct ExtractedFile {
     executable: bool,
     /// Size of the file in bytes.
     size: u64,
-    /// Whether the file was linked from an existing object instead of written.
-    reused: bool,
 }
 
 impl ExtractedFile {
@@ -73,14 +77,12 @@ impl ExtractedFile {
         digest: Option<blake3::Hash>,
         executable: bool,
         size: u64,
-        reused: bool,
     ) -> Self {
         Self {
             path,
             digest,
             executable,
             size,
-            reused,
         }
     }
 }
@@ -118,6 +120,7 @@ pub(crate) struct FileStoreSession<'a> {
     store: &'a FileStore,
     shards: KnownShards,
     files: Vec<ExtractedFile>,
+    reused: FileStoreStats,
 }
 
 impl FileStore {
@@ -154,11 +157,17 @@ impl FileStore {
     /// The path of the object for the given contents and executable bit,
     /// whether or not it exists.
     pub fn object_path(&self, digest: &blake3::Hash, executable: bool) -> PathBuf {
-        self.object_path_for_key(&object_key(digest, executable))
-    }
-
-    fn object_path_for_key(&self, key: &str) -> PathBuf {
-        self.root.join(&key[..2]).join(key)
+        let hash = digest.to_hex();
+        let mut path = self.root.join(&hash.as_str()[..2]);
+        if executable {
+            let mut file_name = String::with_capacity(65);
+            file_name.push_str(hash.as_str());
+            file_name.push('x');
+            path.push(file_name);
+        } else {
+            path.push(hash.as_str());
+        }
+        path
     }
 
     /// Starts sharing the files of one package.
@@ -167,6 +176,7 @@ impl FileStore {
             store: self,
             shards: self.known_shards(),
             files: Vec::new(),
+            reused: FileStoreStats::default(),
         }
     }
 
@@ -175,13 +185,19 @@ impl FileStore {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return KnownShards::default();
         };
-        KnownShards(
-            entries
-                .filter_map(Result::ok)
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| name.len() == 2)
-                .collect(),
-        )
+        let mut shards = KnownShards::default();
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.len() == 2
+                && let Ok(shard) = u8::from_str_radix(name, 16)
+            {
+                shards.insert(shard);
+            }
+        }
+        shards
     }
 
     /// Links an existing object to `destination`. Returns `Ok(false)` when
@@ -195,11 +211,10 @@ impl FileStore {
         executable: bool,
         destination: &Path,
     ) -> io::Result<bool> {
-        let key = object_key(digest, executable);
-        if !shards.contains(&key) {
+        if !shards.contains(digest) {
             return Ok(false);
         }
-        match std::fs::hard_link(self.object_path_for_key(&key), destination) {
+        match std::fs::hard_link(self.object_path(digest, executable), destination) {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err),
@@ -223,7 +238,7 @@ impl FileStore {
 
         files
             .par_iter_mut()
-            .filter(|file| file.digest.is_none() && !file.reused)
+            .filter(|file| file.digest.is_none())
             .for_each(|file| match hash_file(&file.path) {
                 Ok(digest) => file.digest = Some(digest),
                 Err(err) => {
@@ -231,52 +246,68 @@ impl FileStore {
                 }
             });
 
-        let mut shards: HashMap<PathBuf, Vec<(&ExtractedFile, PathBuf)>> = HashMap::new();
+        let mut shards: [Vec<(&ExtractedFile, PathBuf)>; 256] = std::array::from_fn(|_| Vec::new());
         for file in &files {
-            if file.reused {
-                stats.reused += 1;
-                stats.bytes_reused += file.size;
-                continue;
-            }
             let Some(digest) = &file.digest else {
                 stats.unshared += 1;
                 continue;
             };
-            let object = self.object_path(digest, file.executable);
-            let shard = object
-                .parent()
-                .expect("object paths always have a shard directory")
-                .to_path_buf();
-            shards.entry(shard).or_default().push((file, object));
-        }
-        if shards.is_empty() {
-            return stats;
+            shards[usize::from(digest.as_bytes()[0])]
+                .push((file, self.object_path(digest, file.executable)));
         }
 
-        // Creating shard directories concurrently contends on the store root,
-        // so create them up front and let workers link inside them. A store
-        // that cannot be written leaves the package with private copies.
-        let mut ready = Vec::with_capacity(shards.len());
-        for (shard, files) in shards {
-            match std::fs::create_dir_all(&shard) {
-                Ok(()) => ready.push(files),
-                Err(err) => {
+        let mut shards = shards
+            .into_iter()
+            .enumerate()
+            .filter(|(_, files)| !files.is_empty())
+            .map(|(shard, files)| (shard, files, FileStoreStats::default()))
+            .collect::<Vec<_>>();
+        shards.sort_unstable_by_key(|(_, files, _)| Reverse(files.len()));
+
+        // Root-directory mutations and links contend heavily on Windows, so
+        // finish creating shard directories before linking there.
+        #[cfg(windows)]
+        {
+            for (shard, files, shard_stats) in &mut shards {
+                let shard = self.root.join(format!("{shard:02x}"));
+                if let Err(err) = std::fs::create_dir_all(&shard) {
                     tracing::debug!("could not create {}: {err}", shard.display());
-                    stats.unshared += files.len();
+                    shard_stats.unshared += files.len();
+                    files.clear();
                 }
             }
-        }
-        let shards = ready;
-        let linked = shards
-            .par_iter()
-            .map(|files| {
-                let mut shard_stats = FileStoreStats::default();
+            shards.par_iter_mut().for_each(|(_, files, shard_stats)| {
                 for (file, object) in files {
-                    publish_file(&file.path, object, file.size, &mut shard_stats);
+                    publish_file(&file.path, object, file.size, shard_stats);
                 }
-                shard_stats
-            })
-            .reduce(FileStoreStats::default, |a, b| FileStoreStats {
+            });
+        }
+
+        // Other platforms can overlap serial root-directory creation with
+        // links into shards that are already ready.
+        #[cfg(not(windows))]
+        rayon::in_place_scope(|scope| {
+            for (shard, files, shard_stats) in &mut shards {
+                let shard = self.root.join(format!("{shard:02x}"));
+                match std::fs::create_dir_all(&shard) {
+                    Ok(()) => {
+                        scope.spawn(move |_| {
+                            for (file, object) in files {
+                                publish_file(&file.path, object, file.size, shard_stats);
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        tracing::debug!("could not create {}: {err}", shard.display());
+                        shard_stats.unshared += files.len();
+                    }
+                }
+            }
+        });
+
+        let linked = shards
+            .into_iter()
+            .fold(FileStoreStats::default(), |a, (_, _, b)| FileStoreStats {
                 files: 0,
                 added: a.added + b.added,
                 reused: a.reused + b.reused,
@@ -356,10 +387,21 @@ impl FileStoreSession<'_> {
         self.files.push(file);
     }
 
+    /// Records a file linked directly from an existing store object.
+    pub(crate) fn record_reused(&mut self, size: u64) {
+        self.reused.files += 1;
+        self.reused.reused += 1;
+        self.reused.bytes_reused += size;
+    }
+
     /// Shares the recorded files through the store and reports what that
     /// did. Never fails: a file that cannot be shared stays a private copy.
     pub(crate) fn publish(self) -> FileStoreStats {
-        self.store.publish(self.files)
+        let mut stats = self.store.publish(self.files);
+        stats.files += self.reused.files;
+        stats.reused += self.reused.reused;
+        stats.bytes_reused += self.reused.bytes_reused;
+        stats
     }
 }
 
@@ -482,17 +524,6 @@ fn replace_with_link(source: &Path, object: &Path) -> io::Result<()> {
     }
 }
 
-/// The object name for a content hash and executable bit: the hex BLAKE3
-/// digest, with an `x` suffix for executables so the two never collide.
-fn object_key(digest: &blake3::Hash, executable: bool) -> String {
-    let mut key = String::with_capacity(65);
-    key.push_str(digest.to_hex().as_str());
-    if executable {
-        key.push('x');
-    }
-    key
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,25 +536,21 @@ mod tests {
     fn executable_bit_is_part_of_the_key() {
         let store = FileStore::new("store");
         let digest = digest(b"same bytes");
-        assert_ne!(
-            store.object_path(&digest, false),
-            store.object_path(&digest, true)
+        let hash = digest.to_hex();
+        let regular = store.object_path(&digest, false);
+        let executable = store.object_path(&digest, true);
+
+        assert_eq!(
+            regular,
+            Path::new("store")
+                .join(&hash.as_str()[..2])
+                .join(hash.as_str())
         );
-        let path = store.object_path(&digest, false);
-        let shard = path
-            .parent()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(shard.len(), 2);
-        assert!(
-            path.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with(shard)
+        assert_eq!(
+            executable,
+            Path::new("store")
+                .join(&hash.as_str()[..2])
+                .join(format!("{hash}x"))
         );
     }
 
@@ -542,13 +569,7 @@ mod tests {
         std::fs::write(pkg_b.join("z"), b"only in b").unwrap();
 
         let file = |path: PathBuf, contents: &[u8]| {
-            ExtractedFile::new(
-                path,
-                Some(digest(contents)),
-                false,
-                contents.len() as u64,
-                false,
-            )
+            ExtractedFile::new(path, Some(digest(contents)), false, contents.len() as u64)
         };
 
         let stats = store.publish(vec![file(pkg_a.join("x"), &same)]);
@@ -582,7 +603,6 @@ mod tests {
             None,
             false,
             same.len() as u64,
-            false,
         )]);
         assert_eq!((stats.added, stats.reused), (0, 1));
         assert!(same_file(&pkg_a.join("x"), &pkg_b.join("w")));
@@ -591,7 +611,6 @@ mod tests {
             None,
             false,
             0,
-            false,
         )]);
         assert_eq!(stats.unshared, 1);
     }
@@ -635,14 +654,12 @@ mod tests {
                 Some(digest(&kept)),
                 false,
                 kept.len() as u64,
-                false,
             ),
             ExtractedFile::new(
                 pkg.join("orphan"),
                 Some(digest(&orphan)),
                 true,
                 orphan.len() as u64,
-                false,
             ),
         ]);
         assert_eq!(stats.added, 2);
