@@ -1,0 +1,18 @@
+libllvm20-20.1.5-he9d0ab4_0.conda
+  archive     41.0 MiB | unpacked    176.8 MiB in 28 files, 2760 chunks | cold xet download     83.6 MiB (204% of archive)
+libllvm20-20.1.6-he9d0ab4_0.conda
+  archive     41.0 MiB | unpacked    176.8 MiB in 27 files, 2744 chunks | cold xet download     83.6 MiB (204% of archive)
+  vs previous: new chunk data    117.2 MiB ( 66.3% of unpacked) -> xet-compressed     67.6 MiB (164.7% of archive), zstd3     45.3 MiB | file-level    176.4 MiB ( 99.8%) | chunked archive 100.0% new | 158 runs
+  vs all prev: new chunk data    117.2 MiB ( 66.3% of unpacked) -> xet-compressed     67.6 MiB (164.7% of archive) | file-level  99.8% | chunked archive 100.0% new
+libllvm20-20.1.7-he9d0ab4_0.conda
+  archive     41.0 MiB | unpacked    176.8 MiB in 27 files, 2786 chunks | cold xet download     83.4 MiB (203% of archive)
+  vs previous: new chunk data    119.6 MiB ( 67.6% of unpacked) -> xet-compressed     68.4 MiB (166.8% of archive), zstd3     45.6 MiB | file-level    176.4 MiB ( 99.8%) | chunked archive 100.0% new | 138 runs
+  vs all prev: new chunk data    119.1 MiB ( 67.4% of unpacked) -> xet-compressed     68.3 MiB (166.4% of archive) | file-level  99.8% | chunked archive 100.0% new
+libllvm20-20.1.8-hecd9e04_0.conda
+  archive     41.9 MiB | unpacked    180.0 MiB in 27 files, 2842 chunks | cold xet download     85.2 MiB (203% of archive)
+  vs previous: new chunk data    145.1 MiB ( 80.6% of unpacked) -> xet-compressed     77.5 MiB (184.8% of archive), zstd3     50.4 MiB | file-level    179.8 MiB ( 99.9%) | chunked archive 100.0% new | 125 runs
+  vs all prev: new chunk data    144.9 MiB ( 80.5% of unpacked) -> xet-compressed     77.5 MiB (184.7% of archive) | file-level  99.9% | chunked archive 100.0% new
+libllvm20-20.1.8-hf7376ad_1.conda
+  archive     41.9 MiB | unpacked    180.0 MiB in 27 files, 2826 chunks | cold xet download     85.2 MiB (203% of archive)
+  vs previous: new chunk data     87.8 MiB ( 48.8% of unpacked) -> xet-compressed     56.6 MiB (134.9% of archive), zstd3     38.7 MiB | file-level    179.8 MiB ( 99.9%) | chunked archive 100.0% new | 91 runs
+  vs all prev: new chunk data     87.8 MiB ( 48.8% of unpacked) -> xet-compressed     56.6 MiB (134.9% of archive) | file-level  99.9% | chunked archive 100.0% new

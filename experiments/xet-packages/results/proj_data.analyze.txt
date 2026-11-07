@@ -1,0 +1,10 @@
+proj-data-1.24-h707e725_0.conda
+  archive    754.8 MiB | unpacked    763.8 MiB in 469 files, 12790 chunks | cold xet download    739.9 MiB (98% of archive)
+proj-data-1.25-h707e725_0.conda
+  archive    797.8 MiB | unpacked    807.0 MiB in 474 files, 13524 chunks | cold xet download    783.1 MiB (98% of archive)
+  vs previous: new chunk data     43.4 MiB (  5.4% of unpacked) -> xet-compressed     43.2 MiB (  5.4% of archive), zstd3     43.2 MiB | file-level     43.4 MiB (  5.4%) | chunked archive  90.1% new | 20 runs
+  vs all prev: new chunk data     43.4 MiB (  5.4% of unpacked) -> xet-compressed     43.2 MiB (  5.4% of archive) | file-level   5.4% | chunked archive  90.1% new
+proj-data-1.25-ha8204d5_1.conda
+  archive    799.8 MiB | unpacked    807.0 MiB in 470 files, 13522 chunks | cold xet download    783.1 MiB (98% of archive)
+  vs previous: new chunk data      0.1 MiB (  0.0% of unpacked) -> xet-compressed      0.0 MiB (  0.0% of archive), zstd3      0.0 MiB | file-level      0.1 MiB (  0.0%) | chunked archive  88.4% new | 6 runs
+  vs all prev: new chunk data      0.1 MiB (  0.0% of unpacked) -> xet-compressed      0.0 MiB (  0.0% of archive) | file-level   0.0% | chunked archive  85.4% new

@@ -1,0 +1,62 @@
+{
+  "packages": [
+    {
+      "all_new_archive_chunk_bytes": 791498866,
+      "all_new_bytes": 779542914,
+      "all_new_file_level_bytes": 800874935,
+      "all_new_xet_compressed": 775864479,
+      "archive_bytes": 791498866,
+      "chunks": 12790,
+      "files": 469,
+      "package": "proj-data-1.24-h707e725_0.conda",
+      "prev_new_archive_chunk_bytes": 791498866,
+      "prev_new_bytes": 779542914,
+      "prev_new_file_level_bytes": 800874935,
+      "prev_new_xet_compressed": 775864479,
+      "prev_new_zstd3": 773488672,
+      "prev_runs": 1,
+      "unique_bytes": 779542914,
+      "unique_xet_compressed": 775864479,
+      "unpacked_bytes": 800913750
+    },
+    {
+      "all_new_archive_chunk_bytes": 753998223,
+      "all_new_bytes": 45457400,
+      "all_new_file_level_bytes": 45465332,
+      "all_new_xet_compressed": 45332341,
+      "archive_bytes": 836585852,
+      "chunks": 13524,
+      "files": 474,
+      "package": "proj-data-1.25-h707e725_0.conda",
+      "prev_new_archive_chunk_bytes": 753998223,
+      "prev_new_bytes": 45457400,
+      "prev_new_file_level_bytes": 45465332,
+      "prev_new_xet_compressed": 45332341,
+      "prev_new_zstd3": 45285265,
+      "prev_runs": 20,
+      "unique_bytes": 824832858,
+      "unique_xet_compressed": 821133670,
+      "unpacked_bytes": 846203994
+    },
+    {
+      "all_new_archive_chunk_bytes": 716585715,
+      "all_new_bytes": 108310,
+      "all_new_file_level_bytes": 108310,
+      "all_new_xet_compressed": 46513,
+      "archive_bytes": 838701438,
+      "chunks": 13522,
+      "files": 470,
+      "package": "proj-data-1.25-ha8204d5_1.conda",
+      "prev_new_archive_chunk_bytes": 741142461,
+      "prev_new_bytes": 108310,
+      "prev_new_file_level_bytes": 108310,
+      "prev_new_xet_compressed": 46513,
+      "prev_new_zstd3": 26392,
+      "prev_runs": 6,
+      "unique_bytes": 824811685,
+      "unique_xet_compressed": 821124021,
+      "unpacked_bytes": 846182821
+    }
+  ],
+  "series": "proj_data"
+}

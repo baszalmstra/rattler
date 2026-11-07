@@ -1,0 +1,10 @@
+libcudnn-9.26.1.1-ha4ef42a_0.conda
+  archive    433.5 MiB | unpacked    836.0 MiB in 28 files, 13540 chunks | cold xet download    560.4 MiB (129% of archive)
+libcudnn-9.28.0.42-ha4ef42a_0.conda
+  archive    430.6 MiB | unpacked    885.8 MiB in 28 files, 14445 chunks | cold xet download    569.9 MiB (132% of archive)
+  vs previous: new chunk data    791.5 MiB ( 89.4% of unpacked) -> xet-compressed    523.2 MiB (121.5% of archive), zstd3    425.0 MiB | file-level    885.8 MiB (100.0%) | chunked archive  99.4% new | 245 runs
+  vs all prev: new chunk data    791.5 MiB ( 89.4% of unpacked) -> xet-compressed    523.2 MiB (121.5% of archive) | file-level 100.0% | chunked archive  99.4% new
+libcudnn-9.28.1.4-ha4ef42a_0.conda
+  archive    430.7 MiB | unpacked    885.9 MiB in 28 files, 14410 chunks | cold xet download    569.9 MiB (132% of archive)
+  vs previous: new chunk data    212.7 MiB ( 24.0% of unpacked) -> xet-compressed    109.1 MiB ( 25.3% of archive), zstd3     66.2 MiB | file-level    877.3 MiB ( 99.0%) | chunked archive  91.5% new | 316 runs
+  vs all prev: new chunk data    212.7 MiB ( 24.0% of unpacked) -> xet-compressed    109.1 MiB ( 25.3% of archive) | file-level  99.0% | chunked archive  91.4% new

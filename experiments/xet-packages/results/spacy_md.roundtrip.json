@@ -1,0 +1,70 @@
+{
+  "packages": [
+    {
+      "archive_bytes": 35451313,
+      "deduped_bytes": 0,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 54,
+      "new_bytes": 56574671,
+      "package": "spacy-model-en_core_web_md-3.3.0-pyhd8ed1ab_0.tar.bz2",
+      "shard_bytes_uploaded": 49776,
+      "total_bytes": 56574671,
+      "total_bytes_uploaded": 37348403,
+      "upload_seconds": 0.657760859,
+      "xorb_bytes_uploaded": 37298627
+    },
+    {
+      "archive_bytes": 35445890,
+      "deduped_bytes": 56552852,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 58,
+      "new_bytes": 107586,
+      "package": "spacy-model-en_core_web_md-3.3.0-pyhd8ed1ab_1.tar.bz2",
+      "shard_bytes_uploaded": 10848,
+      "total_bytes": 56660438,
+      "total_bytes_uploaded": 41581,
+      "upload_seconds": 0.066449326,
+      "xorb_bytes_uploaded": 30733
+    },
+    {
+      "archive_bytes": 39370926,
+      "deduped_bytes": 1085622,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 59,
+      "new_bytes": 54204758,
+      "package": "spacy-model-en_core_web_md-3.4.0-pyhd8ed1ab_0.tar.bz2",
+      "shard_bytes_uploaded": 51744,
+      "total_bytes": 55290380,
+      "total_bytes_uploaded": 45927004,
+      "upload_seconds": 0.272059265,
+      "xorb_bytes_uploaded": 45875260
+    },
+    {
+      "archive_bytes": 37053424,
+      "deduped_bytes": 41613357,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 59,
+      "new_bytes": 13675305,
+      "package": "spacy-model-en_core_web_md-3.5.0-pyhd8ed1ab_0.conda",
+      "shard_bytes_uploaded": 21504,
+      "total_bytes": 55288662,
+      "total_bytes_uploaded": 12832428,
+      "upload_seconds": 0.100145836,
+      "xorb_bytes_uploaded": 12810924
+    },
+    {
+      "archive_bytes": 30413130,
+      "deduped_bytes": 28803881,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 60,
+      "new_bytes": 27903500,
+      "package": "spacy-model-en_core_web_md-3.8.0-pyhd8ed1ab_0.conda",
+      "shard_bytes_uploaded": 37680,
+      "total_bytes": 56707381,
+      "total_bytes_uploaded": 23266959,
+      "upload_seconds": 0.368712503,
+      "xorb_bytes_uploaded": 23229279
+    }
+  ],
+  "series": "spacy_md"
+}

@@ -1,0 +1,47 @@
+{
+  "packages": [
+    {
+      "all_new_archive_chunk_bytes": 43987020,
+      "all_new_bytes": 186991850,
+      "all_new_file_level_bytes": 188739754,
+      "all_new_xet_compressed": 89327148,
+      "archive_bytes": 43987020,
+      "chunks": 2842,
+      "files": 27,
+      "package": "libllvm20-20.1.8-hecd9e04_0.conda",
+      "prev_new_archive_chunk_bytes": 43987020,
+      "prev_new_bytes": 186991850,
+      "prev_new_file_level_bytes": 188739754,
+      "prev_new_xet_compressed": 89327148,
+      "prev_new_zstd3": 57363030,
+      "prev_new_zstd_chunk": 58909290,
+      "prev_runs": 1,
+      "unique_bytes": 186991850,
+      "unique_xet_compressed": 89327148,
+      "unique_zstd_chunk": 58909290,
+      "unpacked_bytes": 188741904
+    },
+    {
+      "all_new_archive_chunk_bytes": 43977914,
+      "all_new_bytes": 92097956,
+      "all_new_file_level_bytes": 188517243,
+      "all_new_xet_compressed": 59335786,
+      "archive_bytes": 43977914,
+      "chunks": 2826,
+      "files": 27,
+      "package": "libllvm20-20.1.8-hf7376ad_1.conda",
+      "prev_new_archive_chunk_bytes": 43977914,
+      "prev_new_bytes": 92097956,
+      "prev_new_file_level_bytes": 188517243,
+      "prev_new_xet_compressed": 59335786,
+      "prev_new_zstd3": 40531755,
+      "prev_new_zstd_chunk": 41394962,
+      "prev_runs": 91,
+      "unique_bytes": 186991754,
+      "unique_xet_compressed": 89319606,
+      "unique_zstd_chunk": 58900803,
+      "unpacked_bytes": 188741808
+    }
+  ],
+  "series": "libllvm20-zstd"
+}

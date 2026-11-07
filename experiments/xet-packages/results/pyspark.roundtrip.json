@@ -1,0 +1,57 @@
+{
+  "packages": [
+    {
+      "archive_bytes": 446676615,
+      "deduped_bytes": 2712600,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 991,
+      "new_bytes": 494780109,
+      "package": "pyspark-4.1.0-pyhd8ed1ab_0.conda",
+      "shard_bytes_uploaded": 589008,
+      "total_bytes": 497492709,
+      "total_bytes_uploaded": 462680976,
+      "upload_seconds": 2.47442024,
+      "xorb_bytes_uploaded": 462091968
+    },
+    {
+      "archive_bytes": 446440875,
+      "deduped_bytes": 476119530,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 991,
+      "new_bytes": 21397791,
+      "package": "pyspark-4.1.1-pyhd8ed1ab_0.conda",
+      "shard_bytes_uploaded": 214800,
+      "total_bytes": 497517321,
+      "total_bytes_uploaded": 17374370,
+      "upload_seconds": 0.749039213,
+      "xorb_bytes_uploaded": 17159570
+    },
+    {
+      "archive_bytes": 446941119,
+      "deduped_bytes": 457717858,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 991,
+      "new_bytes": 39886496,
+      "package": "pyspark-4.1.2-pyhd8ed1ab_0.conda",
+      "shard_bytes_uploaded": 240528,
+      "total_bytes": 497604354,
+      "total_bytes_uploaded": 34234464,
+      "upload_seconds": 0.718479038,
+      "xorb_bytes_uploaded": 33993936
+    },
+    {
+      "archive_bytes": 440020814,
+      "deduped_bytes": 254838575,
+      "deduped_bytes_by_global_dedup": 0,
+      "files": 1026,
+      "new_bytes": 238046911,
+      "package": "pyspark-4.2.0-pyhd8ed1ab_0.conda",
+      "shard_bytes_uploaded": 408960,
+      "total_bytes": 492885486,
+      "total_bytes_uploaded": 215795099,
+      "upload_seconds": 1.276215706,
+      "xorb_bytes_uploaded": 215386139
+    }
+  ],
+  "series": "pyspark"
+}

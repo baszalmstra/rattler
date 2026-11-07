@@ -1,0 +1,47 @@
+{
+  "packages": [
+    {
+      "all_new_archive_chunk_bytes": 833914698,
+      "all_new_bytes": 2238326642,
+      "all_new_file_level_bytes": 2325726327,
+      "all_new_xet_compressed": 1794317180,
+      "archive_bytes": 833914698,
+      "chunks": 46824,
+      "files": 9330,
+      "package": "libtorch-2.14.1-cuda129_mkl_h546cc0b_301.conda",
+      "prev_new_archive_chunk_bytes": 833914698,
+      "prev_new_bytes": 2238326642,
+      "prev_new_file_level_bytes": 2325726327,
+      "prev_new_xet_compressed": 1794317180,
+      "prev_new_zstd3": 1117956008,
+      "prev_new_zstd_chunk": 1348205217,
+      "prev_runs": 1,
+      "unique_bytes": 2238326642,
+      "unique_xet_compressed": 1794317180,
+      "unique_zstd_chunk": 1348205217,
+      "unpacked_bytes": 2325742221
+    },
+    {
+      "all_new_archive_chunk_bytes": 833799244,
+      "all_new_bytes": 755917188,
+      "all_new_file_level_bytes": 2292112275,
+      "all_new_xet_compressed": 518345833,
+      "archive_bytes": 833819206,
+      "chunks": 46761,
+      "files": 9330,
+      "package": "libtorch-2.14.1-cuda129_mkl_h8d8e464_302.conda",
+      "prev_new_archive_chunk_bytes": 833799244,
+      "prev_new_bytes": 755917188,
+      "prev_new_file_level_bytes": 2292112275,
+      "prev_new_xet_compressed": 518345833,
+      "prev_new_zstd3": 293298839,
+      "prev_new_zstd_chunk": 382730464,
+      "prev_runs": 6102,
+      "unique_bytes": 2238340457,
+      "unique_xet_compressed": 1794241889,
+      "unique_zstd_chunk": 1348095739,
+      "unpacked_bytes": 2325742273
+    }
+  ],
+  "series": "libtorch-zstd"
+}

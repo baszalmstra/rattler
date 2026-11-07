@@ -1,0 +1,14 @@
+pyspark-4.1.0-pyhd8ed1ab_0.conda
+  archive    426.0 MiB | unpacked    474.4 MiB in 991 files, 8467 chunks | cold xet download    437.1 MiB (103% of archive)
+pyspark-4.1.1-pyhd8ed1ab_0.conda
+  archive    425.8 MiB | unpacked    474.5 MiB in 991 files, 8462 chunks | cold xet download    437.1 MiB (103% of archive)
+  vs previous: new chunk data     19.7 MiB (  4.1% of unpacked) -> xet-compressed     15.6 MiB (  3.7% of archive), zstd3     15.0 MiB | file-level    103.9 MiB ( 21.9%) | chunked archive  96.7% new | 184 runs
+  vs all prev: new chunk data     19.7 MiB (  4.1% of unpacked) -> xet-compressed     15.6 MiB (  3.7% of archive) | file-level  21.9% | chunked archive  96.7% new
+pyspark-4.1.2-pyhd8ed1ab_0.conda
+  archive    426.2 MiB | unpacked    474.6 MiB in 991 files, 8468 chunks | cold xet download    437.2 MiB (103% of archive)
+  vs previous: new chunk data     37.8 MiB (  8.0% of unpacked) -> xet-compressed     32.2 MiB (  7.6% of archive), zstd3     31.1 MiB | file-level    128.7 MiB ( 27.1%) | chunked archive  96.9% new | 274 runs
+  vs all prev: new chunk data     37.8 MiB (  8.0% of unpacked) -> xet-compressed     32.2 MiB (  7.5% of archive) | file-level  27.1% | chunked archive  94.6% new
+pyspark-4.2.0-pyhd8ed1ab_0.conda
+  archive    419.6 MiB | unpacked    470.1 MiB in 1026 files, 8410 chunks | cold xet download    432.1 MiB (103% of archive)
+  vs previous: new chunk data    227.0 MiB ( 48.3% of unpacked) -> xet-compressed    205.2 MiB ( 48.9% of archive), zstd3    199.0 MiB | file-level    275.1 MiB ( 58.5%) | chunked archive  98.0% new | 511 runs
+  vs all prev: new chunk data    227.0 MiB ( 48.3% of unpacked) -> xet-compressed    205.2 MiB ( 48.9% of archive) | file-level  58.5% | chunked archive  96.9% new

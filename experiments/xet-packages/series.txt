@@ -1,0 +1,6 @@
+spacy_md noarch spacy-model-en_core_web_md-3.3.0-pyhd8ed1ab_0.tar.bz2 spacy-model-en_core_web_md-3.3.0-pyhd8ed1ab_1.tar.bz2 spacy-model-en_core_web_md-3.4.0-pyhd8ed1ab_0.tar.bz2 spacy-model-en_core_web_md-3.5.0-pyhd8ed1ab_0.conda spacy-model-en_core_web_md-3.8.0-pyhd8ed1ab_0.conda
+libllvm20 linux-64 libllvm20-20.1.5-he9d0ab4_0.conda libllvm20-20.1.6-he9d0ab4_0.conda libllvm20-20.1.7-he9d0ab4_0.conda libllvm20-20.1.8-hecd9e04_0.conda libllvm20-20.1.8-hf7376ad_1.conda
+pyspark noarch pyspark-4.1.0-pyhd8ed1ab_0.conda pyspark-4.1.1-pyhd8ed1ab_0.conda pyspark-4.1.2-pyhd8ed1ab_0.conda pyspark-4.2.0-pyhd8ed1ab_0.conda
+libtorch linux-64 libtorch-2.13.0-cuda129_mkl_h8d8e464_306.conda libtorch-2.14.1-cuda129_mkl_h546cc0b_301.conda libtorch-2.14.1-cuda129_mkl_h8d8e464_302.conda
+libcudnn linux-64 libcudnn-9.26.1.1-ha4ef42a_0.conda libcudnn-9.28.0.42-ha4ef42a_0.conda libcudnn-9.28.1.4-ha4ef42a_0.conda
+proj_data noarch proj-data-1.24-h707e725_0.conda proj-data-1.25-h707e725_0.conda proj-data-1.25-ha8204d5_1.conda

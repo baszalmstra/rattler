@@ -1,0 +1,10 @@
+libtorch-2.13.0-cuda129_mkl_h8d8e464_306.conda
+  archive    779.6 MiB | unpacked   2135.6 MiB in 9264 files, 45186 chunks | cold xet download   1663.3 MiB (213% of archive)
+libtorch-2.14.1-cuda129_mkl_h546cc0b_301.conda
+  archive    795.3 MiB | unpacked   2218.0 MiB in 9330 files, 46824 chunks | cold xet download   1711.2 MiB (215% of archive)
+  vs previous: new chunk data   1456.9 MiB ( 65.7% of unpacked) -> xet-compressed   1102.6 MiB (138.6% of archive), zstd3    662.3 MiB | file-level   2198.0 MiB ( 99.1%) | chunked archive 100.0% new | 5163 runs
+  vs all prev: new chunk data   1456.9 MiB ( 65.7% of unpacked) -> xet-compressed   1102.6 MiB (138.6% of archive) | file-level  99.1% | chunked archive 100.0% new
+libtorch-2.14.1-cuda129_mkl_h8d8e464_302.conda
+  archive    795.2 MiB | unpacked   2218.0 MiB in 9330 files, 46761 chunks | cold xet download   1711.1 MiB (215% of archive)
+  vs previous: new chunk data    720.9 MiB ( 32.5% of unpacked) -> xet-compressed    494.3 MiB ( 62.2% of archive), zstd3    279.7 MiB | file-level   2185.9 MiB ( 98.6%) | chunked archive 100.0% new | 6102 runs
+  vs all prev: new chunk data    720.3 MiB ( 32.5% of unpacked) -> xet-compressed    493.8 MiB ( 62.1% of archive) | file-level  98.6% | chunked archive 100.0% new

@@ -1,0 +1,27 @@
+[package]
+name = "xet-packages-lab"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Experiment: measure what Xet (Hugging Face) chunk-level deduplication would buy conda packages across versions."
+
+# Standalone workspace so this experiment does not touch the main rattler workspace or its lock file.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rattler_package_streaming = { path = "../../crates/rattler_package_streaming", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+walkdir = "2"
+zstd = "0.13"
+# Xet crates are published as packaging for hf_xet without semver promises, so pin exactly.
+xet-core-structures = "=1.8.0"
+xet-data = "=1.8.0"
+xet-runtime = "=1.8.0"
+
+[profile.release]
+debug = 1

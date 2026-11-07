@@ -1,0 +1,62 @@
+{
+  "packages": [
+    {
+      "all_new_archive_chunk_bytes": 453491965,
+      "all_new_bytes": 855326667,
+      "all_new_file_level_bytes": 876590950,
+      "all_new_xet_compressed": 587571790,
+      "archive_bytes": 454566361,
+      "chunks": 13540,
+      "files": 28,
+      "package": "libcudnn-9.26.1.1-ha4ef42a_0.conda",
+      "prev_new_archive_chunk_bytes": 453491965,
+      "prev_new_bytes": 855326667,
+      "prev_new_file_level_bytes": 876590950,
+      "prev_new_xet_compressed": 587571790,
+      "prev_new_zstd3": 486891818,
+      "prev_runs": 1,
+      "unique_bytes": 855326667,
+      "unique_xet_compressed": 587571790,
+      "unpacked_bytes": 876591476
+    },
+    {
+      "all_new_archive_chunk_bytes": 448978297,
+      "all_new_bytes": 829917009,
+      "all_new_file_level_bytes": 928788774,
+      "all_new_xet_compressed": 548643730,
+      "archive_bytes": 451510314,
+      "chunks": 14445,
+      "files": 28,
+      "package": "libcudnn-9.28.0.42-ha4ef42a_0.conda",
+      "prev_new_archive_chunk_bytes": 448978297,
+      "prev_new_bytes": 829917009,
+      "prev_new_file_level_bytes": 928788774,
+      "prev_new_xet_compressed": 548643730,
+      "prev_new_zstd3": 445653121,
+      "prev_runs": 245,
+      "unique_bytes": 908321188,
+      "unique_xet_compressed": 597549687,
+      "unpacked_bytes": 928822448
+    },
+    {
+      "all_new_archive_chunk_bytes": 412792434,
+      "all_new_bytes": 222993100,
+      "all_new_file_level_bytes": 919886980,
+      "all_new_xet_compressed": 114392398,
+      "archive_bytes": 451583154,
+      "chunks": 14410,
+      "files": 28,
+      "package": "libcudnn-9.28.1.4-ha4ef42a_0.conda",
+      "prev_new_archive_chunk_bytes": 413312705,
+      "prev_new_bytes": 222993100,
+      "prev_new_file_level_bytes": 919886980,
+      "prev_new_xet_compressed": 114392398,
+      "prev_new_zstd3": 69466743,
+      "prev_runs": 316,
+      "unique_bytes": 908271243,
+      "unique_xet_compressed": 597541709,
+      "unpacked_bytes": 928921838
+    }
+  ],
+  "series": "libcudnn"
+}

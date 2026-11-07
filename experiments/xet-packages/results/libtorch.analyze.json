@@ -1,0 +1,62 @@
+{
+  "packages": [
+    {
+      "all_new_archive_chunk_bytes": 817520704,
+      "all_new_bytes": 2178621052,
+      "all_new_file_level_bytes": 2239332883,
+      "all_new_xet_compressed": 1744076940,
+      "archive_bytes": 817520704,
+      "chunks": 45186,
+      "files": 9264,
+      "package": "libtorch-2.13.0-cuda129_mkl_h8d8e464_306.conda",
+      "prev_new_archive_chunk_bytes": 817520704,
+      "prev_new_bytes": 2178621052,
+      "prev_new_file_level_bytes": 2239332883,
+      "prev_new_xet_compressed": 1744076940,
+      "prev_new_zstd3": 1086925584,
+      "prev_runs": 1,
+      "unique_bytes": 2178621052,
+      "unique_xet_compressed": 1744076940,
+      "unpacked_bytes": 2239348777
+    },
+    {
+      "all_new_archive_chunk_bytes": 833914698,
+      "all_new_bytes": 1527680519,
+      "all_new_file_level_bytes": 2304759067,
+      "all_new_xet_compressed": 1156122379,
+      "archive_bytes": 833914698,
+      "chunks": 46824,
+      "files": 9330,
+      "package": "libtorch-2.14.1-cuda129_mkl_h546cc0b_301.conda",
+      "prev_new_archive_chunk_bytes": 833914698,
+      "prev_new_bytes": 1527680519,
+      "prev_new_file_level_bytes": 2304759067,
+      "prev_new_xet_compressed": 1156122379,
+      "prev_new_zstd3": 694476805,
+      "prev_runs": 5163,
+      "unique_bytes": 2238326642,
+      "unique_xet_compressed": 1794317180,
+      "unpacked_bytes": 2325742221
+    },
+    {
+      "all_new_archive_chunk_bytes": 833799244,
+      "all_new_bytes": 755285119,
+      "all_new_file_level_bytes": 2292112275,
+      "all_new_xet_compressed": 517778395,
+      "archive_bytes": 833819206,
+      "chunks": 46761,
+      "files": 9330,
+      "package": "libtorch-2.14.1-cuda129_mkl_h8d8e464_302.conda",
+      "prev_new_archive_chunk_bytes": 833799244,
+      "prev_new_bytes": 755917188,
+      "prev_new_file_level_bytes": 2292112275,
+      "prev_new_xet_compressed": 518345833,
+      "prev_new_zstd3": 293298839,
+      "prev_runs": 6102,
+      "unique_bytes": 2238340457,
+      "unique_xet_compressed": 1794241889,
+      "unpacked_bytes": 2325742273
+    }
+  ],
+  "series": "libtorch"
+}
