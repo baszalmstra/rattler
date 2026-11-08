@@ -119,10 +119,18 @@ Shard (metadata) overhead is 0.1–0.6 MiB per package.
    that are fine-tuned or partly frozen, not for full retrains. Models that
    pin the same weights across package versions (wrapper/code changes) are
    the sweet spot.
-6. **Many terms.** A libtorch upgrade has ~6000 runs of known/unknown chunks
-   over 9330 files. Xet's v2 reconstruction batches ranges per xorb, but a
-   client still needs one reconstruction per file; for conda we want one
-   reconstruction document per *package*.
+6. **Request count is manageable.** A libtorch upgrade has ~6000 runs of
+   known/unknown chunks over 9330 files, but that is mostly a metadata
+   question. Download plans can be fetched in batches
+   (`POST /v1/reconstructions`, up to 1000 files per call in OpenXet), so
+   about 10 calls for libtorch. The new chunks of a version are written
+   contiguously into new xorbs (up to 64 MiB each) during upload, so a
+   client that coalesces neighbouring ranges per xorb needs roughly one data
+   request per new xorb, not one per run. Shards do not help on the download
+   side: they are the upload/registration and global-dedup format, and
+   their chunk offsets refer to the uncompressed xorb, while the compressed
+   byte ranges come from the server's xorb layout. A static channel would
+   publish one plan per package that already contains those ranges.
 7. Small quirk: Xet reports an all-zero sha256 for empty files.
 
 ## Server side
@@ -192,8 +200,9 @@ Cons:
 - The `xet-*` crates have no semver promise (pin exact versions), and the
   wire protocol is Hugging Face's; extending it (zstd scheme) needs
   upstream agreement or a fork.
-- Many small range requests per install (thousands of terms for libtorch);
-  needs per-package reconstruction bundles and range coalescing.
+- Stock clients ask for one download plan per file and OpenXet signs one
+  URL per byte range; rattler needs batched plans (or one plan per package)
+  and range coalescing to keep the request count low.
 - New security surface: per-file Merkle hashes instead of one archive hash,
   signing (sigstore attestations cover the `.conda` today), GC of shared
   xorbs across packages and channels.
